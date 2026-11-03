@@ -1,0 +1,101 @@
+{
+  "probe_tokens_matched": 64,
+  "driver_free_difference_bytes": 0,
+  "target_free_mib": 512,
+  "headroom_mib": 768,
+  "telemetry": {
+    "driver_free_ready_bytes": 538509312,
+    "ballast": {
+      "driver_free_before_bytes": 73708142592,
+      "driver_free_ready_bytes": 538509312,
+      "ballast_allocated_bytes": 73169633280,
+      "ballast_torch_reserved_bytes": 73169633280
+    },
+    "first_pressure_request": {
+      "index": 0,
+      "ttft_s": 0.036730683874338865,
+      "tpot_s": 0.0076832703521682155,
+      "activation_delta": {
+        "activation_trim_bytes": 0,
+        "activation_flush_freed_bytes": 0,
+        "activation_trim_calls": 0,
+        "activation_flush_calls": 0
+      }
+    },
+    "subsequent_pressure_requests": [
+      {
+        "index": 1,
+        "ttft_s": 0.03026471333578229,
+        "tpot_s": 0.007695343663235979,
+        "activation_delta": {
+          "activation_trim_bytes": 0,
+          "activation_flush_freed_bytes": 0,
+          "activation_trim_calls": 0,
+          "activation_flush_calls": 0
+        }
+      },
+      {
+        "index": 2,
+        "ttft_s": 0.029088719747960567,
+        "tpot_s": 0.007706414967302292,
+        "activation_delta": {
+          "activation_trim_bytes": 0,
+          "activation_flush_freed_bytes": 0,
+          "activation_trim_calls": 0,
+          "activation_flush_calls": 0
+        }
+      }
+    ],
+    "whole_gpu_nvml_before_bytes": 85360836608,
+    "whole_gpu_nvml_after_bytes": 85360836608,
+    "whole_gpu_nvml_peak_bytes": 85360836608
+  },
+  "both": {
+    "driver_free_ready_bytes": 538509312,
+    "ballast": {
+      "driver_free_before_bytes": 73708142592,
+      "driver_free_ready_bytes": 538509312,
+      "ballast_allocated_bytes": 73169633280,
+      "ballast_torch_reserved_bytes": 73169633280
+    },
+    "first_pressure_request": {
+      "index": 0,
+      "ttft_s": 0.06847312906756997,
+      "tpot_s": 0.00777289444314582,
+      "activation_delta": {
+        "activation_trim_bytes": 1056964608,
+        "activation_flush_freed_bytes": 0,
+        "activation_trim_calls": 1,
+        "activation_flush_calls": 0
+      }
+    },
+    "subsequent_pressure_requests": [
+      {
+        "index": 1,
+        "ttft_s": 0.028960489202290773,
+        "tpot_s": 0.007650334188448531,
+        "activation_delta": {
+          "activation_trim_bytes": 0,
+          "activation_flush_freed_bytes": 0,
+          "activation_trim_calls": 0,
+          "activation_flush_calls": 0
+        }
+      },
+      {
+        "index": 2,
+        "ttft_s": 0.028155074920505285,
+        "tpot_s": 0.007649044639297894,
+        "activation_delta": {
+          "activation_trim_bytes": 0,
+          "activation_flush_freed_bytes": 0,
+          "activation_trim_calls": 0,
+          "activation_flush_calls": 0
+        }
+      }
+    ],
+    "whole_gpu_nvml_before_bytes": 85360836608,
+    "whole_gpu_nvml_after_bytes": 84303872000,
+    "whole_gpu_nvml_peak_bytes": 85360836608
+  },
+  "note": "Fixed mechanism scenario. Whole-GPU NVML samples include ballast."
+}

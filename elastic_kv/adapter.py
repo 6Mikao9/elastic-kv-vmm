@@ -1,6 +1,7 @@
 """Opt-in dense-MHA adapter; no attention kernel or model weights are changed.
 
-Supported: SGLang 0.5.2, TP=1, page_size=1, Triton attention, eager,
+Supported: SGLang 0.5.2, TP=1, page_size=1, Triton attention, eager or
+guarded decode CUDA Graph (baseline/V4/V5),
 no overlap, no radix cache, no speculative decoding or disaggregation.
 """
 import json
@@ -13,9 +14,11 @@ import numpy as np
 import torch
 
 from .backing import Backing
+from . import activation
+from .slots import FreeSlots
 
 MODE = os.environ.get("EKV_MODE", "baseline")
-VALID_MODES = ("baseline", "v0", "v1", "v2", "v3", "v4")
+VALID_MODES = ("baseline", "v0", "v1", "v2", "v3", "v4", "v5")
 HOST_FREE_MODES = ("v2", "v3", "v4")
 CONTROLLERS = []
 _installed = False
@@ -69,6 +72,9 @@ class Residency:
         self.slot_bytes = slot_bytes
         self.layout = layout
         self.chunk_bytes = int(os.environ.get("EKV_CHUNK_MIB", "2")) << 20
+        self.retain_chunks = int(os.environ.get("EKV_RETAIN_CHUNKS", "1"))
+        if self.retain_chunks < 1:
+            raise ValueError("EKV_RETAIN_CHUNKS must retain at least the sink chunk")
         self.live = np.zeros(pool.size + pool.page_size, dtype=np.bool_)
         self.live[0] = True
         self.counts = np.zeros((len(self.live) * slot_bytes + self.chunk_bytes - 1)
@@ -76,6 +82,9 @@ class Residency:
         self.counts[0] = 1  # permanent dummy/sink slot
         self.counters = dict(alloc_calls=0, free_calls=0, index_d2h_ns=0, hook_ns=0)
         self.peak = 0
+        if MODE == "v5":
+            self.live_count = 0
+            self.backed = sum(arena.backed_bytes for arena in self.arenas)
         self.last_publish = 0.0
         self.stats_path = os.environ.get("EKV_STATS_PATH")
         self.logical_bytes = (pool.size + pool.page_size) * pool.head_num * pool.head_dim * pool.dtype.itemsize * pool.layer_num * 2
@@ -108,6 +117,53 @@ class Residency:
         self.counters["alloc_calls"] += 1
         self.publish()
 
+    def admit_ranges(self, ranges):
+        if not ranges:
+            return
+        if self.slot_bytes > self.chunk_bytes:
+            raise ValueError("slot exceeds VMM chunk size")
+        needed = set()
+        previous_stop = 1
+        for start, stop in ranges:
+            if start < previous_stop or stop > len(self.live) or start >= stop or self.live[start:stop].any():
+                raise RuntimeError("invalid or already-live token slot")
+            previous_stop = stop
+            first = start * self.slot_bytes // self.chunk_bytes
+            last = (stop * self.slot_bytes - 1) // self.chunk_bytes
+            needed.update(range(first, last + 1))
+        activation.before_admit(self, ranges)
+        for arena in self.arenas:
+            if not needed.issubset(arena.mapped_chunks):
+                arena.ensure(needed)
+                self.backed = sum(a.backed_bytes for a in self.arenas)
+        for start, stop in ranges:
+            self.live[start:stop] = True
+            self.live_count += stop - start
+        self.counters["alloc_calls"] += 1
+
+    def release_idle_only(self, ids):
+        if ids[0] < 1 or ids[-1] > self.pool.size or not self.live[ids].all():
+            raise RuntimeError("free of a non-live token slot")
+        if (ids[1:] == ids[:-1]).any():
+            raise RuntimeError("duplicate token free")
+        self.live[ids] = False
+        self.live_count -= len(ids)
+        self.counters["free_calls"] += 1
+
+    def reclaim_idle(self):
+        if self.live_count:
+            return
+        candidates = [(arena, {i for i in arena.mapped_chunks if i >= self.retain_chunks})
+                      for arena in self.arenas]
+        if any(indices for _, indices in candidates):
+            start = time.perf_counter_ns()
+            torch.cuda.synchronize()
+            self.counters.setdefault("boundary_sync_ns", 0)
+            self.counters["boundary_sync_ns"] += time.perf_counter_ns() - start
+            for arena, indices in candidates:
+                arena.reclaim(indices, synchronize=False)
+            self.backed = sum(arena.backed_bytes for arena in self.arenas)
+
     def release(self, ids):
         if len(ids) == 0:
             return
@@ -134,7 +190,10 @@ class Residency:
         self.publish(force=not self.live[1:].any())
 
     def publish(self, force=False):
-        backed = sum(arena.backed_bytes for arena in self.arenas) if self.arenas else self.logical_bytes
+        if MODE == "v5":
+            backed = self.backed
+        else:
+            backed = sum(arena.backed_bytes for arena in self.arenas) if self.arenas else self.logical_bytes
         self.peak = max(self.peak, backed)
         now = time.monotonic()
         if not self.stats_path or (not force and now - self.last_publish < .25):
@@ -145,8 +204,9 @@ class Residency:
                 metrics[key] = metrics.get(key, 0) + value
         result = {**metrics, **self.counters, "mode": MODE, "layout": self.layout,
                   "chunk_bytes": self.chunk_bytes, "logical_capacity_bytes": self.logical_bytes,
+                  "retain_chunks": self.retain_chunks if MODE == "v5" else None,
                   "backed_bytes": backed, "peak_backed_bytes": self.peak,
-                  "live_tokens": int(np.count_nonzero(self.live)) - 1}
+                  "live_tokens": self.live_count if MODE == "v5" else int(np.count_nonzero(self.live)) - 1}
         target = Path(self.stats_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         temp = target.with_suffix(".tmp")
@@ -185,7 +245,7 @@ def install():
                 self.k_buffer, self.v_buffer = views[:self.layer_num], views[self.layer_num:]
                 stride = elements * itemsize
                 layout = "layer_contiguous"
-            elif MODE in ("v3", "v4"):
+            elif MODE in ("v3", "v4", "v5"):
                 stride = elements * itemsize
                 projection = PlaneProjection(slots * stride, 2 * self.layer_num, chunk, self.device)
                 projection.ensure([0])
@@ -226,11 +286,15 @@ def install():
             if MODE in HOST_FREE_MODES:
                 self.host_free = np.ones(self.size + 1, dtype=np.bool_)
                 self.host_free[0] = False
-            if MODE == "v4":
+            if MODE in ("v4", "v5"):
                 self.ctrl.counters.update(contiguous_id_view_calls=0, id_upload_calls=0)
+                if MODE == "v5":
+                    self.ctrl.counters.update(interval_alloc_calls=0, fragmented_alloc_calls=0)
                 self.ctrl.publish(force=True)
 
         def available_size(self):
+            if MODE == "v5":
+                return self.free_slots.count
             if MODE in HOST_FREE_MODES and hasattr(self, "host_free"):
                 return int(np.count_nonzero(self.host_free))
             return super().available_size()
@@ -239,18 +303,48 @@ def install():
             if hasattr(self, "ctrl") and MODE != "baseline":
                 ids = np.flatnonzero(self.ctrl.live[1:]) + 1
                 if len(ids):
-                    self.ctrl.release(ids)
+                    if MODE == "v5":
+                        self.ctrl.release_idle_only(ids)
+                    else:
+                        self.ctrl.release(ids)
             super().clear()
-            if MODE == "v4":
+            if MODE == "v5":
+                self.free_slots = FreeSlots(self.size)
+            if MODE in ("v4", "v5"):
                 self.gpu_slot_ids = self.free_pages
             if MODE in HOST_FREE_MODES and hasattr(self, "host_free"):
                 self.host_free[:] = True
                 self.host_free[0] = False
 
+            if MODE == "v5" and hasattr(self, "ctrl"):
+                self.ctrl.reclaim_idle()
+                self.ctrl.publish(force=True)
+
         def alloc(self, need_size):
             if MODE == "baseline":
                 return super().alloc(need_size)
             start = time.perf_counter_ns()
+            if MODE == "v5":
+                ranges = self.free_slots.peek(need_size)
+                if ranges is None:
+                    return None
+                if len(ranges) <= 1:
+                    start_slot = ranges[0][0] - 1 if ranges else 0
+                    result = self.gpu_slot_ids[start_slot:start_slot + need_size]
+                else:
+                    ids = np.concatenate([np.arange(lo, hi, dtype=np.int64) for lo, hi in ranges])
+                    result = torch.from_numpy(ids).to(self.device)
+                self.ctrl.admit_ranges(ranges)
+                self.free_slots.claim(ranges)
+                self.ctrl.counters["interval_alloc_calls"] += 1
+                if len(ranges) <= 1:
+                    self.ctrl.counters["contiguous_id_view_calls"] += 1
+                else:
+                    self.ctrl.counters["id_upload_calls"] += 1
+                    self.ctrl.counters["fragmented_alloc_calls"] += 1
+                self.ctrl.counters["hook_ns"] += time.perf_counter_ns() - start
+                self.ctrl.publish()
+                return result
             if MODE in HOST_FREE_MODES:
                 ids = np.flatnonzero(self.host_free)[:need_size]
                 if len(ids) < need_size:
@@ -280,7 +374,12 @@ def install():
             return result
 
         def free(self, free_index):
-            if MODE == "baseline" or not free_index.numel():
+            if MODE == "baseline":
+                result = super().free(free_index)
+                if self.is_not_in_free_group:
+                    self.ctrl.publish(force=True)
+                return result
+            if not free_index.numel():
                 return super().free(free_index)
             if not self.is_not_in_free_group:
                 self.free_group.append(free_index)
@@ -289,6 +388,14 @@ def install():
             copy_start = time.perf_counter_ns()
             ids = free_index.cpu().numpy()
             self.ctrl.counters["index_d2h_ns"] += time.perf_counter_ns() - copy_start
+            if MODE == "v5":
+                ids = np.sort(ids)
+                self.ctrl.release_idle_only(ids)
+                self.free_slots.release(ids)
+                self.ctrl.reclaim_idle()
+                self.ctrl.counters["hook_ns"] += time.perf_counter_ns() - start
+                self.ctrl.publish(force=not self.ctrl.live_count)
+                return
             self.ctrl.release(ids)
             if MODE in HOST_FREE_MODES:
                 self.host_free[ids] = True
@@ -308,7 +415,8 @@ def install():
 
     def guarded_init(self, *args, **kwargs):
         a = self.server_args
-        required = (a.page_size == 1, a.attention_backend == "triton", a.disable_cuda_graph,
+        graph_safe = a.disable_cuda_graph or MODE in ("baseline", "v4", "v5")
+        required = (a.page_size == 1, a.attention_backend == "triton", graph_safe,
                     a.disable_overlap_schedule, a.disable_radix_cache, a.tp_size == 1,
                     a.pp_size == 1, a.dp_size == 1, not a.enable_two_batch_overlap,
                     a.prefill_attention_backend in (None, "triton"),
@@ -316,10 +424,15 @@ def install():
                     a.disaggregation_mode == "null", not a.enable_memory_saver,
                     not a.speculative_algorithm, not a.enable_hierarchical_cache)
         if not all(required) or self.is_hybrid or self.is_hybrid_gdn or self.use_mla_backend:
-            raise RuntimeError("Unsupported configuration: require dense MHA, TP1, Triton, eager, no overlap/cache/spec/PD")
+            raise RuntimeError("Require dense MHA, TP1, Triton, supported Graph mode, no overlap/cache/spec/PD")
         original_init(self, *args, **kwargs)
 
     runner.MHATokenToKVPool = original_pool if MODE == "baseline" else ElasticPool
     runner.TokenToKVPoolAllocator = ObservedAllocator
     runner.ModelRunner.init_memory_pool = guarded_init
+    from .graph_support import install_graph_hooks
+    install_graph_hooks()
+    if MODE != "v5" and os.environ.get("EKV_ACTIVATION_POLICY", "off") != "off":
+        raise RuntimeError("Activation policies currently require V5")
+    activation.install_activation_hooks()
     _installed = True

@@ -1,0 +1,89 @@
+{
+  "fixture": "synthetic_vmm_activation_pressure",
+  "policy": "both",
+  "chunk_bytes": 2097152,
+  "pending_bytes": 2147483648,
+  "headroom_bytes": 134217728,
+  "samples": {
+    "initial": {
+      "driver_free_bytes": 84648329216,
+      "driver_total_bytes": 85093777408,
+      "torch_allocated_bytes": 0,
+      "torch_reserved_bytes": 0,
+      "nvml_used_bytes": 1251016704
+    },
+    "warm_and_cached": {
+      "driver_free_bytes": 82958024704,
+      "driver_total_bytes": 85093777408,
+      "torch_allocated_bytes": 0,
+      "torch_reserved_bytes": 1073741824,
+      "nvml_used_bytes": 2941321216
+    },
+    "before_policy": {
+      "driver_free_bytes": 1108279296,
+      "driver_total_bytes": 85093777408,
+      "torch_allocated_bytes": 81849745408,
+      "torch_reserved_bytes": 82923487232,
+      "nvml_used_bytes": 84791066624
+    },
+    "after_policy": {
+      "driver_free_bytes": 2714697728,
+      "driver_total_bytes": 85093777408,
+      "torch_allocated_bytes": 81849745408,
+      "torch_reserved_bytes": 81849745408,
+      "nvml_used_bytes": 83184648192
+    },
+    "after_ensure": {
+      "driver_free_bytes": 567214080,
+      "driver_total_bytes": 85093777408,
+      "torch_allocated_bytes": 81849745408,
+      "torch_reserved_bytes": 81849745408,
+      "nvml_used_bytes": 85332131840
+    },
+    "after_cleanup": {
+      "driver_free_bytes": 84568637440,
+      "driver_total_bytes": 85093777408,
+      "torch_allocated_bytes": 0,
+      "torch_reserved_bytes": 0,
+      "nvml_used_bytes": 1330708480
+    }
+  },
+  "counters": {
+    "activation_admission_samples": 1,
+    "activation_prefill_headroom_bytes": 134217728,
+    "activation_admission_free_low_bytes": 1108279296,
+    "activation_pressure_calls": 1,
+    "activation_trim_chunks": 254,
+    "activation_trim_calls": 1,
+    "activation_trim_bytes": 532676608,
+    "activation_trim_ns": 15962557,
+    "activation_flush_calls": 1,
+    "activation_flush_freed_bytes": 1073741824,
+    "activation_flush_ns": 553149
+  },
+  "ballast_bytes": 81849745408,
+  "torch_inactive_before_bytes": 1073741824,
+  "backed_after_policy_bytes": 4194304,
+  "sentinels_before_ensure": [
+    17,
+    29
+  ],
+  "committed_chunks": 1024,
+  "sentinels_after_ensure": [
+    17,
+    29
+  ],
+  "outcome": "mapped",
+  "backing_metrics": {
+    "ensure_calls": 2,
+    "ensure_chunks": 1280,
+    "ensure_ns": 103810476,
+    "reclaim_calls": 1,
+    "reclaim_chunks": 254,
+    "reclaim_ns": 15872297,
+    "reclaim_sync_ns": 0,
+    "peak_backed_bytes": 2151677952,
+    "backed_bytes": 2151677952,
+    "reserved_bytes": 4294967296
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "source": "telemetry-8192/adapter_stats.json",
+  "activation_prefill_peak_growth_bytes": 645922816,
+  "prefill_headroom_mib": 768,
+  "formula": "ceil(peak_bytes / (64 MiB)) * 64 MiB + 128 MiB",
+  "note": "Empirical experiment setting. This does not guarantee memory safety."
+}

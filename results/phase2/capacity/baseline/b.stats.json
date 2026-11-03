@@ -1,0 +1,1 @@
+{"alloc_calls": 0, "free_calls": 0, "index_d2h_ns": 0, "hook_ns": 0, "mode": "baseline", "layout": "stock", "chunk_bytes": 2097152, "logical_capacity_bytes": 34613084160, "retain_chunks": null, "backed_bytes": 34613084160, "peak_backed_bytes": 34613084160, "live_tokens": 0}

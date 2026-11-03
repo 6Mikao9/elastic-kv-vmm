@@ -75,7 +75,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True, type=Path)
     parser.add_argument("--label", required=True, help="public model label")
-    parser.add_argument("--mode", choices=("baseline", "v0", "v1", "v2", "v3", "v4"), required=True)
+    parser.add_argument("--mode", choices=("baseline", "v0", "v1", "v2", "v3", "v4", "v5"), required=True)
+    parser.add_argument("--execution", choices=("eager", "graph", "graph-pad"), default=os.environ.get("EKV_EXECUTION", "eager"))
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--workloads", nargs="+")
@@ -95,8 +96,14 @@ def main(argv=None):
             parser.error(f"output already exists: {path}; choose a new --output-dir")
 
     sources = ("elastic_kv/adapter.py", "elastic_kv/backing.py", "elastic_kv/launch.py",
+               "elastic_kv/slots.py", "elastic_kv/graph_support.py",
+               "elastic_kv/activation.py",
                "native/elastic_vmm.cpp", "benchmarks/client.py", "scripts/run_case.py")
-    manifest = {"mode": args.mode, "model_label": args.label,
+    manifest = {"mode": args.mode, "execution": args.execution, "model_label": args.label,
+                "retain_chunks": int(os.environ.get("EKV_RETAIN_CHUNKS", "1")),
+                "activation_policy": os.environ.get("EKV_ACTIVATION_POLICY", "off"),
+                "prefill_headroom_mib": int(os.environ.get("EKV_PREFILL_HEADROOM_MIB", "0")),
+                "prefill_chunk": int(os.environ.get("EKV_PREFILL_CHUNK", "2048")),
                 "sha256": {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
                            for name in sources}}
     (output / "source_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -112,10 +119,18 @@ def main(argv=None):
         "--model-path", str(args.model_path.resolve()),
         "--host", HOST, "--port", str(PORT),
         "--page-size", "1", "--attention-backend", "triton",
-        "--disable-cuda-graph", "--disable-overlap-schedule", "--disable-radix-cache",
+        "--disable-overlap-schedule", "--disable-radix-cache",
         "--max-total-tokens", "32768", "--context-length", "8192",
-        "--chunked-prefill-size", "2048", "--mem-fraction-static", "0.5",
+        "--chunked-prefill-size", os.environ.get("EKV_PREFILL_CHUNK", "2048"),
+        "--mem-fraction-static", "0.5",
     ]
+    if args.execution == "eager":
+        server_command.append("--disable-cuda-graph")
+    elif args.execution == "graph":
+        server_command.extend(("--disable-cuda-graph-padding", "--cuda-graph-bs",
+                               "1", "2", "3", "4", "5", "6", "7", "8"))
+    else:
+        server_command.extend(("--cuda-graph-bs", "1", "2", "4", "8"))
     client_command = [
         sys.executable, str(ROOT / "benchmarks" / "client.py"),
         "--url", URL, "--output", str(result_path),
@@ -123,6 +138,8 @@ def main(argv=None):
     ]
     if args.workloads is not None:
         client_command.extend(("--workloads", *args.workloads))
+    if args.execution == "graph-pad":
+        client_command.append("--padding-probes")
 
     server = None
     previous_sigterm = signal.signal(signal.SIGTERM, on_sigterm)

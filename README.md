@@ -1,14 +1,16 @@
 # elastic-kv-vmm
 
-A small research prototype for **demand-backed KV cache memory in SGLang**. It reserves stable CUDA virtual addresses, commits physical GPU memory before a token slot is written, and returns empty chunks to the driver after their users finish.
+A small research prototype for **demand-backed KV cache memory in SGLang and vLLM**. It reserves stable CUDA virtual addresses, commits physical GPU memory before a token slot is written, and returns unused chunks to the driver.
 
 The repository contains real model-serving experiments, not just allocation arithmetic. It measures the memory/latency trade-off of several layouts and allocator policies with Qwen3-0.6B-Base and Qwen3-4B on an A100 80GB.
 
-**Scope:** SGLang **0.5.2**, dense MHA, one GPU, BF16, Triton attention, token page size 1, eager execution, overlap scheduling and prefix caching disabled. Existing attention kernels and token IDs are retained. This is **not a removal of PagedAttention**, not an implementation of UnifiedKVPool's Mamba/SWA/Full topology, and not a production allocator.
+**SGLang scope:** **0.5.2**, dense MHA, one GPU, BF16, Triton attention, token page size 1, eager or CUDA Graph execution, overlap scheduling and prefix caching disabled. V4/V5 support tested exact and padded Graph batches. **vLLM scope:** **0.29.0**, legacy runner in the V1 engine, TP1, eager, one homogeneous full-attention cache group, block size 16 in the experiments. Both preserve engine slot/block indexing. Removing software paging, prefix-tree redesign and discrete Top-K optimization are [deferred research](docs/ROADMAP.md). The project does not implement UnifiedKVPool's Mamba/SWA/Full topology or a production allocator.
+
+The [Phase 2 report](docs/RESULTS_PHASE2.md) covers allocator optimization, Graph support, retained backing and application-level capacity. In a same-GPU experiment with an idle 0.6B co-tenant and a burst of 40 long 4B requests, V5 increased throughput from **484 to 614 output tokens/s** and reduced TTFT p95 from **29.96 to 15.46 s**. The static baseline's second model received less logical KV capacity at startup because the first model had already reserved its physical pool. A manually tuned static allocation reached **637 tokens/s**. V5 retains the first model's larger logical capacity, but its median request latency increases relative to the ordinary static baseline. This is evidence about stranded capacity and queue tails, not a general kernel speedup.
 
 ## Experiments
 
-All arms use the same 32,768-token logical KV capacity, 8,192 context limit and 2,048-token prefill chunk. Model snapshots are mounted read-only. Fixed seeds generate synthetic token inputs; inference runs through real HTTP requests, prefill, decode and streaming responses.
+The single-model layout/Graph arms use the same 32,768-token logical KV capacity, 8,192 context limit and 2,048-token prefill chunk. Activation and co-tenant experiments declare their separate settings. Model snapshots are mounted read-only. Fixed seeds generate synthetic token inputs; inference runs through real HTTP requests, prefill, decode and streaming responses.
 
 | Arm | Backing and policy | Question |
 |---|---|---|
@@ -18,10 +20,12 @@ All arms use the same 32,768-token logical KV capacity, 8,192 context limit and 
 | `v2` | Token-major layout, host low-ID reuse, 4 MiB growth headroom, reclaim at idle | Do fewer ID synchronizations and less mapping churn help? |
 | `v3` | Contiguous K/V planes in one padded reservation; batch their mappings; host ID allocation | Can the original attention layout be preserved while batching VMM work? |
 | `v4` | `v3` plus slices of a persistent GPU ID table for contiguous allocations | Can the common decode path avoid uploading token IDs? |
+| `v5` | `v4` plus disjoint free intervals, scalar free count and range-based admission | Can allocation avoid scanning the entire logical pool? |
+| `v5-keep8` | V5 with up to eight already-mapped chunks retained per K/V plane after idle | How much remapping overhead can a bounded warm reserve remove? |
 
 Three measured repetitions cover short serial requests, short concurrent requests, long concurrent requests and mixed lengths. Warmups are excluded. Twelve separate, fixed-order, batch-size-one greedy probes provide a controlled token-by-token comparison between arms.
 
-Results and plots are collected in [the experiment report](docs/RESULTS.md). [Measurement details](docs/MEASUREMENT.md) define TTFT, TPOT, throughput and the boundaries of the comparison. Raw request timings, 50 ms NVML samples and correctness token IDs accompany the report.
+Historical V0–V4 results are in [the Phase 1 report](docs/RESULTS.md); current comparisons are in [Phase 2](docs/RESULTS_PHASE2.md). [Measurement details](docs/MEASUREMENT.md) define TTFT, TPOT, throughput and the boundaries of the comparison. Raw request timings, 50 ms NVML samples and correctness token IDs accompany the reports. Single-model percentiles use linear interpolation; the capacity experiment explicitly uses nearest-rank p95.
 
 With V4, whole-device idle memory fell from **6.304 to 2.804 GiB** on 0.6B and from **13.850 to 9.350 GiB** on 4B. Throughput decreased by 2.8–5.6% and 0.2–2.3%, respectively, across the four workloads. The 4B mixed workload's TTFT increased by about 27%. A separate V2 two-instance run reduced the both-active sampled peak from **19.366 to 12.225 GiB**, with aggregate throughput decreasing 2.4%. These are workload-specific measurements with three repeats, not full-capacity or production-serving guarantees.
 
@@ -31,7 +35,7 @@ With V4, whole-device idle memory fell from **6.304 to 2.804 GiB** on 0.6B and f
 
 ```mermaid
 flowchart LR
-    A[Allocate token IDs] --> B[Count live users of each chunk]
+    A[Allocate token IDs] --> B[Track live slots and required chunks]
     B --> C[Create and map missing physical chunks]
     C --> D[Existing SGLang attention kernel]
     D --> E[Release token IDs]
@@ -63,10 +67,10 @@ export SGLANG_IMAGE=your-local-sglang-0.5.2-image
 MODEL_HUB=/path/to/existing/huggingface/hub
 MODEL_REL=models--Qwen--Qwen3-0.6B-Base/snapshots/da87bfb608c14b7cf20ba1ce41287e8de496c0cd
 bash scripts/container_case.sh 0 "$MODEL_HUB" "$MODEL_REL" \
-  Qwen3-0.6B-Base v4 results/my-v4-run 3
+  Qwen3-0.6B-Base v5 results/my-v5-run 3
 ```
 
-Use a fresh output directory for every run. Substitute `baseline`, `v0`, `v1`, `v2` or `v3` to run the ablations. The Qwen3-4B snapshot revision is recorded in `environment.json`. Never copy weights into this repository.
+Use a fresh output directory for every run. Substitute `baseline` or `v0`–`v4` for ablations. Set `EKV_EXECUTION=graph-pad` for capture batches 1, 2, 4, 8 (including additional 3/5/3-request padding probes), or `graph` for exact batches 1–8. `EKV_RETAIN_CHUNKS=8` selects the warm retention policy. These are environment variables on the container script. The Qwen3-4B snapshot revision is recorded in `environment.json`. Never copy weights into this repository.
 
 For an existing isolated environment, the direct entry point is `python3 -m elastic_kv.launch` with the supported flags in `scripts/run_case.py`. The module entry point is required: it installs the adapter in the spawned scheduler process as well as the launcher. `EKV_MODE` selects the arm; `EKV_STATS_PATH` optionally records residency telemetry.
 
@@ -75,25 +79,25 @@ Summarize only explicitly selected completed runs:
 ```bash
 python3 benchmarks/summarize.py \
   --case Qwen3-0.6B-Base:baseline:results/my-baseline \
-  --case Qwen3-0.6B-Base:v4:results/my-v4-run \
+  --case Qwen3-0.6B-Base:v5:results/my-v5-run \
   --output-dir results/summary
 python3 benchmarks/plot.py results/summary/summary.json --output-dir docs/figures
 ```
 
-The summarizer rejects incomplete runs, mismatched input prompts, missing probe coverage and token-ID disagreements. Plotting additionally requires matplotlib. `scripts/run_dual.py` tests two model servers on one GPU; its shared-GPU experiment is separate from the single-instance ablations. Run it via `bash scripts/container_dual.sh 0 "$MODEL_HUB" v2 results/my-dual-v2`, with the two recorded snapshots already available. Reproduce the published dual tables with `python3 benchmarks/summarize_dual.py results/dual`.
+The summarizer rejects incomplete runs, mismatched input prompts, missing probe coverage and token-ID disagreements. Plotting additionally requires matplotlib. Phase 2 reproduction commands, capacity controls and activation tests are described in [the protocol](docs/PHASE2_PROTOCOL.md). The [vLLM adapter](vllm_integration/README.md) has its own runner, baseline and software environment. Do not interpret the two engines' numbers as a controlled comparison between engines.
 
 ## Integration points and limitations
 
 The adapter replaces `MHATokenToKVPool._create_buffers` and the plain `TokenToKVPoolAllocator` selected by `ModelRunner.init_memory_pool`. It guards unsupported configurations at startup and preserves the existing attention interface. The source SGLang installation is not modified on disk.
 
-See the [integration map](docs/INTEGRATION.md) for the changed components and the additional work needed for mixed state pools, cross-instance admission and prefill activation lending.
+See the [integration map](docs/INTEGRATION.md) for changed components, Graph lifetimes, prefill pressure coordination and the remaining work for mixed state pools and cross-instance admission.
 
 - VMM admission completes before the allocator publishes IDs to the forward pass. Reclamation waits for device work to finish. Slot zero remains backed.
 - `v0` and `v1` reclaim empty chunks on logical frees. The later arms defer reclamation until the instance is idle; they therefore do not promise prompt return of all slack under a permanently busy workload.
-- A fixed virtual address is not sufficient to make arbitrary unmapping safe. CUDA Graph replay, overlap scheduling, speculative decoding, HiCache/PD transfers, prefix-cache retention and hybrid recurrent states require additional lifetime protocols and are not supported here.
+- A fixed virtual address is not sufficient to make arbitrary unmapping safe. SGLang Graph padding uses a permanently backed sink row and maps real slots before replay. Overlap scheduling, speculative decoding, HiCache/PD transfers, prefix-cache retention and hybrid recurrent states remain unsupported. vLLM Graph execution remains unsupported.
 - CUDA allocation failures are fail-stop. A successfully mapped earlier plane may remain allocated until worker teardown if a later plane fails. There is no tested transactional OOM recovery, multi-tenant fairness or process-failure broker.
 - Two instances can independently release unused backing to the driver. The shared-GPU experiment does not implement a global admission broker, transfer live KV, force physical OOM or demonstrate safe preemption of another model.
-- Prefill activation-budget lending is not implemented. Extending the mechanism needs prefill admission, reclaimable KV semantics and coordination with PyTorch's caching allocator and Graph pools.
+- Optional V5 activation policies measure prefill demand, trim unused retained KV chunks before prefill under pressure, and return actually releasable PyTorch cache before new VMM commitment. They never evict live KV or release Graph pools. Headroom is empirical; unresolved pressure is recorded, not converted into scheduler backpressure. This is not a guaranteed activation-budget lender or OOM recovery system.
 
 ## Related work
 

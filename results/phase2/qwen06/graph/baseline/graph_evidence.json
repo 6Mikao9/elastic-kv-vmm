@@ -1,0 +1,6 @@
+{
+  "source": "SGLang decode log",
+  "engine_decode_log_graph_true_count": 132,
+  "server_log_sha256": "ced69a0af16a37878f351c0722e4dd084aa76ab3dcf862cda38e2c561762c53b",
+  "note": "Baseline telemetry was last published at capture. These periodic engine log lines confirm Graph decode but are not an exact replay count."
+}

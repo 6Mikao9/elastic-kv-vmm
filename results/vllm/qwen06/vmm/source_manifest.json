@@ -1,0 +1,18 @@
+{
+  "engine": "vllm",
+  "engine_version": "0.29.0",
+  "mode": "vmm",
+  "sha256": {
+    "vllm_integration/README.md": "8d62930eba40e7f694ed6a141d941d9b61f35a775b21162a38fcc402d610cf92",
+    "vllm_integration/adapter.py": "8ea87631fa7e01bd0d3de4c105bf74a8decfb0d37147a567e80778c11828406e",
+    "vllm_integration/client.py": "e750c0e292ffdcd7b9319ba7f36bdcfb29aa43ffb6b5388ce12d26b9f5091856",
+    "vllm_integration/container_case.sh": "4d1d553abcccf22576b24035b2bf486f4bc8d45469d7fe6a38f4e1ec40ebaa5a",
+    "vllm_integration/launch.py": "7f7fc34d2335ceb77e166c158fde09529cf42fc4826fc7bc5f39746d9fdf1886",
+    "vllm_integration/run_case.py": "56e976dfdc6950458b8d8f3f24e85b30531f5ffb931e69d4ad479e8c41f632a8",
+    "vllm_integration/run_matrix.sh": "6239c3057a096c4b1cd7f25f49e9cdcd875be8b94eb4aec77eab68cdd623e6e2",
+    "elastic_kv/backing.py": "d9e540a5f92cba768cde3d117a9daf9c00059a16ea32cfe5849d40bb45250864",
+    "native/elastic_vmm.cpp": "b31d846bc0fd9dd7e0f34d0d8c9dda10ceb6bfd5ad3a427f097062fd4e67869a",
+    "benchmarks/client.py": "126f6022c0dbba1343e1e23fc33cb852048fab252bcbb9690fb3e9981743ad2b",
+    "scripts/run_case.py": "723b029f15b8e7e781e6fd81cdcafa8a05d04e84a8ebfa55f089ecbf04a3c814"
+  }
+}

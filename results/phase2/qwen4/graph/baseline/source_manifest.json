@@ -1,0 +1,15 @@
+{
+  "mode": "baseline",
+  "execution": "graph",
+  "model_label": "Qwen3-4B",
+  "sha256": {
+    "elastic_kv/adapter.py": "b9f9340d5ea51f7100f0a56f4ea2a191db4a5316fdc659cbfabcdf8562a1c5d7",
+    "elastic_kv/backing.py": "d9e540a5f92cba768cde3d117a9daf9c00059a16ea32cfe5849d40bb45250864",
+    "elastic_kv/launch.py": "823dedb75a2c2038f61a4f65f5d98abef0b97d013987ea6fdf09876ab1e8f5b8",
+    "elastic_kv/slots.py": "ca19cf72aa5260f94912891c2aa016fc8caff7f4a51e5c4f9fea22829ca87c4f",
+    "elastic_kv/graph_support.py": "24f60545191a4b0bb5dfa73d1f947531c0d6110a5ef6a9e820171b33f55c9a53",
+    "native/elastic_vmm.cpp": "b31d846bc0fd9dd7e0f34d0d8c9dda10ceb6bfd5ad3a427f097062fd4e67869a",
+    "benchmarks/client.py": "5729d2218f401504746befe2334d36523c4ff81d210d314d799be5304fe66ecd",
+    "scripts/run_case.py": "966de19fa77dceb860cf11824f3791d86a09cf2563e87c817f53f2417451ef81"
+  }
+}

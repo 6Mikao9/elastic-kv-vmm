@@ -57,6 +57,33 @@ class ResidencyTest(unittest.TestCase):
         for arena in self.arenas:
             self.assertEqual(arena.mapped_chunks, expected)
 
+    def test_idle_policy_retains_only_configured_mapped_prefix(self):
+        with patch.object(adapter, "MODE", "v5"):
+            self.ctrl = adapter.Residency(self.ctrl.pool, self.arenas, SLOT, "test")
+            self.ctrl.retain_chunks = 2
+            self.ctrl.admit_ranges([(1, 4)])
+            self.assertEqual(self.ctrl.live_count, 3)
+            self.assert_mapping({0, 1, 2})
+            self.ctrl.release_idle_only(np.array([1, 2]))
+            self.ctrl.reclaim_idle()
+            self.assert_mapping({0, 1, 2})
+            self.synchronize.assert_not_called()
+            self.ctrl.release_idle_only(np.array([3]))
+            self.ctrl.reclaim_idle()
+            self.assertEqual(self.ctrl.live_count, 0)
+            self.assert_mapping({0, 1})
+            self.synchronize.assert_called_once()
+
+    def test_idle_policy_rejects_duplicate_free_before_mutation(self):
+        with patch.object(adapter, "MODE", "v5"):
+            self.ctrl = adapter.Residency(self.ctrl.pool, self.arenas, SLOT, "test")
+        self.ctrl.admit_ranges([(1, 3)])
+        before = self.ctrl.live.copy()
+        with self.assertRaises(RuntimeError):
+            self.ctrl.release_idle_only(np.array([1, 1]))
+        np.testing.assert_array_equal(self.ctrl.live, before)
+        self.assertEqual(self.ctrl.live_count, 2)
+
     def test_crossing_slots_retain_shared_chunks(self):
         # Slot 1 touches chunks 0,1. Slot 2 touches chunks 1,2.
         # Slot 3 touches only chunk 2, leaving it live after 1 and 2 finish.

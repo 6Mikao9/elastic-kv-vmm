@@ -1,0 +1,1 @@
+{"alloc_calls": 0, "free_calls": 0, "index_d2h_ns": 0, "hook_ns": 0, "graph_capture_calls": 1, "actual_graph_replay_calls": 5698, "padded_graph_replay_calls": 381, "mode": "baseline", "layout": "stock", "chunk_bytes": 2097152, "logical_capacity_bytes": 3758211072, "retain_chunks": null, "backed_bytes": 3758211072, "peak_backed_bytes": 3758211072, "live_tokens": 0}

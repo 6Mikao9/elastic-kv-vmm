@@ -20,6 +20,11 @@ docker run --rm --pull=never --gpus "device=$gpu" --network none --shm-size 1g \
     --mount "type=bind,src=$hub,dst=/hf/hub,readonly" \
     --mount "type=bind,src=$root,dst=/experiment" --workdir /experiment \
     -e "BENCH_GPU_UUID=${gpu_uuid// /}" -e HOME=/experiment/cache/e2e/home \
+    -e EKV_EXECUTION="${EKV_EXECUTION:-eager}" \
+    -e EKV_RETAIN_CHUNKS="${EKV_RETAIN_CHUNKS:-1}" \
+    -e EKV_ACTIVATION_POLICY="${EKV_ACTIVATION_POLICY:-off}" \
+    -e EKV_PREFILL_HEADROOM_MIB="${EKV_PREFILL_HEADROOM_MIB:-0}" \
+    -e EKV_PREFILL_CHUNK="${EKV_PREFILL_CHUNK:-2048}" \
     -e HF_HOME=/experiment/cache/e2e/hf -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
     -e XDG_CACHE_HOME=/experiment/cache/e2e/xdg -e TORCH_HOME=/experiment/cache/e2e/torch \
     -e TRITON_CACHE_DIR=/experiment/cache/e2e/triton \

@@ -1,0 +1,25 @@
+{
+  "experiment_date": "2026-11-03",
+  "image_tag": "vllm/vllm-openai:v0.29.0",
+  "gpu": "NVIDIA A100-SXM4-80GB",
+  "driver": "580.178.04",
+  "python": "3.12.3",
+  "packages": {
+    "vllm": "0.29.0",
+    "torch": "2.13.0+cu130",
+    "cupy-cuda13x": "14.2.0",
+    "triton": "3.7.1",
+    "transformers": "5.16.1",
+    "numpy": "2.2.6",
+    "requests": "2.34.2",
+    "nvidia-ml-py": "13.610.43"
+  },
+  "model_mount": "read-only",
+  "models": {
+    "Qwen/Qwen3-0.6B-Base": "da87bfb608c14b7cf20ba1ce41287e8de496c0cd",
+    "Qwen/Qwen3-4B": "1cfa9a7208912126459214e8b04321603b3df60c"
+  },
+  "native_library": "same driver-API library as the SGLang experiment",
+  "fresh_environment_build_verified": false,
+  "note": "Existing local image used; no installation or model download. Engine comparisons use separate baselines."
+}

@@ -1,49 +1,68 @@
 # Integration map
 
-This experiment installs an opt-in adapter into SGLang 0.5.2 at process
-startup. It does not edit the installed package or model weights. The
-prototype preserves the attention interface and logical token slot IDs.
+The opt-in SGLang 0.5.2 adapter installs at process startup and keeps the
+attention interface and logical token slot IDs. The supported path is dense
+MHA with Triton, page size 1 and TP/PP/DP size 1. It disables overlap, radix
+and hierarchical caching, speculative decoding and prefill/decode
+disaggregation.
 
-| Layer | Project file | Change |
+| Layer | Source | Integration |
 |---|---|---|
-| Physical backing | `native/elastic_vmm.cpp` | Reserve VA, create/map/access independent physical chunks, zero only newly mapped chunks, unmap and release unused handles |
-| Tensor view | `elastic_kv/backing.py` | Expose stable GPU addresses to PyTorch through CuPy/DLPack and track committed chunks |
-| Pool construction | `elastic_kv/adapter.py`, `ElasticPool._create_buffers` | Replace fixed physical KV tensors with views into demand-backed virtual ranges |
-| Residency | `Residency.admit/release` | Count live slot references per physical chunk; finish mapping before admitting writes; synchronize before reclaim |
-| Token allocation | `ObservedAllocator.alloc/free` | Retain the existing slot interface, reuse low IDs, and in V4 return persistent GPU ID slices when contiguous |
-| Startup | `elastic_kv/launch.py`, `guarded_init` | Install in spawned workers and reject unsupported execution paths |
+| Physical memory | [elastic_vmm.cpp](../native/elastic_vmm.cpp), [backing.py](../elastic_kv/backing.py) | Reserve stable virtual addresses, map and zero newly committed CUDA chunks, then unmap and release unused physical handles. CuPy/DLPack exposes those addresses as PyTorch tensors. |
+| Pool construction | [adapter.py](../elastic_kv/adapter.py) | Hook `ModelRunner.init_memory_pool` and `MHATokenToKVPool._create_buffers` to provide demand-backed K/V planes. |
+| Slot allocation | [adapter.py](../elastic_kv/adapter.py) | V5 tracks free ID ranges on the host, favors low IDs and admits ranges before writes. Contiguous allocations use slices of a persistent GPU ID tensor. Fragmented allocations return the selected IDs through the existing allocator interface. |
+| Residency | [adapter.py](../elastic_kv/adapter.py) | V5 defers ordinary reclaim until the pool drains, synchronizes before unmapping and can retain a configurable low-ID chunk reserve with `EKV_RETAIN_CHUNKS`. Logical capacity remains fixed. |
+| Startup | [launch.py](../elastic_kv/launch.py), [adapter.py](../elastic_kv/adapter.py) | Install hooks in the server process tree and reject unsupported configurations. |
 
-The upstream entry points are `ModelRunner.init_memory_pool`,
-`MHATokenToKVPool._create_buffers`, and `TokenToKVPoolAllocator`.
-V0–V4 vary layout and allocation policy within these hooks. All have the
-same configured logical token capacity. Released physical bytes become
-available to other CUDA allocations; increasing another server's logical
-capacity still requires an admission and capacity policy.
+## Decode CUDA Graph
 
-## Extending to a memory management system
+The SGLang baseline, V4 and V5 paths support decode CUDA Graph in the
+guarded configuration. Graphs keep the same virtual K/V addresses through
+mapping and reclaim cycles. Slot zero remains backed. Capture starts from
+an idle pool, with request indices pointing at an extra request table row
+outside the allocator's free list. Triton uses a capture sequence length of
+one, so the first entry of that row points to slot zero. For padded replay,
+the adapter resets the request-index tail to that row before the upstream
+metadata update. The upstream runner resets padded write positions to slot
+zero and copies real request indices and write positions into the prefix.
+This prevents a smaller batch from inheriting stale indices into a reclaimed
+range. See [graph_support.py](../elastic_kv/graph_support.py).
 
-1. **Physical budget and admission:** track weights, activation demand,
-   committed KV, growth headroom and outstanding grants. Map before the
-   scheduler admits work; handle allocation failure transactionally.
-2. **Mixed state pools:** give Full KV, SWA and Mamba independent virtual
-   ranges, with local slot allocators and one shared byte budget. Preserve
-   the Full/SWA ID relationship and make joint allocations atomic. This
-   removes neighboring-range collisions but does not itself solve sparse
-   live-data fragmentation inside a physical chunk.
-3. **Runtime lifetimes:** track retained prefixes, in-flight kernels,
-   transfers and Graph replay references. The current eager-only device
-   synchronization is a correctness boundary, not the intended final
-   performance design.
-4. **Cross-instance coordination:** reclaim only unused or explicitly
-   evictable backing, acknowledge release before granting growth to a
-   peer, and define fairness, minimum capacity and process-failure cleanup.
-   A global broker and live-KV preemption are absent from this experiment.
-5. **Prefill headroom:** estimate the next prefill demand and coordinate
-   reclaim with PyTorch's caching allocator and Graph pools. Compare with
-   a tuned chunked-prefill baseline. Activation-budget lending is not
-   implemented here.
+## Prefill activation pressure
 
-The newer UnifiedKVPool Mamba/SWA/Full topology is a separate integration
-target. The measured dense-MHA adapter does not validate that topology.
-Removing attention's software page-table lookup is also a separate kernel
-and indexing change; CUDA VMM alone does not do it.
+The optional V5 hooks mark `ScheduleBatch.prepare_for_extend` as prefill
+context and instrument `ModelRunner.forward_extend` to sample CUDA memory
+around prefill. Before committing new KV chunks, the adapter compares free
+device memory with the pending backing bytes plus a configured prefill
+headroom target. `EKV_ACTIVATION_POLICY` selects `off`, `telemetry`,
+`trim`, `recycle` or `both`. The headroom target is set with
+`EKV_PREFILL_HEADROOM_MIB`. See [activation.py](../elastic_kv/activation.py).
+
+Under prefill pressure, trim can synchronize and release mapped chunks that
+contain neither live slots nor slots in the pending allocation. Recycle can
+ask PyTorch to release unused caching-allocator memory when the target still
+exceeds free memory. A shortfall is recorded and allocation proceeds through
+the usual path. The target is a heuristic. Scheduler admission, guaranteed
+activation budgets, transactional allocation failure and cross-instance
+memory grants remain separate work.
+
+## vLLM
+
+The vLLM 0.29.0 adapter selects the legacy GPU model runner in the V1 engine.
+Its scope is TP1 eager with prefix caching, async scheduling, speculation
+and KV connectors disabled. It requires one homogeneous full-attention cache
+group and matching manager and kernel block sizes. vLLM CUDA Graph is outside
+this integration. See [vLLM usage](../vllm_integration/README.md).
+
+The worker's `initialize_kv_cache_tensors` path replaces the backing
+allocation while reusing vLLM's native `create_kv_cache_views`. Before
+`_update_states`, the adapter maps blocks for new or resumed requests,
+appended blocks for cached requests and all blocks the worker will zero.
+After the last worker request finishes, it synchronizes and releases unused
+backing while keeping the sink resident. vLLM retains its software block
+table and logical paging. See [vLLM adapter](../vllm_integration/adapter.py)
+and [launcher](../vllm_integration/launch.py).
+
+Mixed Full/SWA/Mamba pools, live KV eviction and a global memory broker
+remain separate integration targets. Removing attention's software page
+lookup requires changes to the kernel and indexing path in addition to VMM.

@@ -1,0 +1,16 @@
+{
+  "mode": "vmm",
+  "num_blocks": 2048,
+  "live_requests": 0,
+  "logical_capacity_bytes": 4831838208,
+  "backed_bytes": 75497472,
+  "peak_backed_bytes": 2566914048,
+  "ensure_calls": 144,
+  "reclaim_calls": 54,
+  "ensure_chunks": 19620,
+  "ensure_ns": 1314812251,
+  "reclaim_chunks": 19584,
+  "reclaim_ns": 1127649221,
+  "reclaim_sync_ns": 5966537,
+  "reserved_bytes": 4831838208
+}

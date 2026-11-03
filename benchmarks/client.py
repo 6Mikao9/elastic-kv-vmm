@@ -40,6 +40,9 @@ STATS_NUMBERS = {
     "live_tokens", "alloc_calls", "free_calls", "index_d2h_ns", "hook_ns",
     "ensure_calls", "ensure_chunks", "ensure_ns", "reclaim_calls",
     "reclaim_chunks", "reclaim_ns", "reclaim_sync_ns", "reserved_bytes",
+    "actual_graph_replay_calls", "padded_graph_replay_calls", "graph_capture_calls", "boundary_sync_ns",
+    "interval_alloc_calls", "fragmented_alloc_calls", "contiguous_id_view_calls", "id_upload_calls",
+    "retain_chunks",
 }
 SAMPLE_SECONDS = 0.05
 IDLE_SECONDS = 0.3
@@ -280,7 +283,8 @@ class MemorySampler:
                     raw = json.load(source)
                 if not isinstance(raw, dict) or type(raw.get("backed_bytes")) is not int:
                     raise BenchmarkError("adapter stats lack integer backed_bytes")
-                stats = {key: raw[key] for key in STATS_NUMBERS
+                numeric_keys = STATS_NUMBERS | {key for key in raw if key.startswith("activation_")}
+                stats = {key: raw[key] for key in numeric_keys
                          if key in raw and type(raw[key]) in (int, float)}
                 # Do not copy arbitrary strings (paths, host names, or identifiers).
                 for key in ("mode", "layout"):
@@ -431,6 +435,8 @@ def main():
     parser.add_argument("--timeout", type=float, default=600, help="HTTP read timeout seconds")
     parser.add_argument("--correctness-only", action="store_true",
                         help="run fixed probes using metadata from the completed --output file")
+    parser.add_argument("--padding-probes", action="store_true",
+                        help="also run 3/5/3 concurrent long-request probes after performance")
     args = parser.parse_args()
     names = [name for item in args.workloads for name in item.split(",") if name]
     if not names or len(names) != len(set(names)) or any(name not in WORKLOADS for name in names):
@@ -513,6 +519,26 @@ def main():
                     failure_context = {"stage": "fixed_probe", "request_id": spec["request_id"]}
                     correctness["probes"].append(generate(url, spec, args.timeout, stream=False))
                     write_json(correctness_path, correctness)
+        if args.padding_probes:
+            correctness["padded_batches"] = []
+            for round_number, batch_size in enumerate((3, 5, 3)):
+                failure_context = {"stage": "padding_probe", "round": round_number}
+                specs = [{"request_id": f"padding/{round_number}/{batch_size}/{index}",
+                          "input_tokens": 4096, "requested_output_tokens": 128}
+                         for index in range(batch_size)]
+                with MemorySampler() as sampler:
+                    records, started, ended = run_requests(
+                        url, specs, batch_size, args.timeout, stream=False)
+                    time.sleep(IDLE_SECONDS)
+                    sampler.take()
+                for record in records:
+                    record.pop("_started_perf_s", None)
+                correctness["padded_batches"].append({
+                    "round": round_number, "batch_size": batch_size, "requests": records,
+                    "memory_samples": sampler.samples,
+                    "active_window_s": [started - sampler.origin, ended - sampler.origin],
+                })
+                write_json(correctness_path, correctness)
         correctness["status"] = "complete"
         write_json(correctness_path, correctness)
         return 0

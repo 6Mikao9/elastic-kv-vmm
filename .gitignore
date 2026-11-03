@@ -11,6 +11,9 @@ SGLang052接入简报.md
 .env.*
 results/pilot*/
 results/qwen06/baseline/
+results/phase2/pilot*/
+results/phase2/unit-tests.txt
+results/vllm/pilot*/
 *.safetensors
 *.bin
 *.pt

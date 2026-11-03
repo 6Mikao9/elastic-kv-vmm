@@ -1,0 +1,20 @@
+/usr/local/lib/python3.10/dist-packages/torch/cuda/__init__.py:63: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+test_decode_recycles_only_on_missing_backing (test_activation.ActivationTest) ... ok
+test_prefill_protects_live_and_prospective_chunks_and_resamples (test_activation.ActivationTest) ... ok
+test_release_and_recommit_one_hole (test_backing.BackingTest) ... ok
+test_captured_gather_reuses_virtual_addresses_after_recommit (test_graph_backing.GraphBackingTest) ... ok
+unittest.case.FunctionTestCase (test_padding_uses_unallocatable_sink) ... ok
+test_crossing_slots_retain_shared_chunks (test_residency.ResidencyTest) ... ok
+test_idle_policy_rejects_duplicate_free_before_mutation (test_residency.ResidencyTest) ... ok
+test_idle_policy_retains_only_configured_mapped_prefix (test_residency.ResidencyTest) ... ok
+test_int32_release_past_two_gib (test_residency.ResidencyTest) ... ok
+test_invalid_and_duplicate_frees_leave_state_intact (test_residency.ResidencyTest) ... ok
+test_fragmented_claim_and_bridge_merge (test_slots.FreeSlotsTest) ... ok
+test_peek_bounds_leave_state_intact (test_slots.FreeSlotsTest) ... ok
+test_randomized_conservation (test_slots.FreeSlotsTest) ... ok
+
+----------------------------------------------------------------------
+Ran 13 tests in 0.767s
+
+OK

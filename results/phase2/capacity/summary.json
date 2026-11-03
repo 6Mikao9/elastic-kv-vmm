@@ -1,0 +1,359 @@
+{
+  "metadata": {
+    "ttft_limits_s": [
+      5,
+      10,
+      20,
+      30
+    ],
+    "e2e_limit_s": 60,
+    "threshold_rule": "TTFT and E2E must both meet inclusive limits",
+    "p95_method": "nearest rank",
+    "scope": "Startup admission experiment. Static pool occupancy influences peer profiling and actual capacities.",
+    "baseline_tuned": "Uses prior traffic knowledge to manually lower the resident model A capacity."
+  },
+  "arms": {
+    "baseline": {
+      "requested_capacities": {
+        "a": 327680,
+        "b": 327680
+      },
+      "actual_capacity": {
+        "a": 327680,
+        "b": 234734
+      },
+      "steady": {
+        "elapsed_s": {
+          "median": 42.34102876018733,
+          "min": 42.3386679389514,
+          "max": 42.39177063014358
+        },
+        "output_tokens_per_s": {
+          "median": 483.6916012597468,
+          "min": 483.11263473003544,
+          "max": 483.71857209892244
+        },
+        "active_peak_device_used_bytes": {
+          "median": 84068859904,
+          "min": 84068859904,
+          "max": 84068859904
+        },
+        "post_idle_device_used_bytes": {
+          "median": 84068859904,
+          "min": 84068859904,
+          "max": 84068859904
+        },
+        "ttft_s": {
+          "median": 7.7204043893143535,
+          "p95": 29.962942813988775
+        },
+        "end_to_end_s": {
+          "median": 28.927854241570458,
+          "p95": 42.16793963359669
+        },
+        "tpot_s": {
+          "median": 0.04146389208037822,
+          "p95": 0.05452630951282534
+        },
+        "thresholds": {
+          "5": {
+            "request_fraction": 0.325,
+            "phase_success_requests_per_s_median": 0.30703080158089396
+          },
+          "10": {
+            "request_fraction": 0.65,
+            "phase_success_requests_per_s_median": 0.6140616031617879
+          },
+          "20": {
+            "request_fraction": 0.875,
+            "phase_success_requests_per_s_median": 0.8266213888716376
+          },
+          "30": {
+            "request_fraction": 0.95,
+            "phase_success_requests_per_s_median": 0.8974746507749208
+          }
+        }
+      },
+      "first_burst": {
+        "elapsed_s": {
+          "median": 42.37560558877885,
+          "min": 42.37560558877885,
+          "max": 42.37560558877885
+        },
+        "output_tokens_per_s": {
+          "median": 483.2969279245686,
+          "min": 483.2969279245686,
+          "max": 483.2969279245686
+        },
+        "active_peak_device_used_bytes": {
+          "median": 84068859904,
+          "min": 84068859904,
+          "max": 84068859904
+        },
+        "post_idle_device_used_bytes": {
+          "median": 84068859904,
+          "min": 84068859904,
+          "max": 84068859904
+        },
+        "ttft_s": {
+          "median": 7.7205198362935334,
+          "p95": 29.908302810043097
+        },
+        "end_to_end_s": {
+          "median": 28.944418620085344,
+          "p95": 42.18848643777892
+        },
+        "tpot_s": {
+          "median": 0.04144304964888236,
+          "p95": 0.054326701025367366
+        },
+        "thresholds": {
+          "5": {
+            "request_fraction": 0.325,
+            "phase_success_requests_per_s_median": 0.30678027651461875
+          },
+          "10": {
+            "request_fraction": 0.65,
+            "phase_success_requests_per_s_median": 0.6135605530292375
+          },
+          "20": {
+            "request_fraction": 0.875,
+            "phase_success_requests_per_s_median": 0.8259468983085889
+          },
+          "30": {
+            "request_fraction": 0.95,
+            "phase_success_requests_per_s_median": 0.8967423467350394
+          }
+        }
+      }
+    },
+    "v5": {
+      "requested_capacities": {
+        "a": 327680,
+        "b": 327680
+      },
+      "actual_capacity": {
+        "a": 327680,
+        "b": 327680
+      },
+      "steady": {
+        "elapsed_s": {
+          "median": 33.34796939464286,
+          "min": 33.330383548978716,
+          "max": 33.3758334829472
+        },
+        "output_tokens_per_s": {
+          "median": 614.1303465178897,
+          "min": 613.6176347615078,
+          "max": 614.454375237081
+        },
+        "active_peak_device_used_bytes": {
+          "median": 51017744384,
+          "min": 51017744384,
+          "max": 51017744384
+        },
+        "post_idle_device_used_bytes": {
+          "median": 11910053888,
+          "min": 11910053888,
+          "max": 11910053888
+        },
+        "ttft_s": {
+          "median": 8.327107878401875,
+          "p95": 15.46161946002394
+        },
+        "end_to_end_s": {
+          "median": 33.20071669993922,
+          "p95": 33.28974411310628
+        },
+        "tpot_s": {
+          "median": 0.048674601140211535,
+          "p95": 0.06274276192221652
+        },
+        "thresholds": {
+          "5": {
+            "request_fraction": 0.3,
+            "phase_success_requests_per_s_median": 0.359841999912826
+          },
+          "10": {
+            "request_fraction": 0.6,
+            "phase_success_requests_per_s_median": 0.719683999825652
+          },
+          "20": {
+            "request_fraction": 1.0,
+            "phase_success_requests_per_s_median": 1.1994733330427534
+          },
+          "30": {
+            "request_fraction": 1.0,
+            "phase_success_requests_per_s_median": 1.1994733330427534
+          }
+        }
+      },
+      "first_burst": {
+        "elapsed_s": {
+          "median": 33.50050621107221,
+          "min": 33.50050621107221,
+          "max": 33.50050621107221
+        },
+        "output_tokens_per_s": {
+          "median": 611.3340458488709,
+          "min": 611.3340458488709,
+          "max": 611.3340458488709
+        },
+        "active_peak_device_used_bytes": {
+          "median": 50977898496,
+          "min": 50977898496,
+          "max": 50977898496
+        },
+        "post_idle_device_used_bytes": {
+          "median": 11870208000,
+          "min": 11870208000,
+          "max": 11870208000
+        },
+        "ttft_s": {
+          "median": 8.34367739642039,
+          "p95": 15.432410451117903
+        },
+        "end_to_end_s": {
+          "median": 33.322382379323244,
+          "p95": 33.441413630731404
+        },
+        "tpot_s": {
+          "median": 0.04886828362212722,
+          "p95": 0.06296876953265934
+        },
+        "thresholds": {
+          "5": {
+            "request_fraction": 0.3,
+            "phase_success_requests_per_s_median": 0.35820354248957276
+          },
+          "10": {
+            "request_fraction": 0.6,
+            "phase_success_requests_per_s_median": 0.7164070849791455
+          },
+          "20": {
+            "request_fraction": 1.0,
+            "phase_success_requests_per_s_median": 1.194011808298576
+          },
+          "30": {
+            "request_fraction": 1.0,
+            "phase_success_requests_per_s_median": 1.194011808298576
+          }
+        }
+      }
+    },
+    "baseline-tuned": {
+      "requested_capacities": {
+        "a": 32768,
+        "b": 327680
+      },
+      "actual_capacity": {
+        "a": 32768,
+        "b": 327680
+      },
+      "steady": {
+        "elapsed_s": {
+          "median": 32.15000490099192,
+          "min": 32.13812173111364,
+          "max": 32.16923741903156
+        },
+        "output_tokens_per_s": {
+          "median": 637.0138997822714,
+          "min": 636.6330582609297,
+          "max": 637.2494376413059
+        },
+        "active_peak_device_used_bytes": {
+          "median": 63999115264,
+          "min": 63999115264,
+          "max": 63999115264
+        },
+        "post_idle_device_used_bytes": {
+          "median": 63999115264,
+          "min": 63999115264,
+          "max": 63999115264
+        },
+        "ttft_s": {
+          "median": 7.764533190056682,
+          "p95": 14.366493698209524
+        },
+        "end_to_end_s": {
+          "median": 31.994409664766863,
+          "p95": 32.1029417370446
+        },
+        "tpot_s": {
+          "median": 0.04738682936767659,
+          "p95": 0.060486470175990854
+        },
+        "thresholds": {
+          "5": {
+            "request_fraction": 0.325,
+            "phase_success_requests_per_s_median": 0.4043545262289809
+          },
+          "10": {
+            "request_fraction": 0.65,
+            "phase_success_requests_per_s_median": 0.8087090524579618
+          },
+          "20": {
+            "request_fraction": 1.0,
+            "phase_success_requests_per_s_median": 1.244167773012249
+          },
+          "30": {
+            "request_fraction": 1.0,
+            "phase_success_requests_per_s_median": 1.244167773012249
+          }
+        }
+      },
+      "first_burst": {
+        "elapsed_s": {
+          "median": 32.65239254105836,
+          "min": 32.65239254105836,
+          "max": 32.65239254105836
+        },
+        "output_tokens_per_s": {
+          "median": 627.2128443343828,
+          "min": 627.2128443343828,
+          "max": 627.2128443343828
+        },
+        "active_peak_device_used_bytes": {
+          "median": 63959269376,
+          "min": 63959269376,
+          "max": 63959269376
+        },
+        "post_idle_device_used_bytes": {
+          "median": 63959269376,
+          "min": 63959269376,
+          "max": 63959269376
+        },
+        "ttft_s": {
+          "median": 8.091943435603753,
+          "p95": 14.654340500943363
+        },
+        "end_to_end_s": {
+          "median": 32.48995303292759,
+          "p95": 32.61001570196822
+        },
+        "tpot_s": {
+          "median": 0.04782325877587506,
+          "p95": 0.06142852306839829
+        },
+        "thresholds": {
+          "5": {
+            "request_fraction": 0.3,
+            "phase_success_requests_per_s_median": 0.3675075259771774
+          },
+          "10": {
+            "request_fraction": 0.625,
+            "phase_success_requests_per_s_median": 0.7656406791191196
+          },
+          "20": {
+            "request_fraction": 1.0,
+            "phase_success_requests_per_s_median": 1.2250250865905914
+          },
+          "30": {
+            "request_fraction": 1.0,
+            "phase_success_requests_per_s_median": 1.2250250865905914
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "mode": "v5",
+  "execution": "graph-pad",
+  "model_label": "Qwen3-4B",
+  "retain_chunks": 8,
+  "activation_policy": "telemetry",
+  "prefill_headroom_mib": 0,
+  "prefill_chunk": 512,
+  "sha256": {
+    "elastic_kv/adapter.py": "2a6edc48f929b90716eaec4cf6cc0e67bb5807ec75b4765a68635cb1ee66ce4e",
+    "elastic_kv/backing.py": "d9e540a5f92cba768cde3d117a9daf9c00059a16ea32cfe5849d40bb45250864",
+    "elastic_kv/launch.py": "823dedb75a2c2038f61a4f65f5d98abef0b97d013987ea6fdf09876ab1e8f5b8",
+    "elastic_kv/slots.py": "b972e472f20ebc2ca838b9784b1e3857591be2cd64b7c7712f8df7468d3b8ecc",
+    "elastic_kv/graph_support.py": "1d6a0d4bf890dbe8cd3c358f1bd179a31c14f55d2215c707f1f77b69a7ab026e",
+    "elastic_kv/activation.py": "499b8de0dc36ff635c0a28833a470a5a75dc51278ec3d78d97001a4bd7d53d6d",
+    "native/elastic_vmm.cpp": "b31d846bc0fd9dd7e0f34d0d8c9dda10ceb6bfd5ad3a427f097062fd4e67869a",
+    "benchmarks/client.py": "00738dadeceee0dedddb8c5b36b01731d6ac6096696cf8b1b222a16269b0b8a9",
+    "scripts/run_case.py": "b31377d000125557d3db8dd56e15c5024c3d7fbc2f63c68adb9bf6382df06f8c"
+  }
+}
