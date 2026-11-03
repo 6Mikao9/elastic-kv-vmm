@@ -1,0 +1,29 @@
+{
+  "demotions": 3,
+  "promotions": 0,
+  "migration_seconds": 0.2208607760258019,
+  "transfer_bytes": 1132554240,
+  "released_bytes": 503316480,
+  "growth_bytes": 0,
+  "max_observed_backed_bytes": 1006632960,
+  "reasons": {
+    "decode_pressure": 1,
+    "decode_pressure_group": 1
+  },
+  "rejected_cap": 0,
+  "rejected_dwell": 2,
+  "pressure_observations": 9,
+  "no_reclaimable_candidate": 7,
+  "group_actions": 1,
+  "group_sizes": {
+    "2": 1
+  },
+  "group_released_bytes": 251658240,
+  "group_requests_demoted": 2,
+  "slack_reclaim_actions": 0,
+  "slack_reclaim_bytes": 0,
+  "min_live_bytes": 251658240,
+  "max_live_bytes": 1006632960,
+  "min_reclaimable_bytes": 0,
+  "max_reclaimable_bytes": 0
+}

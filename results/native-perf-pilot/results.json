@@ -1,0 +1,67 @@
+{
+  "mode": "native",
+  "tp_size": 4,
+  "sm80_bf16_projections": true,
+  "vmm_backing": false,
+  "resident_limit": 0,
+  "status": "complete",
+  "probes": [
+    {
+      "input_tokens": 128,
+      "output_tokens": 16,
+      "elapsed_s": 2.6475093071348965,
+      "prompt_sha256": "6dd8ef052d69d43db646ff6a995d88aa611d9275fe0fa534b14c9350e881b8f1",
+      "output_ids": [
+        3431,
+        3431,
+        3431,
+        3431,
+        3431,
+        3431,
+        3431,
+        3431,
+        3431,
+        3431,
+        3431,
+        3431,
+        3431,
+        3431,
+        32,
+        88638
+      ],
+      "output_ids_sha256": "c9e96d92b171abb3ecf6eb9ce7fb27bbacbd43d93c46bae43b848602cf12df77"
+    },
+    {
+      "input_tokens": 8192,
+      "output_tokens": 16,
+      "elapsed_s": 3.280350419227034,
+      "prompt_sha256": "2f59eeca523ed02122c54eb834608e93848269c135557474bfe09416156b346e",
+      "output_ids": [
+        180,
+        4831,
+        2844,
+        4368,
+        2844,
+        4368,
+        2844,
+        4368,
+        2844,
+        4368,
+        2844,
+        4368,
+        2844,
+        4368,
+        2844,
+        4368
+      ],
+      "output_ids_sha256": "4044ff280aab56f6a378f739a1237280b8b237cdf930afabe4316f72ac3ef749"
+    }
+  ],
+  "capacity": {
+    "reported_pool_capacity": 32768,
+    "resolved_max_total_tokens": 32768,
+    "derived_logical_capacity": 65536,
+    "host_to_device_ratio": 2,
+    "derivation": "Audited MiniMax pool and allocator code; logical/index capacity is physical pool size times ratio."
+  }
+}

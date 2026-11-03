@@ -4,6 +4,7 @@ __pycache__/
 *.o
 cache/
 inspection/
+**/private_trace/
 SGLang052接入简报.md
 *.log
 *.tmp

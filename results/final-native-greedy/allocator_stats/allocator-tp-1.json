@@ -1,0 +1,10 @@
+{
+  "memory_allocated_bytes": 67541411840,
+  "memory_reserved_bytes": 68589453312,
+  "max_memory_allocated_bytes": 67815284224,
+  "max_memory_reserved_bytes": 69124227072,
+  "tp_rank": 1,
+  "tp_size": 4,
+  "boundary": "scheduler_idle",
+  "timestamp_monotonic_ns": 3625631154692027
+}

@@ -1,9 +1,9 @@
 # Research scope and order
 
-## Current delivery
+## Published dense backing phase
 
-Improve and validate the elastic physical-backing prototype before changing
-the attention addressing model:
+The dense SGLang and vLLM experiments cover the following work before
+changing the attention addressing model:
 
 1. Reduce allocator overhead and document memory/latency tradeoffs.
 2. Support CUDA Graph capture and replay, including safe padding lanes and
@@ -17,6 +17,21 @@ the attention addressing model:
    and validate correctness, memory and serving efficiency against vLLM's
    own baseline.
 6. Publish tested code, reproduction commands, raw measurements and limitations.
+
+## Request-level HiSparse phase
+
+The current MiniMax prototype keeps the native sparse attention algorithm
+and adds full GPU residency alongside the fixed native HiSparse hot pool.
+It implements safe eager transitions, physical-chunk-aware candidate
+selection, joint demotion, low-water promotion and anti-thrashing controls.
+Full selected-KV and migration-history byte checks have passed in the
+recorded scenarios. Compare native HiSparse, static mixed residency,
+fully resident execution and matched single/joint pressure policies;
+publish repeated timing, actual backing, whole-device memory and limits.
+
+Prefill activation allocation and MiniMax CUDA Graph support remain
+separate extensions. A configured prefill headroom term is not ownership
+of the activation allocator. See the [research report](HISPARSE_REPORT_ZH.md).
 
 ## Deferred research
 
@@ -36,6 +51,6 @@ After the current delivery is tested, documented and pushed:
   for stable virtual addresses and capacity management; its dense-prefix
   reads are not evidence of discrete Top-K performance.
 
-The current SGLang and initial vLLM adapters retain their engines' logical
+The dense, MiniMax and initial vLLM adapters retain their engines' logical
 slot/block indexing. They should be described as elastic physical-backing
 prototypes, not as completion of the deferred software-page-table removal.

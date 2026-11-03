@@ -1,0 +1,110 @@
+{
+  "mode": "native",
+  "tp_size": 4,
+  "sm80_bf16_projections": true,
+  "vmm_backing": false,
+  "resident_limit": 0,
+  "status": "complete",
+  "probes": [
+    {
+      "input_tokens": 128,
+      "output_tokens": 16,
+      "elapsed_s": 2.1202063537202775,
+      "prompt_sha256": "6dd8ef052d69d43db646ff6a995d88aa611d9275fe0fa534b14c9350e881b8f1",
+      "output_ids": [
+        3431,
+        3431,
+        2411,
+        2411,
+        2411,
+        2411,
+        2411,
+        88638,
+        6938,
+        2411,
+        2411,
+        2411,
+        2411,
+        88638,
+        6938,
+        2411
+      ],
+      "output_ids_sha256": "5c35c20c5bf006b96134fc545c6352a4e969ecf9f5e01e7b117b31c22630eec9"
+    },
+    {
+      "input_tokens": 8192,
+      "output_tokens": 16,
+      "elapsed_s": 3.0650781458243728,
+      "prompt_sha256": "2f59eeca523ed02122c54eb834608e93848269c135557474bfe09416156b346e",
+      "output_ids": [
+        180,
+        10,
+        44,
+        32,
+        200060,
+        367,
+        472,
+        367,
+        472,
+        367,
+        472,
+        367,
+        472,
+        367,
+        472,
+        367
+      ],
+      "output_ids_sha256": "5895e5ac1170a4383914d373623dd039f0ab1d840dc71d001dce25d3a9413866"
+    }
+  ],
+  "capacity": {
+    "reported_pool_capacity": 32768,
+    "resolved_max_total_tokens": 32768,
+    "derived_logical_capacity": 65536,
+    "host_to_device_ratio": 2,
+    "derivation": "Audited MiniMax pool and allocator code; logical/index capacity is physical pool size times ratio."
+  },
+  "allocator_idle": [
+    {
+      "memory_allocated_bytes": 67541475840,
+      "memory_reserved_bytes": 68589453312,
+      "max_memory_allocated_bytes": 67815284224,
+      "max_memory_reserved_bytes": 69124227072,
+      "tp_rank": 0,
+      "tp_size": 4,
+      "boundary": "scheduler_idle",
+      "timestamp_monotonic_ns": 3625620276304814
+    },
+    {
+      "memory_allocated_bytes": 67541475840,
+      "memory_reserved_bytes": 68589453312,
+      "max_memory_allocated_bytes": 67815284224,
+      "max_memory_reserved_bytes": 69124227072,
+      "tp_rank": 1,
+      "tp_size": 4,
+      "boundary": "scheduler_idle",
+      "timestamp_monotonic_ns": 3625620275555530
+    },
+    {
+      "memory_allocated_bytes": 67541475840,
+      "memory_reserved_bytes": 68589453312,
+      "max_memory_allocated_bytes": 67815284224,
+      "max_memory_reserved_bytes": 69124227072,
+      "tp_rank": 2,
+      "tp_size": 4,
+      "boundary": "scheduler_idle",
+      "timestamp_monotonic_ns": 3625620276264991
+    },
+    {
+      "memory_allocated_bytes": 67541475840,
+      "memory_reserved_bytes": 68589453312,
+      "max_memory_allocated_bytes": 67815284224,
+      "max_memory_reserved_bytes": 69124227072,
+      "tp_rank": 3,
+      "tp_size": 4,
+      "boundary": "scheduler_idle",
+      "timestamp_monotonic_ns": 3625620275673043
+    }
+  ],
+  "semantic_smoke_passed": true
+}

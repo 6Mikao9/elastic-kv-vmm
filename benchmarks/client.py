@@ -100,6 +100,12 @@ def payload_for(spec, stream):
     if not stream:
         body.update(logprob_start_len=-1, top_logprobs_num=0,
                     return_text_in_logprobs=False)
+    if spec.get("forced_replay"):
+        from benchmarks.forced_tokens import forced_payload
+        forced = forced_payload(spec["input_tokens"], spec["requested_output_tokens"])
+        body["sampling_params"].update(forced.pop("sampling_params"))
+        body.update(forced, return_logprob=True, logprob_start_len=-1,
+                    top_logprobs_num=0, return_text_in_logprobs=False)
     return body
 
 
@@ -253,6 +259,10 @@ def generate(url, spec, timeout, stream=True):
         "first_event_tokens": next((e["completion_tokens"] for e in events
                                     if e["completion_tokens"] > 0), None),
     }
+    if spec.get("forced_replay"):
+        from benchmarks.forced_tokens import forced_ids, verify_forced_output
+        verify_forced_output(record, forced_ids(spec["input_tokens"], spec["requested_output_tokens"]))
+        record["forced_ids_verified"] = True
     return record
 
 

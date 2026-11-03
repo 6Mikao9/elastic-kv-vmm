@@ -1,0 +1,52 @@
+{
+  "gpu": "NVIDIA A100-SXM4-80GB",
+  "torch": "2.15.0.dev20261005+cu134",
+  "length": 8192,
+  "topk_blocks": 16,
+  "block_size": 128,
+  "warmup_calls": 100,
+  "rounds": 40,
+  "calls_per_round": 100,
+  "timing": "CUDA event time per call within each round",
+  "results": [
+    {
+      "batch": 1,
+      "correctness_passed": true,
+      "torch": {
+        "p50_us": 213.79584312438965,
+        "p95_us": 323.6029510498047
+      },
+      "triton": {
+        "p50_us": 30.535680055618286,
+        "p95_us": 47.65696048736572
+      },
+      "p50_speedup": 7.001509143892577
+    },
+    {
+      "batch": 2,
+      "correctness_passed": true,
+      "torch": {
+        "p50_us": 211.06176376342773,
+        "p95_us": 212.24856853485107
+      },
+      "triton": {
+        "p50_us": 30.003199577331543,
+        "p95_us": 30.621183276176453
+      },
+      "p50_speedup": 7.034641862759604
+    },
+    {
+      "batch": 4,
+      "correctness_passed": true,
+      "torch": {
+        "p50_us": 211.88096046447754,
+        "p95_us": 213.76563930511475
+      },
+      "triton": {
+        "p50_us": 30.080000162124634,
+        "p95_us": 30.606847405433655
+      },
+      "p50_speedup": 7.043914871093265
+    }
+  ]
+}

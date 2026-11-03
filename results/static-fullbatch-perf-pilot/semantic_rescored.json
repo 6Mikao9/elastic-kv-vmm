@@ -1,0 +1,29 @@
+{
+  "raw_report": "semantic_smoke.json",
+  "raw_sha256": "a23b83e9e3f92a533d8541123e45c4c5430a2ca329cfd22af26ea07911813490",
+  "scorer_sha256": "f6512c84716cc595b9936b8812c13538ef0cbef4bd0a8cc0e1dde2eabf6d2bea",
+  "reason": "Recognize MiniMax mm:think delimiters without changing recorded model outputs",
+  "checks": [
+    {
+      "case": "arithmetic",
+      "finish_reason": "stop",
+      "passed": true
+    },
+    {
+      "case": "capital",
+      "finish_reason": "stop",
+      "passed": true
+    },
+    {
+      "case": "translation",
+      "finish_reason": "stop",
+      "passed": true
+    },
+    {
+      "case": "sort",
+      "finish_reason": "stop",
+      "passed": true
+    }
+  ],
+  "passed": true
+}

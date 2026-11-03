@@ -1,0 +1,21 @@
+{
+  "status": "failed",
+  "phase": "startup",
+  "reason": "TP free-memory imbalance before model load",
+  "pre_model_load_memory_gib": 16.36151123046875,
+  "local_gpu_memory_gib": 72.527099609375,
+  "startup_exit_status": 9,
+  "measured_workloads": 0,
+  "later_resource_snapshot": {
+    "selected_cards": 4,
+    "used_mib_per_selected_card": [
+      58400,
+      58400,
+      58400,
+      58400
+    ],
+    "compute_processes_on_selected_cards": 4,
+    "all_gpu_workload_running": true
+  },
+  "note": "The later snapshot confirms resource contention. It does not identify the cause of the earlier failure."
+}
