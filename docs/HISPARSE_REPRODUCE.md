@@ -76,6 +76,9 @@ PRESSURE=(--resident-free-reserve 4096 --adaptive-budget-mib 800
           --adaptive-migration-cap-mib 1024 --chunk-aware-retention
           --adaptive-trim-low-water)
 
+bash "$RUN" "$GPUS" "$MODEL" native "$OUT/pressure-native" \
+  "${COMMON[@]}" "${BENCH[@]}" --workloads mixed12k_unequal
+
 bash "$RUN" "$GPUS" "$MODEL" native "$OUT/pressure-static" \
   "${COMMON[@]}" "${BENCH[@]}" "${MIXED[@]}" --resident-free-reserve 4096 \
   --workloads mixed12k_unequal
@@ -88,8 +91,18 @@ done
 
 python3 scripts/summarize_hisparse.py --format markdown \
   "$OUT/native" "$OUT/static" "$OUT/resident" \
-  "$OUT/pressure-static" "$OUT/pressure-group-1" "$OUT/pressure-group-2"
+  "$OUT/pressure-native" "$OUT/pressure-static" \
+  "$OUT/pressure-group-1" "$OUT/pressure-group-2"
 ```
+
+The summarizer requires a completed outer `results.json`, the matching
+`source_manifest.json`, consistent runtime capacity and timing without
+intrusive diagnostics. Plotting also checks common inference arguments,
+the SM80 compatibility source hash, HiSparse settings when both arms use
+them, and measured prompt identities and shapes. It permits the different
+physical pool sizes used to match logical capacity with HiSparse disabled.
+Keep the same checkpoint and pinned image across arms; these checks do not
+replace that experimental control.
 
 ## Correctness run
 

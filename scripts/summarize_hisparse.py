@@ -22,10 +22,107 @@ def distribution(values):
             "p95": values[lower] + (values[upper] - values[lower]) * (index - lower)}
 
 
+COMMON_ARGS = (
+    "tp-size", "dtype", "kv-cache-dtype", "attention-backend", "mm-attention-backend",
+    "moe-runner-backend", "page-size", "context-length", "chunked-prefill-size",
+    "max-running-requests", "mem-fraction-static", "random-seed",
+)
+EAGER_FLAGS = ("disable-cuda-graph", "disable-prefill-cuda-graph",
+               "disable-overlap-schedule", "disable-radix-cache")
+DIAGNOSTICS = ("diagnostic_captures", "cuda_launch_blocking_diagnostic",
+               "layer_trace_diagnostic", "qknorm_fusion_disabled",
+               "attention_capture_diagnostic", "logical_shadow_diagnostic")
+COMPAT_SOURCE = "adaptive_sparse/minimax_sm80.py"
+
+
+def comparison_signature(directory, performance):
+    outer = json.loads((directory / "results.json").read_text(encoding="utf-8"))
+    manifest = json.loads((directory / "source_manifest.json").read_text(encoding="utf-8"))
+    require(outer.get("status") == "complete", f"{directory}: outer run is incomplete")
+    require(outer.get("mode") == manifest["mode"], f"{directory}: mode evidence differs")
+    for key in DIAGNOSTICS:
+        require(key in manifest and not manifest[key], f"{directory}: missing or intrusive {key}")
+    settings = manifest["adaptive_settings"] or {}
+    require(not any(settings.get(key, 0) for key in (
+        "EKV_ADAPTIVE_FORCE_DECODE_STEP", "EKV_ADAPTIVE_FORCE_PROMOTE_STEP",
+        "EKV_ADAPTIVE_PLAN_CAPTURE",
+    )), f"{directory}: forced migration or plan capture")
+    require(performance["repeats"] == manifest["benchmark_repeats"]
+            and (manifest["workloads"] is None or performance["workloads"] == manifest["workloads"]),
+            f"{directory}: workload or repeat manifest mismatch")
+    require(performance.get("forced_replay", False) == manifest.get("forced_replay", False)
+            and (performance.get("warmup_policy", "each_repeat") == "once_all_shapes")
+            == manifest.get("warmup_once", False),
+            f"{directory}: replay or warmup manifest mismatch")
+
+    capacity = outer["capacity"]
+    logical = capacity["derived_logical_capacity"]
+    pool, ratio = capacity["reported_pool_capacity"], capacity["host_to_device_ratio"]
+    require(all(type(value) is int and value > 0 for value in (logical, pool, ratio))
+            and pool == capacity["resolved_max_total_tokens"]
+            and logical == pool * ratio == manifest["requested_logical_capacity"],
+            f"{directory}: actual logical capacity disagrees with requested capacity")
+
+    argv = manifest["server_args"]
+    def option(name):
+        flag = "--" + name
+        require(argv.count(flag) == 1 and argv.index(flag) + 1 < len(argv)
+                and not argv[argv.index(flag) + 1].startswith("--"),
+                f"{directory}: missing or ambiguous {flag}")
+        return argv[argv.index(flag) + 1]
+
+    require(pool == manifest["requested_pool_capacity"] == int(option("max-total-tokens")),
+            f"{directory}: actual physical capacity disagrees with requested pool")
+    mode = manifest["mode"]
+    hisparse = None
+    if mode == "native":
+        require(argv.count("--enable-hisparse") == 1, f"{directory}: native mode requires HiSparse")
+        hisparse = json.loads(option("hisparse-config"))
+        require(all(type(hisparse.get(key)) is int and hisparse[key] > 0 for key in
+                    ("top_k", "device_buffer_size", "host_to_device_ratio"))
+                and hisparse["host_to_device_ratio"] == ratio,
+                f"{directory}: HiSparse config ratio or dimensions disagree")
+    else:
+        require(mode == "resident" and ratio == 1 and "--enable-hisparse" not in argv
+                and "--hisparse-config" not in argv,
+                f"{directory}: resident mode requires no HiSparse and capacity ratio one")
+    signature = {name: option(name) for name in COMMON_ARGS}
+    for name in ("enable-deterministic-inference", "disable-custom-all-reduce",
+                 "enable-custom-logit-processor"):
+        flag = "--" + name
+        require(argv.count(flag) <= 1, f"{directory}: duplicate {flag}")
+        signature[name] = flag in argv
+    require(signature["enable-custom-logit-processor"] == performance.get("forced_replay", False),
+            f"{directory}: custom logit processor and replay evidence disagree")
+    require(all(argv.count("--" + name) == 1 for name in EAGER_FLAGS),
+            f"{directory}: missing eager, no-overlap or no-radix flags")
+    require(int(signature["tp-size"]) == performance["tp_size"] == outer["tp_size"],
+            f"{directory}: TP degree mismatch")
+    compat = manifest["sm80_bf16_projections"]
+    require(type(compat) is bool and outer.get("sm80_bf16_projections") is compat,
+            f"{directory}: missing or inconsistent SM80 compatibility mode")
+    source = manifest["sha256"].get(COMPAT_SOURCE)
+    require(not compat or (isinstance(source, str) and len(source) == 64
+                           and all(char in "0123456789abcdef" for char in source)),
+            f"{directory}: missing SM80 compatibility source hash")
+    return {**signature, **dict.fromkeys(EAGER_FLAGS, True),
+            "logical_capacity": logical, "sm80_bf16_projections": compat,
+            "sm80_compat_source_sha256": source if compat else None}, hisparse
+
+
+def require_matched(reference, case):
+    require(all(case[key] == reference[key] for key in
+                ("sampling", "tp_size", "warmup_policy", "comparison_signature")),
+            "Sampling, TP degree, warmup policy or common inference configuration differs")
+    left, right = reference["hisparse_config"], case["hisparse_config"]
+    require(left is None or right is None or left == right, "HiSparse configuration differs")
+
+
 def load(directory):
     path = directory / "performance.json" if directory.is_dir() else directory
     data = json.loads(path.read_text(encoding="utf-8"))
     require(data["status"] == "complete", f"{path}: run is incomplete")
+    signature, hisparse = comparison_signature(path.parent, data)
     workloads, repeats, ranks = data["workloads"], data["repeats"], data["tp_size"]
     require(type(repeats) is int and repeats > 0 and type(ranks) is int and ranks > 0,
             "Invalid repeat or rank count")
@@ -88,7 +185,8 @@ def load(directory):
                                          for rank in range(ranks)],
         }
     return {"arm": path.parent.name, "sampling": "forced" if forced else "greedy",
-            "tp_size": ranks, "warmup_policy": warmup_policy, "workloads": result}
+            "tp_size": ranks, "warmup_policy": warmup_policy, "workloads": result,
+            "comparison_signature": signature, "hisparse_config": hisparse}
 
 
 def markdown(report):

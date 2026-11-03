@@ -1,0 +1,821 @@
+{
+  "cases": {
+    "final-native-greedy": {
+      "source_sha256": {
+        "results/final-native-greedy/results.json": "5ab60e0274e7105421d80881d279151afc7c1646274947d5f343489eb5788d35",
+        "results/final-native-greedy/performance.json": "93cccb4083dcaec6ceeebeb55d0c13cc6b7a5cf123dfbb87b04092f180b9d497",
+        "results/final-native-greedy/source_manifest.json": "17bcfd347ad07333cfb42d9e6e3e3bc38ba86111191bb29673b62d2283494519"
+      },
+      "workloads": [
+        "short_serial",
+        "short_concurrent",
+        "long_serial",
+        "long_concurrent",
+        "mixed"
+      ],
+      "repeats": 3,
+      "warmup_policy": "once_all_shapes",
+      "ranks": [
+        {
+          "rank": 0,
+          "torch_allocated_bytes": 67541475840,
+          "torch_reserved_bytes": 68589453312,
+          "torch_reserved_minus_allocated_bytes": 1047977472,
+          "sparse_main_vmm_backed_bytes": 0,
+          "vmm_snapshot_minus_allocator_snapshot_ns": null
+        },
+        {
+          "rank": 1,
+          "torch_allocated_bytes": 67541475840,
+          "torch_reserved_bytes": 68589453312,
+          "torch_reserved_minus_allocated_bytes": 1047977472,
+          "sparse_main_vmm_backed_bytes": 0,
+          "vmm_snapshot_minus_allocator_snapshot_ns": null
+        },
+        {
+          "rank": 2,
+          "torch_allocated_bytes": 67541475840,
+          "torch_reserved_bytes": 68589453312,
+          "torch_reserved_minus_allocated_bytes": 1047977472,
+          "sparse_main_vmm_backed_bytes": 0,
+          "vmm_snapshot_minus_allocator_snapshot_ns": null
+        },
+        {
+          "rank": 3,
+          "torch_allocated_bytes": 67541475840,
+          "torch_reserved_bytes": 68589453312,
+          "torch_reserved_minus_allocated_bytes": 1047977472,
+          "sparse_main_vmm_backed_bytes": 0,
+          "vmm_snapshot_minus_allocator_snapshot_ns": null
+        }
+      ],
+      "measured_phase_idle_snapshots": [
+        {
+          "workload": "short_serial",
+          "repeat": 0,
+          "idle_before": {
+            "nvml_by_rank_bytes": [
+              76226756608,
+              76306907136,
+              76306907136,
+              75702927360
+            ],
+            "nvml_minus_torch_reserved_and_vmm_by_rank_bytes": [
+              7637303296,
+              7717453824,
+              7717453824,
+              7113474048
+            ]
+          },
+          "idle_after": {
+            "nvml_by_rank_bytes": [
+              76226756608,
+              76306907136,
+              76306907136,
+              75702927360
+            ],
+            "nvml_minus_torch_reserved_and_vmm_by_rank_bytes": [
+              7637303296,
+              7717453824,
+              7717453824,
+              7113474048
+            ]
+          }
+        },
+        {
+          "workload": "short_concurrent",
+          "repeat": 0,
+          "idle_before": {
+            "nvml_by_rank_bytes": [
+              76226756608,
+              76306907136,
+              76306907136,
+              75702927360
+            ],
+            "nvml_minus_torch_reserved_and_vmm_by_rank_bytes": [
+              7637303296,
+              7717453824,
+              7717453824,
+              7113474048
+            ]
+          },
+          "idle_after": {
+            "nvml_by_rank_bytes": [
+              76226756608,
+              76306907136,
+              76306907136,
+              75702927360
+            ],
+            "nvml_minus_torch_reserved_and_vmm_by_rank_bytes": [
+              7637303296,
+              7717453824,
+              7717453824,
+              7113474048
+            ]
+          }
+        },
+        {
+          "workload": "long_serial",
+          "repeat": 0,
+          "idle_before": {
+            "nvml_by_rank_bytes": [
+              76226756608,
+              76306907136,
+              76306907136,
+              75702927360
+            ],
+            "nvml_minus_torch_reserved_and_vmm_by_rank_bytes": [
+              7637303296,
+              7717453824,
+              7717453824,
+              7113474048
+            ]
+          },
+          "idle_after": {
+            "nvml_by_rank_bytes": [
+              76226756608,
+              76306907136,
+              76306907136,
+              75702927360
+            ],
+            "nvml_minus_torch_reserved_and_vmm_by_rank_bytes": [
+              7637303296,
+              7717453824,
+              7717453824,
+              7113474048
+            ]
+          }
+        },
+        {
+          "workload": "long_concurrent",
+          "repeat": 0,
+          "idle_before": {
+            "nvml_by_rank_bytes": [
+              76226756608,
+              76306907136,
+              76306907136,
+              75702927360
+            ],
+            "nvml_minus_torch_reserved_and_vmm_by_rank_bytes": [
+              7637303296,
+              7717453824,
+              7717453824,
+              7113474048
+            ]
+          },
+          "idle_after": {
+            "nvml_by_rank_bytes": [
+              76226756608,
+              76306907136,
+              76306907136,
+              75702927360
+            ],
+            "nvml_minus_torch_reserved_and_vmm_by_rank_bytes": [
+              7637303296,
+              7717453824,
+              7717453824,
+              7113474048
+            ]
+          }
+        },
+        {
+          "workload": "mixed",
+          "repeat": 0,
+          "idle_before": {
+            "nvml_by_rank_bytes": [
+              76226756608,
+              76306907136,
+              76306907136,
+              75702927360
+            ],
+            "nvml_minus_torch_reserved_and_vmm_by_rank_bytes": [
+              7637303296,
+              7717453824,
+              7717453824,
+              7113474048
+            ]
+          },
+          "idle_after": {
+            "nvml_by_rank_bytes": [
+              76226756608,
+              76306907136,
+              76306907136,
+              75702927360
+            ],
+            "nvml_minus_torch_reserved_and_vmm_by_rank_bytes": [
+              7637303296,
+              7717453824,
+              7717453824,
+              7113474048
+            ]
+          }
+        },
+        {
+          "workload": "short_serial",
+          "repeat": 1,
+          "idle_before": {
+            "nvml_by_rank_bytes": [
+              76226756608,
+              76306907136,
+              76306907136,
+              75702927360
+            ],
+            "nvml_minus_torch_reserved_and_vmm_by_rank_bytes": [
+              7637303296,
+              7717453824,
+              7717453824,
+              7113474048
+            ]
+          },
+          "idle_after": {
+            "nvml_by_rank_bytes": [
+              76226756608,
+              76306907136,
+              76306907136,
+              75702927360
+            ],
+            "nvml_minus_torch_reserved_and_vmm_by_rank_bytes": [
+              7637303296,
+              7717453824,
+              7717453824,
+              7113474048
+            ]
+          }
+        },
+        {
+          "workload": "short_concurrent",
+          "repeat": 1,
+          "idle_before": {
+            "nvml_by_rank_bytes": [
+              76226756608,
+              76306907136,
+              76306907136,
+              75702927360
+            ],
+            "nvml_minus_torch_reserved_and_vmm_by_rank_bytes": [
+              7637303296,
+              7717453824,
+              7717453824,
+              7113474048
+            ]
+          },
+          "idle_after": {
+            "nvml_by_rank_bytes": [
+              76226756608,
+              76306907136,
+              76306907136,
+              75702927360
+            ],
+            "nvml_minus_torch_reserved_and_vmm_by_rank_bytes": [
+              7637303296,
+              7717453824,
+              7717453824,
+              7113474048
+            ]
+          }
+        },
+        {
+          "workload": "long_serial",
+          "repeat": 1,
+          "idle_before": {
+            "nvml_by_rank_bytes": [
+              76226756608,
+              76306907136,
+              76306907136,
+              75702927360
+            ],
+            "nvml_minus_torch_reserved_and_vmm_by_rank_bytes": [
+              7637303296,
+              7717453824,
+              7717453824,
+              7113474048
+            ]
+          },
+          "idle_after": {
+            "nvml_by_rank_bytes": [
+              76226756608,
+              76306907136,
+              76306907136,
+              75702927360
+            ],
+            "nvml_minus_torch_reserved_and_vmm_by_rank_bytes": [
+              7637303296,
+              7717453824,
+              7717453824,
+              7113474048
+            ]
+          }
+        },
+        {
+          "workload": "long_concurrent",
+          "repeat": 1,
+          "idle_before": {
+            "nvml_by_rank_bytes": [
+              76226756608,
+              76306907136,
+              76306907136,
+              75702927360
+            ],
+            "nvml_minus_torch_reserved_and_vmm_by_rank_bytes": [
+              7637303296,
+              7717453824,
+              7717453824,
+              7113474048
+            ]
+          },
+          "idle_after": {
+            "nvml_by_rank_bytes": [
+              76226756608,
+              76306907136,
+              76306907136,
+              75702927360
+            ],
+            "nvml_minus_torch_reserved_and_vmm_by_rank_bytes": [
+              7637303296,
+              7717453824,
+              7717453824,
+              7113474048
+            ]
+          }
+        },
+        {
+          "workload": "mixed",
+          "repeat": 1,
+          "idle_before": {
+            "nvml_by_rank_bytes": [
+              76226756608,
+              76306907136,
+              76306907136,
+              75702927360
+            ],
+            "nvml_minus_torch_reserved_and_vmm_by_rank_bytes": [
+              7637303296,
+              7717453824,
+              7717453824,
+              7113474048
+            ]
+          },
+          "idle_after": {
+            "nvml_by_rank_bytes": [
+              76226756608,
+              76306907136,
+              76306907136,
+              75702927360
+            ],
+            "nvml_minus_torch_reserved_and_vmm_by_rank_bytes": [
+              7637303296,
+              7717453824,
+              7717453824,
+              7113474048
+            ]
+          }
+        },
+        {
+          "workload": "short_serial",
+          "repeat": 2,
+          "idle_before": {
+            "nvml_by_rank_bytes": [
+              76226756608,
+              76306907136,
+              76306907136,
+              75702927360
+            ],
+            "nvml_minus_torch_reserved_and_vmm_by_rank_bytes": [
+              7637303296,
+              7717453824,
+              7717453824,
+              7113474048
+            ]
+          },
+          "idle_after": {
+            "nvml_by_rank_bytes": [
+              76226756608,
+              76306907136,
+              76306907136,
+              75702927360
+            ],
+            "nvml_minus_torch_reserved_and_vmm_by_rank_bytes": [
+              7637303296,
+              7717453824,
+              7717453824,
+              7113474048
+            ]
+          }
+        },
+        {
+          "workload": "short_concurrent",
+          "repeat": 2,
+          "idle_before": {
+            "nvml_by_rank_bytes": [
+              76226756608,
+              76306907136,
+              76306907136,
+              75702927360
+            ],
+            "nvml_minus_torch_reserved_and_vmm_by_rank_bytes": [
+              7637303296,
+              7717453824,
+              7717453824,
+              7113474048
+            ]
+          },
+          "idle_after": {
+            "nvml_by_rank_bytes": [
+              76226756608,
+              76306907136,
+              76306907136,
+              75702927360
+            ],
+            "nvml_minus_torch_reserved_and_vmm_by_rank_bytes": [
+              7637303296,
+              7717453824,
+              7717453824,
+              7113474048
+            ]
+          }
+        },
+        {
+          "workload": "long_serial",
+          "repeat": 2,
+          "idle_before": {
+            "nvml_by_rank_bytes": [
+              76226756608,
+              76306907136,
+              76306907136,
+              75702927360
+            ],
+            "nvml_minus_torch_reserved_and_vmm_by_rank_bytes": [
+              7637303296,
+              7717453824,
+              7717453824,
+              7113474048
+            ]
+          },
+          "idle_after": {
+            "nvml_by_rank_bytes": [
+              76226756608,
+              76306907136,
+              76306907136,
+              75702927360
+            ],
+            "nvml_minus_torch_reserved_and_vmm_by_rank_bytes": [
+              7637303296,
+              7717453824,
+              7717453824,
+              7113474048
+            ]
+          }
+        },
+        {
+          "workload": "long_concurrent",
+          "repeat": 2,
+          "idle_before": {
+            "nvml_by_rank_bytes": [
+              76226756608,
+              76306907136,
+              76306907136,
+              75702927360
+            ],
+            "nvml_minus_torch_reserved_and_vmm_by_rank_bytes": [
+              7637303296,
+              7717453824,
+              7717453824,
+              7113474048
+            ]
+          },
+          "idle_after": {
+            "nvml_by_rank_bytes": [
+              76226756608,
+              76306907136,
+              76306907136,
+              75702927360
+            ],
+            "nvml_minus_torch_reserved_and_vmm_by_rank_bytes": [
+              7637303296,
+              7717453824,
+              7717453824,
+              7113474048
+            ]
+          }
+        },
+        {
+          "workload": "mixed",
+          "repeat": 2,
+          "idle_before": {
+            "nvml_by_rank_bytes": [
+              76226756608,
+              76306907136,
+              76306907136,
+              75702927360
+            ],
+            "nvml_minus_torch_reserved_and_vmm_by_rank_bytes": [
+              7637303296,
+              7717453824,
+              7717453824,
+              7113474048
+            ]
+          },
+          "idle_after": {
+            "nvml_by_rank_bytes": [
+              76226756608,
+              76306907136,
+              76306907136,
+              75702927360
+            ],
+            "nvml_minus_torch_reserved_and_vmm_by_rank_bytes": [
+              7637303296,
+              7717453824,
+              7717453824,
+              7113474048
+            ]
+          }
+        }
+      ]
+    },
+    "static-fullbatch-perf-pilot": {
+      "source_sha256": {
+        "results/static-fullbatch-perf-pilot/results.json": "fd0a7cbee702c3b2605419e249e220d89703e7bde3850c3e536daab1a6c09aa0",
+        "results/static-fullbatch-perf-pilot/performance.json": "4a6bb44621e6614f1461d1971c4f5b75856469d52231533406be8d578ead8214",
+        "results/static-fullbatch-perf-pilot/source_manifest.json": "938b086631b1e9d3f2ca6232814de5bd764c2f4b2c25105daee78f533bf88962"
+      },
+      "workloads": [
+        "long_serial",
+        "long_concurrent",
+        "mixed"
+      ],
+      "repeats": 1,
+      "warmup_policy": "each_repeat",
+      "ranks": [
+        {
+          "rank": 0,
+          "torch_allocated_bytes": 66529612800,
+          "torch_reserved_bytes": 67884810240,
+          "torch_reserved_minus_allocated_bytes": 1355197440,
+          "sparse_main_vmm_backed_bytes": 251658240,
+          "vmm_snapshot_minus_allocator_snapshot_ns": -978486
+        },
+        {
+          "rank": 1,
+          "torch_allocated_bytes": 66529612800,
+          "torch_reserved_bytes": 67884810240,
+          "torch_reserved_minus_allocated_bytes": 1355197440,
+          "sparse_main_vmm_backed_bytes": 251658240,
+          "vmm_snapshot_minus_allocator_snapshot_ns": -729162
+        },
+        {
+          "rank": 2,
+          "torch_allocated_bytes": 66529612800,
+          "torch_reserved_bytes": 67884810240,
+          "torch_reserved_minus_allocated_bytes": 1355197440,
+          "sparse_main_vmm_backed_bytes": 251658240,
+          "vmm_snapshot_minus_allocator_snapshot_ns": -755237
+        },
+        {
+          "rank": 3,
+          "torch_allocated_bytes": 66529612800,
+          "torch_reserved_bytes": 67884810240,
+          "torch_reserved_minus_allocated_bytes": 1355197440,
+          "sparse_main_vmm_backed_bytes": 251658240,
+          "vmm_snapshot_minus_allocator_snapshot_ns": -869180
+        }
+      ],
+      "measured_phase_idle_snapshots": [
+        {
+          "workload": "long_serial",
+          "repeat": 0,
+          "idle_before": {
+            "nvml_by_rank_bytes": [
+              75769577472,
+              75849728000,
+              75849728000,
+              75245748224
+            ],
+            "nvml_minus_torch_reserved_and_vmm_by_rank_bytes": [
+              7633108992,
+              7713259520,
+              7713259520,
+              7109279744
+            ]
+          },
+          "idle_after": {
+            "nvml_by_rank_bytes": [
+              75769577472,
+              75849728000,
+              75849728000,
+              75245748224
+            ],
+            "nvml_minus_torch_reserved_and_vmm_by_rank_bytes": [
+              7633108992,
+              7713259520,
+              7713259520,
+              7109279744
+            ]
+          }
+        },
+        {
+          "workload": "long_concurrent",
+          "repeat": 0,
+          "idle_before": {
+            "nvml_by_rank_bytes": [
+              75773771776,
+              75853922304,
+              75853922304,
+              75249942528
+            ],
+            "nvml_minus_torch_reserved_and_vmm_by_rank_bytes": [
+              7637303296,
+              7717453824,
+              7717453824,
+              7113474048
+            ]
+          },
+          "idle_after": {
+            "nvml_by_rank_bytes": [
+              75773771776,
+              75853922304,
+              75853922304,
+              75249942528
+            ],
+            "nvml_minus_torch_reserved_and_vmm_by_rank_bytes": [
+              7637303296,
+              7717453824,
+              7717453824,
+              7113474048
+            ]
+          }
+        },
+        {
+          "workload": "mixed",
+          "repeat": 0,
+          "idle_before": {
+            "nvml_by_rank_bytes": [
+              75773771776,
+              75853922304,
+              75853922304,
+              75249942528
+            ],
+            "nvml_minus_torch_reserved_and_vmm_by_rank_bytes": [
+              7637303296,
+              7717453824,
+              7717453824,
+              7113474048
+            ]
+          },
+          "idle_after": {
+            "nvml_by_rank_bytes": [
+              75773771776,
+              75853922304,
+              75853922304,
+              75249942528
+            ],
+            "nvml_minus_torch_reserved_and_vmm_by_rank_bytes": [
+              7637303296,
+              7717453824,
+              7717453824,
+              7113474048
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "comparisons": [
+    {
+      "workload": "long_serial",
+      "boundary": "idle_before",
+      "nvml_reduction_by_rank_bytes": [
+        457179136,
+        457179136,
+        457179136,
+        457179136
+      ],
+      "torch_reserved_reduction_net_of_vmm_by_rank_bytes": [
+        452984832,
+        452984832,
+        452984832,
+        452984832
+      ],
+      "remainder_reduction_by_rank_bytes": [
+        4194304,
+        4194304,
+        4194304,
+        4194304
+      ]
+    },
+    {
+      "workload": "long_serial",
+      "boundary": "idle_after",
+      "nvml_reduction_by_rank_bytes": [
+        457179136,
+        457179136,
+        457179136,
+        457179136
+      ],
+      "torch_reserved_reduction_net_of_vmm_by_rank_bytes": [
+        452984832,
+        452984832,
+        452984832,
+        452984832
+      ],
+      "remainder_reduction_by_rank_bytes": [
+        4194304,
+        4194304,
+        4194304,
+        4194304
+      ]
+    },
+    {
+      "workload": "long_concurrent",
+      "boundary": "idle_before",
+      "nvml_reduction_by_rank_bytes": [
+        452984832,
+        452984832,
+        452984832,
+        452984832
+      ],
+      "torch_reserved_reduction_net_of_vmm_by_rank_bytes": [
+        452984832,
+        452984832,
+        452984832,
+        452984832
+      ],
+      "remainder_reduction_by_rank_bytes": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "workload": "long_concurrent",
+      "boundary": "idle_after",
+      "nvml_reduction_by_rank_bytes": [
+        452984832,
+        452984832,
+        452984832,
+        452984832
+      ],
+      "torch_reserved_reduction_net_of_vmm_by_rank_bytes": [
+        452984832,
+        452984832,
+        452984832,
+        452984832
+      ],
+      "remainder_reduction_by_rank_bytes": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "workload": "mixed",
+      "boundary": "idle_before",
+      "nvml_reduction_by_rank_bytes": [
+        452984832,
+        452984832,
+        452984832,
+        452984832
+      ],
+      "torch_reserved_reduction_net_of_vmm_by_rank_bytes": [
+        452984832,
+        452984832,
+        452984832,
+        452984832
+      ],
+      "remainder_reduction_by_rank_bytes": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "workload": "mixed",
+      "boundary": "idle_after",
+      "nvml_reduction_by_rank_bytes": [
+        452984832,
+        452984832,
+        452984832,
+        452984832
+      ],
+      "torch_reserved_reduction_net_of_vmm_by_rank_bytes": [
+        452984832,
+        452984832,
+        452984832,
+        452984832
+      ],
+      "remainder_reduction_by_rank_bytes": [
+        0,
+        0,
+        0,
+        0
+      ]
+    }
+  ],
+  "scope": [
+    "Cross-run descriptive accounting, not a matched formal experiment. Workloads, repeat count, and warmup policies differ.",
+    "Allocator and VMM figures use scheduler-idle summaries embedded in results.json. NVML samples are client idle windows in performance.json, not synchronized to scheduler snapshots.",
+    "NVML minus Torch reserved minus VMM backing is an accounting residual, not a component-level attribution. Torch allocated is included within reserved."
+  ]
+}

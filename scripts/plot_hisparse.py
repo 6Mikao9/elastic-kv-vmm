@@ -10,7 +10,7 @@ from pathlib import Path
 from statistics import median
 import sys
 
-from summarize_hisparse import load, require
+from summarize_hisparse import load, require, require_matched
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,8 +37,7 @@ def plot(directory_args, output):
     reference = cases[0]
     raw = raw_phases(directory_args[0])
     for path, case in zip(directory_args[1:], cases[1:]):
-        require(all(case[key] == reference[key] for key in ("sampling", "tp_size", "warmup_policy")),
-                "Sampling, TP degree, or warmup policy differs")
+        require_matched(reference, case)
         audit_pair(raw, raw_phases(path))
 
     sys.path.insert(0, str(ROOT / "cache" / "plot-deps"))

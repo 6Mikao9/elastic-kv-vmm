@@ -138,6 +138,17 @@ logical shadow 复用原有请求表和 Top-K 输出，因此主要证明 KV 存
 
 静态组空闲时四卡 NVML 合计约 281.94 GiB，相对原生约 283.63 GiB 少 1.69 GiB，约 0.6%；并发峰值则达到 284.75 GiB，高于原生。主 K/V backing 空闲回到 240 MiB/rank，其他 allocator、缓存和运行时占用会影响整卡结果。当前结果支持“释放了物理主 KV，并降低了空闲整卡占用”，不支持“所有情况下峰值更低”。生命周期内的 PyTorch max counters 与单个工作负载的峰值也不可混用。
 
+把原生三轮运行和 full-batch pilot 的空闲记录展开，可以核对这 1.69 GiB 的组成。每 rank 的 PyTorch `reserved` 少了 672 MiB，另计的 VMM backing 增加 240 MiB，净少 **432 MiB/rank**，四卡共 **1.6875 GiB**。长并发和混合负载的 NVML 空闲差额逐卡吻合；长串行还多出 4 MiB/rank 的差额。[逐卡对账与来源摘要](../results/memory-accounting/accounting.json)
+
+| 空闲账目，MiB/rank | 原生三轮运行 | full-batch pilot | 静态减原生 |
+|---|---:|---:|---:|
+| PyTorch allocated | 64,412.57 | 63,447.58 | −964.99 |
+| PyTorch reserved | 65,412 | 64,740 | −672 |
+| 另计 VMM backing | 0 | 240 | +240 |
+| reserved 与 VMM 合计差额 | — | — | −432 |
+
+`reserved − allocated` 的差额反而增加约 293 MiB/rank。这部分是 PyTorch 池内未计入活跃分配的空间，不能直接假设都能由 `empty_cache()` 释放。两组的重复和预热协议不同，NVML 与 scheduler 空闲快照也未同步，因此这是观测对账，不是逐项因果归因。它明确了后续优化方向：主 KV 释放量之外，还要测量并协调 PyTorch 池的实际归还，才能提高整卡可用余量。
+
 full-batch pilot 的四道题原始输出均正确，但初版评分器未处理 MiniMax 的思考标签而误判。保留原始失败评分，并另存带原始文件摘要的[修正评分](../results/static-fullbatch-perf-pilot/semantic_rescored.json)，没有改写原始输出。
 
 ### 尚待补齐的配对
