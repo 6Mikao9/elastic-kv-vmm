@@ -1,0 +1,26 @@
+{
+  "experiment_date": "2026-11-03",
+  "gpu": "NVIDIA A100-SXM4-80GB",
+  "gpu_memory_mib": 81920,
+  "driver": "580.178.04",
+  "native_compiler": "g++ 11.4.0",
+  "native_cuda_headers": "13.0.88",
+  "cuda_runtime": "12.8",
+  "python": "3.10",
+  "sglang": "0.5.2",
+  "torch": "2.8.0+cu128",
+  "sgl-kernel": "0.3.9.post2",
+  "flashinfer-python": "0.3.1",
+  "triton": "3.4.0",
+  "transformers": "4.56.1",
+  "numpy": "1.26.4",
+  "cupy-cuda12x": "13.6.0",
+  "requests": "2.34.2",
+  "nvidia-ml-py": "13.610.43",
+  "models": {
+    "Qwen/Qwen3-0.6B-Base": "da87bfb608c14b7cf20ba1ce41287e8de496c0cd",
+    "Qwen/Qwen3-4B": "1cfa9a7208912126459214e8b04321603b3df60c"
+  },
+  "model_mount": "read-only",
+  "fresh_environment_build_verified": false
+}

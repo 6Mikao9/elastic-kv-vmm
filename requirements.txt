@@ -1,0 +1,12 @@
+# Serving stack used by this experiment. Requires a matching CUDA-enabled torch.
+sglang[all]==0.5.2
+torch==2.8.0
+sgl-kernel==0.3.9.post2
+flashinfer-python==0.3.1
+triton==3.4.0
+transformers==4.56.1
+numpy==1.26.4
+cupy-cuda12x==13.6.0
+requests==2.34.2
+# Optional NVML monitoring. The existing image supplies the pynvml import.
+nvidia-ml-py==13.610.43

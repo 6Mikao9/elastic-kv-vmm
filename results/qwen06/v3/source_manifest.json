@@ -1,0 +1,12 @@
+{
+  "mode": "v3",
+  "model_label": "Qwen3-0.6B-Base",
+  "sha256": {
+    "elastic_kv/adapter.py": "833e8ad8a49002bae040fb3449f3ad8d8935e04d8fe3f0f86748592d20725b62",
+    "elastic_kv/backing.py": "d9e540a5f92cba768cde3d117a9daf9c00059a16ea32cfe5849d40bb45250864",
+    "elastic_kv/launch.py": "823dedb75a2c2038f61a4f65f5d98abef0b97d013987ea6fdf09876ab1e8f5b8",
+    "native/elastic_vmm.cpp": "b31d846bc0fd9dd7e0f34d0d8c9dda10ceb6bfd5ad3a427f097062fd4e67869a",
+    "benchmarks/client.py": "d8bca43a4aaeb8eac50c68e8a1545148139e78c87f06587916fbd72092caadee",
+    "scripts/run_case.py": "54ef2abaaa7b8643fcbe7cff72cf17917567cdb7eba157400af89f4d0ae855b7"
+  }
+}

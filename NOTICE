@@ -1,0 +1,7 @@
+elastic-kv-vmm
+
+This project adapts the public memory-pool and allocator interfaces of SGLang.
+SGLang is Copyright 2025 SGLang Team and licensed under Apache License 2.0.
+Upstream reference: https://github.com/sgl-project/sglang/tree/v0.5.2
+
+Model weights and the SGLang distribution are not included.

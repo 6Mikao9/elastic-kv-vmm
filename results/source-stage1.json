@@ -1,0 +1,11 @@
+{
+  "phase": "qwen06 baseline-final,v0,v1,v2 before addition of v3",
+  "sha256": {
+    "elastic_kv/adapter.py": "66eb8e9aa39b53f603eb2823c37b493e425754b3bf1eea7bd8f70a712ff6e73e",
+    "elastic_kv/backing.py": "d9e540a5f92cba768cde3d117a9daf9c00059a16ea32cfe5849d40bb45250864",
+    "elastic_kv/launch.py": "823dedb75a2c2038f61a4f65f5d98abef0b97d013987ea6fdf09876ab1e8f5b8",
+    "native/elastic_vmm.cpp": "b31d846bc0fd9dd7e0f34d0d8c9dda10ceb6bfd5ad3a427f097062fd4e67869a",
+    "benchmarks/client.py": "d8bca43a4aaeb8eac50c68e8a1545148139e78c87f06587916fbd72092caadee",
+    "scripts/run_case.py": "c07290dedd09e037a3e291356a6bf75638319af495e1c21b47ca02d633215a85"
+  }
+}
