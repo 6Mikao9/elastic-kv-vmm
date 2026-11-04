@@ -1,11 +1,47 @@
+from collections import Counter
+from itertools import combinations
+from random import Random
 from types import SimpleNamespace as B
 import unittest
 from unittest.mock import Mock, patch
 
-from adaptive_sparse.scheduler_budget import SchedulerBudget, _rank_demotions, _releasable
+from adaptive_sparse.scheduler_budget import (
+    SchedulerBudget, _chunk_release_counts, _rank_demotions, _releasable,
+    _releasable_counts, _releasable_pair,
+)
 
 
 class SchedulerBudgetTest(unittest.TestCase):
+    def test_cached_release_counts_match_page_union(self):
+        random = Random(137)
+        for trial in range(100):
+            layout = [set(random.sample(range(9), random.randint(1, 3))) for _ in range(16)]
+            refs = Counter(chunk for chunks in layout for chunk in chunks)
+            mapped = set(random.sample(range(9), 8))
+            tracker = B(chunks=layout.__getitem__, refs=refs, backing=B(mapped_chunks=mapped))
+            candidates = [set(random.sample(range(1, 16), 7)) for _ in range(5)]
+            if trial % 2:
+                # Disjoint page ownership, while chunks can still be shared.
+                candidates = [set(range(start, start + 3)) for start in range(1, 16, 3)]
+
+            def reference(released):
+                return {
+                    chunk for chunk in mapped
+                    if any(chunk in layout[page] for page in released)
+                    and all(page in released or chunk not in chunks
+                            for page, chunks in enumerate(layout))
+                }
+
+            counts = [_chunk_release_counts(tracker, pages) for pages in candidates]
+            for pages, count in zip(candidates, counts):
+                self.assertEqual(_releasable_counts(tracker, count), reference(pages))
+            for left, right in combinations(range(len(candidates)), 2):
+                self.assertEqual(
+                    _releasable_pair(tracker, candidates[left], counts[left],
+                                     candidates[right], counts[right]),
+                    reference(candidates[left] | candidates[right]),
+                )
+
     def test_common_rank_uses_worst_rank_benefit_and_cost(self):
         ranks = [{"a": (100, 10), "b": (50, 10), "only": (999, 1)},
                  {"a": (20, 20), "b": (50, 10)}]

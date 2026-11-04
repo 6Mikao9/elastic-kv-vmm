@@ -22,9 +22,24 @@ LOG = logging.getLogger(__name__)
 
 
 def _releasable(tracker, pages):
-    counts = Counter(chunk for page in set(pages) for chunk in tracker.chunks(page))
+    return _releasable_counts(tracker, _chunk_release_counts(tracker, set(pages)))
+
+
+def _chunk_release_counts(tracker, pages):
+    return Counter(chunk for page in pages for chunk in tracker.chunks(page))
+
+
+def _releasable_counts(tracker, counts):
+    mapped = tracker.backing.mapped_chunks
     return {chunk for chunk, count in counts.items()
-            if count == tracker.refs.get(chunk) and chunk in tracker.backing.mapped_chunks}
+            if count == tracker.refs.get(chunk) and chunk in mapped}
+
+
+def _releasable_pair(tracker, left_pages, left_counts, right_pages, right_counts):
+    # Preserve union semantics if two candidates name the same physical page.
+    if not left_pages.isdisjoint(right_pages):
+        return _releasable(tracker, left_pages | right_pages)
+    return _releasable_counts(tracker, left_counts + right_counts)
 
 
 def _rank_demotions(rank_candidates):
@@ -208,6 +223,7 @@ class SchedulerBudget:
         resident = coordinator._ekv_resident
         requests = {}
         plans = {}
+        release_counts = {}
         for request in batch.reqs:
             kv = request.kv
             if (kv.req_pool_idx not in resident or request.finished() or request.hisparse_staging
@@ -226,8 +242,11 @@ class SchedulerBudget:
             if any(slot <= 0 or slot % page_size for slot in slots) or len(set(pages)) != len(pages):
                 continue
             retained_pages, released_pages = plan_demote_pages(tracker, pages, capacity // page_size)
-            chunks = _releasable(tracker, released_pages)
-            requests[request.rid] = (request, released_pages, chunks)
+            unique_pages = set(released_pages)
+            counts = _chunk_release_counts(tracker, unique_pages)
+            chunks = _releasable_counts(tracker, counts)
+            requests[request.rid] = (request, unique_pages, chunks)
+            release_counts[request.rid] = counts
             if self.capture_plans:
                 plans[kv.req_pool_idx] = {"page_ids": pages, "retained": retained_pages,
                                           "released": released_pages,
@@ -252,8 +271,11 @@ class SchedulerBudget:
                 if transfer > self.byte_cap:
                     self.stats["rejected_cap"] += 1
                     continue
-                released = _releasable(tracker, [
-                    page for rid in pair for page in requests[rid][1]])
+                left, right = pair
+                released = _releasable_pair(
+                    tracker, requests[left][1], release_counts[left],
+                    requests[right][1], release_counts[right],
+                )
                 if released:
                     pairs[pair] = (len(released) * tracker.chunk_bytes, transfer)
                     pair_chunks[pair] = released

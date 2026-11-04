@@ -1,0 +1,45 @@
+{
+  "scope": "CPU geometry on synthetic support sets; no GPU or model measurement",
+  "length": 65536,
+  "selected": 2048,
+  "row_elements": 256,
+  "itemsize": 2,
+  "chunk_bytes": 2097152,
+  "sink_bytes_excluded_from_cases": 2097152,
+  "full_request_backing_bytes": 33554432,
+  "limitations": [
+    "No mapping latency or transfer timing",
+    "No LouisKV trace or quality test",
+    "Compact lower bound excludes indices, allocator slack and packing cost",
+    "VMM commitment does not imply every byte must be transferred"
+  ],
+  "cases": [
+    {
+      "pattern": "contiguous",
+      "unique_tokens": 2048,
+      "selected_payload_bytes": 1048576,
+      "fixed_position_chunks": 1,
+      "fixed_position_backing_bytes": 2097152,
+      "compact_payload_lower_bound_bytes": 2097152,
+      "backing_over_payload": 2.0
+    },
+    {
+      "pattern": "uniform_random",
+      "unique_tokens": 2048,
+      "selected_payload_bytes": 1048576,
+      "fixed_position_chunks": 16,
+      "fixed_position_backing_bytes": 33554432,
+      "compact_payload_lower_bound_bytes": 2097152,
+      "backing_over_payload": 32.0
+    },
+    {
+      "pattern": "synthetic_clustered",
+      "unique_tokens": 2048,
+      "selected_payload_bytes": 1048576,
+      "fixed_position_chunks": 8,
+      "fixed_position_backing_bytes": 16777216,
+      "compact_payload_lower_bound_bytes": 2097152,
+      "backing_over_payload": 16.0
+    }
+  ]
+}
