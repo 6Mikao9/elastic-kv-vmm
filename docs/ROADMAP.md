@@ -122,6 +122,15 @@ deadline ordering, static residency and live elastic residency using the same
 requests and report capacity delay, demotions, deadline misses, TTFT/TPOT and
 whole-device memory separately.
 
+Future-aware admission now reserves interval peaks instead of summing every item
+inside the horizon, skips deadline protection when positive post-current slack
+remains, and recomputes service duration for backlogged requests. TP prefill-plan
+signatures also distinguish KV from activation bytes. These are CPU-validated
+accounting fixes; the next protocol revision should unify deadline timing on a
+request-creation clock (or transport an absolute deadline plus calibrated clock
+offset), because the current HTTP dispatch-relative hint can otherwise gain
+network and queue time as extra slack.
+
 Active residency now consumes the same immutable hint at demotion time.  A
 conservative retention value combines business weight, remaining decode work,
 deadline distance, and potential shared-prefix reuse; imminent deadlines and

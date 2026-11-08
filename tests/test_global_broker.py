@@ -178,12 +178,37 @@ class GlobalAdmissionBrokerTest(unittest.TestCase):
             denied = second.reserve({"b-0": 2})
             self.assertEqual(denied.reason, "global-capacity-exhausted")
             self.assertEqual(first.release(["a-0"]), 10)
-            first.reserve({"a-1": 8})
-            yielded = first.reserve({"a-2": 2})
+            self.assertTrue(first.reserve({"a-1": 5}).admit)
+            yielded = first.reserve({"a-2": 1})
             self.assertFalse(yielded.admit)
             self.assertEqual(yielded.reason, "fair-share-yield")
             self.assertEqual(yielded.starved_tenants, ("model-b",))
             self.assertTrue(second.reserve({"b-0": 2}).admit)
+        finally:
+            first.close()
+            second.close()
+
+    def test_fair_share_rejects_batch_that_would_overshoot_target(self):
+        first = self.broker(
+            "first", capacity=10, tenant_id="model-a", fair_mode="enforce"
+        )
+        second = self.broker(
+            "second", capacity=10, tenant_id="model-b", fair_mode="enforce"
+        )
+        try:
+            self.assertTrue(first.reserve({"a-0": 10}).admit)
+            self.assertFalse(second.reserve({"b-0": 1}).admit)
+            first.release(["a-0"])
+            self.assertTrue(first.reserve({"a-1": 4}).admit)
+
+            yielded = first.reserve({"a-2": 2})
+
+            self.assertFalse(yielded.admit)
+            self.assertEqual(yielded.reason, "fair-share-yield")
+            self.assertEqual(yielded.tenant_usage_bytes, 4)
+            self.assertEqual(yielded.starved_tenants, ("model-b",))
+            self.assertEqual(first.outstanding_bytes(), 4)
+            self.assertTrue(second.reserve({"b-1": 5}).admit)
         finally:
             first.close()
             second.close()
@@ -218,8 +243,7 @@ class GlobalAdmissionBrokerTest(unittest.TestCase):
             first.reserve({"a-0": 10})
             self.assertFalse(second.reserve({"b-0": 1}).admit)
             first.release(["a-0"])
-            first.reserve({"a-1": 8})
-            observed = first.reserve({"a-2": 2})
+            observed = first.reserve({"a-1": 8})
             self.assertTrue(observed.admit)
             self.assertEqual(observed.reason, "fair-share-observed")
             self.assertTrue(first.snapshot()["fair_share_would_yield"])
@@ -265,7 +289,7 @@ class GlobalAdmissionBrokerTest(unittest.TestCase):
                 first.reserve({"a-0": 10})
                 self.assertFalse(second.reserve({"b-0": 1}).admit)
                 first.release(["a-0"])
-                first.reserve({"a-1": 8})
+                self.assertTrue(first.reserve({"a-1": 5}).admit)
                 now[0] = 106.0
                 self.assertTrue(first.reserve({"a-2": 2}).admit)
             finally:
@@ -289,7 +313,7 @@ class GlobalAdmissionBrokerTest(unittest.TestCase):
                 first.reserve({"a-0": 10})
                 self.assertFalse(second.reserve({"b-0": 1}).admit)
                 first.release(["a-0"])
-                first.reserve({"a-1": 8})
+                self.assertTrue(first.reserve({"a-1": 5}).admit)
                 self.assertTrue(first.snapshot()["fair_share_would_yield"])
 
                 now[0] = 106.0

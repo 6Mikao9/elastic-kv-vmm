@@ -247,8 +247,10 @@ def runtime_value_from_hint(request: Any, hint: Any, *, now_s: float) -> Runtime
 
         try:
             age_ms = _request_age_ms(request, now_s)
-        except (AttributeError, TypeError, ValueError):
-            age_ms = 0.0
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "deadline hint requires a scheduler receive timestamp"
+            ) from exc
         deadline = max(0, math.ceil(deadline - age_ms))
     return RuntimeRequestValue(
         request_id=request_id,

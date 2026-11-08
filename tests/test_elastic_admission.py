@@ -286,6 +286,171 @@ class ElasticAdmissionTest(unittest.TestCase):
         self.assertEqual(decision.future_reserved_bytes, 0)
         self.assertEqual(decision.future_reserved_requests, 0)
 
+    def test_future_reservation_skips_work_with_slack_after_current_finishes(self):
+        current = submission("current", weight=1.0, estimated_finish_ms=50)
+        urgent = submission(
+            "urgent",
+            weight=1.0,
+            submit_at_ms=20,
+            estimated_finish_ms=120,
+            deadline_after_ms=300,
+        )
+        config = ElasticKVConfig(
+            memory_budget_bytes=700,
+            kv_bytes_per_token=2,
+            sparse_hot_tokens=64,
+            lookahead_ms=200,
+        )
+
+        decision = decide_elastic_admission(
+            current,
+            active_bytes=0,
+            config=config,
+            future_submissions=(current, urgent),
+            now_ms=0,
+        )
+
+        self.assertEqual(decision.chosen_residence, "resident")
+        self.assertEqual(decision.future_reserved_bytes, 0)
+        self.assertEqual(decision.future_reserved_requests, 0)
+
+    def test_future_reservation_keeps_higher_weight_when_deadline_has_slack(self):
+        current = submission("current", weight=1.0, estimated_finish_ms=50)
+        urgent = submission(
+            "urgent",
+            weight=2.0,
+            submit_at_ms=20,
+            estimated_finish_ms=120,
+            deadline_after_ms=300,
+        )
+        config = ElasticKVConfig(
+            memory_budget_bytes=700,
+            kv_bytes_per_token=2,
+            sparse_hot_tokens=64,
+            lookahead_ms=200,
+        )
+
+        decision = decide_elastic_admission(
+            current,
+            active_bytes=0,
+            config=config,
+            future_submissions=(current, urgent),
+            now_ms=0,
+        )
+
+        self.assertEqual(decision.chosen_residence, "host_backed")
+        self.assertEqual(decision.future_reserved_bytes, 400)
+        self.assertEqual(decision.future_reserved_requests, 1)
+
+    def test_future_reservation_keeps_higher_weight_when_deadline_is_infeasible(self):
+        current = submission("current", weight=1.0, estimated_finish_ms=50)
+        urgent = submission(
+            "urgent",
+            weight=2.0,
+            submit_at_ms=20,
+            estimated_finish_ms=120,
+            deadline_after_ms=20,
+        )
+        config = ElasticKVConfig(
+            memory_budget_bytes=700,
+            kv_bytes_per_token=2,
+            sparse_hot_tokens=64,
+            lookahead_ms=200,
+        )
+
+        decision = decide_elastic_admission(
+            current,
+            active_bytes=0,
+            config=config,
+            future_submissions=(current, urgent),
+            now_ms=0,
+        )
+
+        self.assertEqual(decision.chosen_residence, "host_backed")
+        self.assertEqual(decision.future_reserved_bytes, 400)
+        self.assertEqual(decision.future_reserved_requests, 1)
+
+    def test_future_reservation_uses_interval_peak_instead_of_horizon_sum(self):
+        current = submission(
+            "current",
+            prompt=1,
+            output=199,
+            weight=1.0,
+            estimated_finish_ms=300,
+        )
+        disjoint = [
+            submission(
+                request_id,
+                weight=2.0,
+                submit_at_ms=start,
+                estimated_finish_ms=finish,
+                deadline_after_ms=deadline_after,
+            )
+            for request_id, start, finish, deadline_after in (
+                ("early", 20, 120, 250),
+                ("late", 150, 190, 185),
+            )
+        ]
+        config = ElasticKVConfig(
+            memory_budget_bytes=2_000,
+            kv_bytes_per_token=2,
+            sparse_hot_tokens=64,
+            prefill_workspace_bytes_per_token=1,
+            lookahead_ms=200,
+        )
+
+        decision = decide_elastic_admission(
+            current,
+            active_bytes=0,
+            config=config,
+            future_submissions=(current, *disjoint),
+            now_ms=0,
+        )
+
+        self.assertEqual(decision.future_reserved_requests, 2)
+        self.assertEqual(decision.future_reserved_bytes, 400)
+        self.assertEqual(decision.future_prefill_bytes, 100)
+
+    def test_future_reservation_uses_remaining_duration_after_backlog(self):
+        current = submission("current", weight=1.0, estimated_finish_ms=300)
+        backlogged = submission(
+            "backlogged",
+            weight=2.0,
+            submit_at_ms=20,
+            estimated_finish_ms=120,
+            deadline_after_ms=400,
+        )
+        config = ElasticKVConfig(
+            memory_budget_bytes=700,
+            kv_bytes_per_token=2,
+            sparse_hot_tokens=64,
+            lookahead_ms=400,
+        )
+
+        decision = decide_elastic_admission(
+            current,
+            active_bytes=0,
+            config=config,
+            future_submissions=(current, backlogged),
+            now_ms=200,
+        )
+
+        self.assertEqual(decision.future_reserved_requests, 1)
+        self.assertEqual(decision.future_reserved_bytes, 400)
+
+    def test_direct_admission_rejects_shared_prefix_above_prompt(self):
+        invalid = submission(
+            "invalid-prefix",
+            prompt=10,
+            prefix_group="shared",
+            shared_prefix_tokens=11,
+        )
+
+        with self.assertRaisesRegex(ValueError, "shared prefix exceeds prompt"):
+            decide_elastic_admission(
+                invalid, active_bytes=0, config=self.config
+            )
+
     def test_future_reservation_requires_time_and_fits_planner_projection(self):
         config = ElasticKVConfig(
             memory_budget_bytes=1_000,

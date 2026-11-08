@@ -490,8 +490,9 @@ reservation = kv + prompt * activation_rate
 `resident` 缺少输出长度预测时不进入预留；显式 `host_backed` 仍可按
 `min(prompt, native_hot_tokens)` 预留有界热集。所有完整条目按 waiting queue
 顺序装入 `max_reserve_bytes`，装不下的请求整条跳过，不记录会造成误导的部分
-字节。TP 各 rank 交换 plan signature；任一 rank 不一致时所有 rank 同时回退为
-零预留。
+字节。TP 各 rank 交换 plan signature；signature 分别包含每个条目的 KV 与
+activation 字节，不仅比较两者之和，因为有效 headroom 对这两类字节采用不同
+合并规则。任一 rank 的拆分或总量不一致时，所有 rank 同时回退为零预留。
 
 | 环境变量 | 默认值 | 作用 |
 |---|---:|---|
@@ -533,12 +534,20 @@ horizon 内的后续请求。预留只覆盖同时满足以下条件的请求：
 
 1. 可能在该请求预计完成前启动；
 2. 位于 `lookahead_ms` 内；
-3. 带 deadline，或 soft business weight 严格高于当前请求。
+3. 带 deadline 且等待当前请求可能耗尽可行 slack，或 soft business weight
+   严格高于当前请求。
 
 默认 `lookahead_ms=0`，因此不传未来队列时行为与原来的实时 active-byte 准入
 相同。启用后最多计入 `max_future_reservations` 条近期请求；未来请求若是短请求
 或显式 `host_backed`，只预留其有界 HiSparse hot-set，不会为所有未来请求永久
-映射完整 KV。
+映射完整 KV。deadline 在等待当前请求结束后仍有正 slack 时，仅 deadline 信号不
+触发当前请求降级；更高业务权重仍独立保护该未来请求。估计即使立即启动也无法在
+期限内完成的请求不会以 deadline 为由挤占当前请求，但高权重原因仍可触发预留。
+
+预留按当前请求存活窗口内各未来请求的实际到达区间取**并发峰值**，不把 horizon
+内先后出现、互不重叠的请求字节直接相加。若请求因排队已越过原预计完成时刻，仍
+从其实际可启动时刻重新计算一个预测服务时长，避免生成 `finish < start` 的倒挂
+区间。共享前缀只对同一时刻共同活跃的 resident 请求抵扣一次。
 
 当前请求仍在预算内时，若 `active + current + imminent_future` 超限，它会在
 请求级选择上退为 `host_backed`，原因记为 `imminent-future-demotion`。当前请求

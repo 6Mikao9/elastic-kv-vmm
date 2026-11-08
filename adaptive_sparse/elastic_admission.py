@@ -157,11 +157,19 @@ def _future_reservation(
     """Reserve bounded capacity for more urgent requests that can overlap now.
 
     The executor receives a known rollout schedule. Counting every queued
-    request would serialize the whole trace, so this conservative guard only
-    includes requests that may start before the current request finishes,
-    arrive inside the configured horizon, and carry a deadline or a strictly
-    larger soft business weight. A fixed request cap bounds both the search and
-    the over-reservation caused by an unusually dense trace.
+    request would serialize the whole trace, so this guard only includes
+    requests that may start before the current request finishes, arrive inside
+    the configured horizon, and carry a deadline or a strictly larger soft
+    business weight. A deadline is protected only when waiting behind the
+    current request would consume otherwise feasible slack. A fixed request cap
+    bounds the search and the effect of an unusually dense trace.
+
+    The returned bytes are interval peaks, not sums over the whole horizon.
+    Two requests that appear and finish at different times do not need two
+    simultaneous reservations merely because both lie before the current
+    request finishes. This reduces false demotions while retaining the
+    controller's conservative assumption that prefill workspace remains
+    charged until a request completes.
     """
 
     if config.lookahead_ms == 0:
@@ -171,10 +179,7 @@ def _future_reservation(
         1, submission.estimated_finish_ms - submission.submit_at_ms
     )
     horizon_end_ms = now_ms + config.lookahead_ms
-    reserved_kv_bytes = 0
-    reserved_prefill_bytes = 0
-    reserved_requests = 0
-    resident_prefixes: dict[str, list[int]] = {}
+    reservations: list[tuple[int, int, int, int, str | None, int]] = []
     for future in future_submissions:
         if future.request_id == submission.request_id:
             continue
@@ -183,32 +188,89 @@ def _future_reservation(
         if future.submit_at_ms > current_finish_ms:
             continue
         future_hint = FutureHint.from_payload(dict(future.hint))
-        protected = (
-            future_hint.deadline_after_ms is not None
-            or future_hint.weight > current_hint.weight
+        if future_hint.shared_prefix_tokens > future.prompt_tokens:
+            raise ValueError(
+                f"{future.request_id}: shared prefix exceeds prompt length"
+            )
+        has_deadline = future_hint.deadline_after_ms is not None
+        has_higher_weight = future_hint.weight > current_hint.weight
+        if not has_deadline and not has_higher_weight:
+            continue
+        predicted_duration_ms = max(
+            1, future.estimated_finish_ms - future.submit_at_ms
         )
-        if not protected:
+        deadline_needs_protection = has_deadline
+        if has_deadline and future.deadline_ms is not None:
+            earliest_finish_ms = (
+                max(now_ms, future.submit_at_ms) + predicted_duration_ms
+            )
+            deadline_needs_protection = (
+                earliest_finish_ms <= future.deadline_ms
+                and current_finish_ms + predicted_duration_ms >= future.deadline_ms
+            )
+        if not has_higher_weight and not deadline_needs_protection:
+            # A deadline with positive slack after the current request, or one
+            # that is already infeasible even when started immediately, should
+            # not demote unrelated work. The weight signal remains independent.
             continue
         placement, _ = _preferred_residence(future, config)
-        reserved_kv_bytes += config.hold_bytes(future, placement)
-        reserved_prefill_bytes += config.prefill_workspace_bytes(future)
-        if (
-            placement == "resident"
-            and future_hint.prefix_group is not None
-            and future_hint.shared_prefix_tokens > 0
-        ):
-            resident_prefixes.setdefault(future_hint.prefix_group, []).append(
-                future_hint.shared_prefix_tokens
+        start_ms = max(now_ms, future.submit_at_ms)
+        # A queued request may have crossed its original estimated finish
+        # before it was admitted. Preserve its predicted remaining service time
+        # instead of creating an interval whose finish precedes its start.
+        finish_ms = min(current_finish_ms, start_ms + predicted_duration_ms)
+        if finish_ms <= start_ms:
+            continue
+        reservations.append(
+            (
+                start_ms,
+                finish_ms,
+                config.hold_bytes(future, placement),
+                config.prefill_workspace_bytes(future),
+                future_hint.prefix_group if placement == "resident" else None,
+                future_hint.shared_prefix_tokens if placement == "resident" else 0,
             )
-        reserved_requests += 1
-        if reserved_requests >= config.max_future_reservations:
+        )
+        if len(reservations) >= config.max_future_reservations:
             break
-    reserved_kv_bytes -= sum(
-        (len(lengths) - 1) * min(lengths) * config.kv_bytes_per_token
-        for lengths in resident_prefixes.values()
-        if len(lengths) > 1
-    )
-    return reserved_kv_bytes, reserved_prefill_bytes, reserved_requests
+
+    if not reservations:
+        return 0, 0, 0
+
+    events: dict[int, tuple[list[int], list[int]]] = {}
+    for index, (start_ms, finish_ms, *_rest) in enumerate(reservations):
+        starts = events.setdefault(start_ms, ([], []))[0]
+        finishes = events.setdefault(finish_ms, ([], []))[1]
+        starts.append(index)
+        finishes.append(index)
+
+    active: set[int] = set()
+    peak_kv_bytes = 0
+    peak_prefill_bytes = 0
+    for event_ms in sorted(events):
+        starts, finishes = events[event_ms]
+        # Intervals are half-open. A request that finishes as another starts
+        # does not overlap it.
+        active.difference_update(finishes)
+        active.update(starts)
+        kv_bytes = sum(reservations[index][2] for index in active)
+        resident_prefixes: dict[str, list[int]] = {}
+        for index in active:
+            _, _, _, _, prefix_group, shared_tokens = reservations[index]
+            if prefix_group is not None and shared_tokens > 0:
+                resident_prefixes.setdefault(prefix_group, []).append(shared_tokens)
+        shared_credit = sum(
+            (len(lengths) - 1) * min(lengths) * config.kv_bytes_per_token
+            for lengths in resident_prefixes.values()
+            if len(lengths) > 1
+        )
+        peak_kv_bytes = max(peak_kv_bytes, kv_bytes - shared_credit)
+        peak_prefill_bytes = max(
+            peak_prefill_bytes,
+            sum(reservations[index][3] for index in active),
+        )
+
+    return peak_kv_bytes, peak_prefill_bytes, len(reservations)
 
 
 def decide_elastic_admission(
@@ -242,6 +304,10 @@ def decide_elastic_admission(
     if not math.isfinite(now_ms) or now_ms < 0:
         raise ValueError("now_ms must be finite and nonnegative")
     hint = FutureHint.from_payload(dict(submission.hint))
+    if hint.shared_prefix_tokens > submission.prompt_tokens:
+        raise ValueError(
+            f"{submission.request_id}: shared prefix exceeds prompt length"
+        )
     planned = hint.residence
     resident_bytes = config.hold_bytes(submission, "resident")
     sparse_bytes = config.hold_bytes(submission, "host_backed")

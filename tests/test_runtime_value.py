@@ -58,6 +58,18 @@ class RuntimeValueTest(unittest.TestCase):
         self.assertEqual(set(values), {"bad", "plain"})
         self.assertTrue(all(value.retention_score() == 1.0 for value in values.values()))
 
+    def test_deadline_without_scheduler_timestamp_is_neutral_and_invalid(self):
+        request = hinted_request(
+            "missing-clock",
+            payload={"deadline_after_ms": 1000, "weight": 4},
+        )
+        request.time_stats = NS()
+
+        values, stats = runtime_values([request], now_s=10.0)
+
+        self.assertEqual(stats, {"hinted": 0, "invalid": 1})
+        self.assertEqual(values["missing-clock"].retention_score(), 1.0)
+
     def test_ranking_prefers_low_value_work_and_moves_deadline_last(self):
         rank_candidates = [{
             "normal": (10, 10),

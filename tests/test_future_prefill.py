@@ -1,4 +1,5 @@
 from types import SimpleNamespace as NS
+from dataclasses import replace
 import unittest
 
 from adaptive_sparse.future_prefill import (
@@ -231,6 +232,28 @@ class FuturePrefillPlanTest(unittest.TestCase):
         self.assertEqual(rejected.mode, "dry_run")
         self.assertEqual(rejected.reserve_bytes, 0)
         self.assertTrue(fallback)
+
+    def test_tp_signature_distinguishes_kv_and_activation_split(self):
+        plan = plan_future_prefill(
+            [request("resident")], now_s=1.0, kv_bytes_per_token=10,
+            config=self.config(),
+        )
+        entry = plan.entries[0]
+        kv_only = replace(
+            plan,
+            entries=(replace(entry, kv_bytes=170, activation_bytes=0),),
+        )
+        activation_only = replace(
+            plan,
+            entries=(replace(entry, kv_bytes=0, activation_bytes=170),),
+        )
+
+        self.assertEqual(kv_only.reserve_bytes, activation_only.reserve_bytes)
+        rejected, fallback = reconcile_tp_plan(
+            kv_only, [activation_only.signature]
+        )
+        self.assertTrue(fallback)
+        self.assertEqual(rejected.reserve_bytes, 0)
 
     def test_effective_headroom_adds_kv_and_uses_one_activation_estimate(self):
         plan = plan_future_prefill(

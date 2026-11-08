@@ -101,7 +101,8 @@ demand；申请成功后立即清除。另一个超额 tenant 若继续增长，
 这种算法是软公平，不是硬分区：
 
 - 无竞争时允许 borrow；
-- 为保持 VMM chunk 的原子性，一个申请可以从份额下方一次性跨过目标边界；
+- 有饥饿 tenant 时，按“当前用量 + 本次申请字节”检查目标；多 chunk 申请若会
+  越界则整批返回 `fair-share-yield`，仍保持每次 VMM mapping 的原子失败语义；
 - demand 过期后自动退出竞争，避免崩溃实例永久冻结资源；
 - 权重相同的两个模型在持续竞争时获得近似相同份额；
 - 权重不同的模型按比例分配，但获得更高权重的服务仍需自己提供可回收 KV。
@@ -113,8 +114,8 @@ demand；申请成功后立即清除。另一个超额 tenant 若继续增长，
 受压时新增长预算归零，避免先向 SGLang 分配一个最终无法映射的 batch。
 
 请求级驻留准入也会读取当前 rank 的 broker 快照。`observe` 只累计
-`global_fair_claim_would_yield`，不改变请求放置；`enforce` 下若当前 tenant 已
-超过目标且其他 tenant 有未满足 demand，新请求直接进入 native HiSparse，而不是
+`global_fair_claim_would_yield`，不改变请求放置；`enforce` 下若当前 tenant 的
+下一次申请会超过目标且其他 tenant 有未满足 demand，新请求直接进入 native HiSparse，而不是
 先占完整 GPU KV、再在后续 decode 边界尝试降级。各 TP rank 分别检查本地 GPU 的
 broker，再对“是否允许驻留”做 MIN collective；任一 rank 受压时整组保守回退。
 这要求 MiniMax 使用 VMM backing；缺少 broker 快照时 fail closed。

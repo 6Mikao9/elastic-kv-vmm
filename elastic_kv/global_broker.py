@@ -412,7 +412,7 @@ class GlobalAdmissionBroker:
                 self.fair_mode == "enforce"
                 and required > 0
                 and target is not None
-                and tenant_usage >= target
+                and tenant_usage + required > target
                 and bool(starved)
             )
             if fair_yield:

@@ -121,7 +121,13 @@ class FuturePrefillPlan:
             self.mode,
             self.reserve_bytes,
             tuple(
-                (entry.request_id, entry.kind, entry.total_bytes, entry.residence)
+                (
+                    entry.request_id,
+                    entry.kind,
+                    entry.kv_bytes,
+                    entry.activation_bytes,
+                    entry.residence,
+                )
                 for entry in self.entries
             ),
         )

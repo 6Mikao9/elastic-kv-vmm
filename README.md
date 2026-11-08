@@ -137,10 +137,11 @@ participant reaches the scheduler hook:
 --elastic-global-broker-wait-ms 0
 ```
 
-An over-share owner is denied *new* leases while another tenant has an unmet
-demand. Dense V5 returns no new-growth budget under the same fairness pressure,
-and MiniMax treats the signal as pressure before aggregate exhaustion. The
-broker never unmaps another process's live KV. Wait-based retry is optional and
+An owner is denied a *new* batch when its prospective usage would exceed the
+target while another tenant has an unmet demand. Dense V5 returns no new-growth
+budget under the same fairness pressure, and MiniMax treats the signal as
+pressure before aggregate exhaustion. The broker never unmaps another
+process's live KV. Wait-based retry is optional and
 limited to 5 seconds because it can delay the calling scheduler.
 
 MiniMax also samples the same tenant signal when a new request would claim a
@@ -189,6 +190,10 @@ their own implementation. The VMM adapter and future-ordering hook can therefore
 share one process without changing sampling or attention behavior. See [the
 compatibility boundary](docs/KV_HINTS_COMPAT.md), [scheduler integration
 design](docs/FUTURE_PLANNER_DESIGN.md), and [smoke script](scripts/container_future_smoke.sh).
+For a source build that should carry the transport natively, the checked-in
+[SGLang 0.5.2 transport patch](patches/sglang-v0.5.2-kv-hints-transport.patch)
+backports only request validation and propagation; it does not change attention
+or allocator behavior.
 The known-future planner now has a live executor that consumes its
 `submit_at_ms` schedule, fails on malformed or late submissions, preserves the
 original absolute deadline, and records planned versus actual latency and
@@ -220,6 +225,10 @@ and the bounded future reservation. Per-request evidence separates persistent KV
 from `elastic_prefill_peak_bytes` and `elastic_future_effective_peak_bytes`, so a
 dropped arm can be attributed to activation pressure instead of being reported as
 ordinary KV contention.
+Future reservations use the peak concurrent demand of anticipated intervals and
+protect deadlines only while waiting behind the current request would consume
+feasible slack. Intervals already backlogged past their planned finish retain a
+predicted service duration from their actual start.
 Shared immutable prefixes are also carried through the validated future hint;
 resident requests in one `prefix_group` are charged one prefix copy in the
 planner and future reservation model. The current runtime does not yet bind

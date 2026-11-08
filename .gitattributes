@@ -3,4 +3,5 @@ results/phase2/exact-source/** -text whitespace=blank-at-eol,blank-at-eof,space-
 results/phase2/padded-source/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
 results/phase2/activation-source/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
 results/vllm/tested-source/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+patches/*.patch -whitespace
 *.png binary
