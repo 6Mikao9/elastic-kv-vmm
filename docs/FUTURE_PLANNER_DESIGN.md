@@ -5,9 +5,11 @@ SGLang 的准入顺序和 VMM 驻留决策。第一阶段以正确、可离线�
 GPU 结果出来前，不把规划收益写成已证实的性能收益。
 
 当前实现状态：`adaptive_sparse/future_plan.py` 已提供不依赖 SGLang/CUDA 的
-确定性事件模拟，比较 `fifo`、`longest`、`mode-aware` 和 `future` 四种策略。
-它目前只用于策略研究；下文所述的 scheduler 接入尚未完成，不能把离线结果当成
-服务端吞吐或延迟结论。
+确定性事件模拟，比较 `fifo`、`longest`、`mode-aware` 和 `future` 四种策略；
+`adaptive_sparse/sglang_future_hook.py` 已实现默认关闭的 scheduler 排序 hook。
+该 hook 只在支持 `kv_hints` 的 SGLang revision 上启用，并保持 `PrefillAdder`
+为最终准入权威。它尚未在带 `kv_hints` 的上游 revision 上完成真实服务 A/B，
+也不能把离线结果当成服务端吞吐或延迟结论。
 
 ## 1. 要解决的问题
 
@@ -48,7 +50,7 @@ Mamba 和 paged allocator 约束仍由原生 `PrefillAdder` 决定。规划器�
   "action_version": "1",
   "payload": {
     "release_after_ms": 250,
-    "deadline_ms": 1800,
+    "deadline_after_ms": 1800,
     "expected_output_tokens": 192,
     "residence": "auto",
     "weight": 1.0
@@ -144,7 +146,8 @@ MVP 不求解任意加权优化问题，而是使用可解释的字典序，避�
 打分：
 
 1. 保留 SGLang 已有的硬 priority 语义和 FCFS 平局规则；
-2. 未到 `release_at` 的请求放到已释放请求之后；
+2. 未到 `release_at` 的请求放到已释放请求之后；这是软排序提示，不是硬准入
+   门槛，`PrefillAdder` 的遍历仍可能尝试后面的未释放请求；
 3. 已释放请求中优先 `latest_start` 更早者：
 
    ```text
@@ -153,8 +156,10 @@ MVP 不求解任意加权优化问题，而是使用可解释的字典序，避�
 
 4. `latest_start` 相同，优先预计完成更早、释放内存更快的请求；
 5. 无 hint 的请求维持原生顺序，不能因为规划关闭而被移到队尾；
-6. `chunked_req` 不参与重排，当前 chunk 必须先完成；
-7. 只改变合法候选的相对顺序，不跳过原生 `PrefillAdder` 检查。
+6. hook 不跨越 SGLang 原生 priority tier；启用 priority scheduling 时只在
+   相同 priority 的连续队列段内重排，无法取得有效 priority 时整体回退；
+7. `chunked_req` 不参与重排，当前 chunk 必须先完成；
+8. 只改变合法候选的相对顺序，不跳过原生 `PrefillAdder` 检查。
 
 服务时间先用可观测的 EWMA 估计：
 
@@ -248,6 +253,10 @@ HINTED -> RELEASED -> ADMITTED -> RUNNING -> DONE
 - `promote/demote_requested`、`promote/demote_committed`；
 - `deadline_feasible_before/after`、`native_order_changed`；
 - 每请求的 `rid_hash`、`reason`、`predicted_slack_ms`。
+
+当前 hook 可把 tick、重排、队列规模、释放/未释放数量、三类回退和 telemetry
+错误写入 `EKV_FUTURE_STATS_PATH`。该文件与 VMM adapter 的 `EKV_STATS_PATH`
+分开，避免两个组件相互覆盖。
 
 实验至少比较 native、EDF/SPT 排序、排序 + 驻留建议、完整执行四组；报告 TTFT p50/p95、
 端到端延迟、deadline hit rate、吞吐、OOM/retraction 次数、迁移字节和浪费预留。

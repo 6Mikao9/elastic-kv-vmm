@@ -15,11 +15,13 @@ from typing import Mapping
 
 MODES = ("baseline", "v0", "v1", "v2", "v3", "v4", "v5")
 ACTIVATION_POLICIES = ("off", "telemetry", "trim", "recycle", "both")
+FUTURE_POLICIES = ("off", "deadline")
 DEFAULT_MODE = "baseline"
 DEFAULT_CHUNK_MIB = 2
 DEFAULT_RETAIN_CHUNKS = 1
 DEFAULT_ACTIVATION_POLICY = "off"
 DEFAULT_PREFILL_HEADROOM_MIB = 0
+DEFAULT_FUTURE_POLICY = "off"
 
 
 def _integer(name: str, value: object, *, minimum: int) -> int:
@@ -41,6 +43,7 @@ class ElasticConfig:
     retain_chunks: int = DEFAULT_RETAIN_CHUNKS
     activation_policy: str = DEFAULT_ACTIVATION_POLICY
     prefill_headroom_mib: int = DEFAULT_PREFILL_HEADROOM_MIB
+    future_policy: str = DEFAULT_FUTURE_POLICY
     stats_path: str | None = None
 
     def __post_init__(self) -> None:
@@ -56,6 +59,8 @@ class ElasticConfig:
             raise ValueError("retain_chunks must retain at least the sink chunk")
         if self.prefill_headroom_mib < 0:
             raise ValueError("prefill_headroom_mib must be nonnegative")
+        if self.future_policy not in FUTURE_POLICIES:
+            raise ValueError(f"unknown future policy: {self.future_policy!r}")
         if self.activation_policy != "off" and self.mode != "v5":
             raise ValueError("activation policies require elastic mode v5")
 
@@ -84,6 +89,7 @@ class ElasticConfig:
                 ),
                 minimum=0,
             ),
+            future_policy=env.get("EKV_FUTURE_POLICY", DEFAULT_FUTURE_POLICY),
             stats_path=env.get("EKV_STATS_PATH") or None,
         )
 
@@ -95,6 +101,7 @@ class ElasticConfig:
         retain_chunks: int | None = None,
         activation_policy: str | None = None,
         prefill_headroom_mib: int | None = None,
+        future_policy: str | None = None,
         stats_path: str | None = None,
     ) -> "ElasticConfig":
         changes = {
@@ -105,6 +112,7 @@ class ElasticConfig:
                 ("retain_chunks", retain_chunks),
                 ("activation_policy", activation_policy),
                 ("prefill_headroom_mib", prefill_headroom_mib),
+                ("future_policy", future_policy),
                 ("stats_path", stats_path),
             )
             if value is not None
@@ -118,6 +126,7 @@ class ElasticConfig:
             "EKV_RETAIN_CHUNKS": str(self.retain_chunks),
             "EKV_ACTIVATION_POLICY": self.activation_policy,
             "EKV_PREFILL_HEADROOM_MIB": str(self.prefill_headroom_mib),
+            "EKV_FUTURE_POLICY": self.future_policy,
         }
         if self.stats_path is not None:
             result["EKV_STATS_PATH"] = self.stats_path
@@ -137,6 +146,7 @@ class ElasticConfig:
             "retain_chunks": self.retain_chunks,
             "activation_policy": self.activation_policy,
             "prefill_headroom_mib": self.prefill_headroom_mib,
+            "future_policy": self.future_policy,
             "stats_path": self.stats_path,
         }
 

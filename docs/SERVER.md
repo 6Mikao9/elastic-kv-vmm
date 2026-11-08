@@ -5,6 +5,11 @@ experimental memory policy before importing SGLang or touching CUDA, then
 installs the pinned SGLang 0.5.2 adapter and passes all remaining arguments to
 SGLang unchanged.
 
+`--elastic-mode baseline` deliberately skips the pinned VMM monkeypatch. This
+keeps a native baseline available and allows the separate future-ordering hook
+to run on newer SGLang revisions that expose `kv_hints`. Non-baseline modes
+still require the pinned 0.5.2 dense-MHA adapter.
+
 ```bash
 python -m elastic_kv --elastic-dry-run \
   --elastic-mode v5 --elastic-retain-chunks 8
@@ -35,8 +40,13 @@ SGLang or touch CUDA.
 | `--elastic-retain-chunks` | `1` | at least the sink chunk |
 | `--elastic-activation-policy` | `off` | requires `v5` unless `off` |
 | `--elastic-prefill-headroom-mib` | `0` | nonnegative integer |
+| `--elastic-future-policy` | `off` | `deadline` only on SGLang revisions with `kv_hints` |
 | `--elastic-stats-path` | unset | atomic JSON telemetry destination |
 
 The CLI currently launches the guarded dense-MHA scope documented in
 [integration](INTEGRATION.md). Unsupported SGLang configurations fail at
 startup rather than silently running with an incorrect backing layout.
+
+Set `EKV_FUTURE_STATS_PATH` to atomically export scheduler hook counters from
+`adaptive_sparse.sglang_future_hook`; these are separate from the VMM adapter's
+`EKV_STATS_PATH` file.

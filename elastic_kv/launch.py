@@ -8,16 +8,22 @@ import os
 import sys
 from typing import Sequence
 
-from .config import ACTIVATION_POLICIES, MODES, ElasticConfig
+from .config import ACTIVATION_POLICIES, FUTURE_POLICIES, MODES, ElasticConfig
 
 
 SPAWN_INSTALL_ENV = "_ELASTIC_KV_INSTALL_ON_IMPORT"
 
 
 def _install_adapter() -> None:
-    from .adapter import install
+    config = ElasticConfig.from_env()
+    if config.mode != "baseline":
+        from .adapter import install
 
-    install()
+        install()
+    if config.future_policy == "deadline":
+        from adaptive_sparse.sglang_future_hook import install as install_future_policy
+
+        install_future_policy()
 
 
 def _install_spawned_worker() -> None:
@@ -47,6 +53,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--elastic-retain-chunks", type=int)
     parser.add_argument("--elastic-activation-policy", choices=ACTIVATION_POLICIES)
     parser.add_argument("--elastic-prefill-headroom-mib", type=int)
+    parser.add_argument("--elastic-future-policy", choices=FUTURE_POLICIES)
     parser.add_argument("--elastic-stats-path")
     parser.add_argument(
         "--elastic-dry-run",
@@ -65,6 +72,7 @@ def resolve_config(argv: Sequence[str]) -> tuple[ElasticConfig, list[str], bool]
         retain_chunks=args.elastic_retain_chunks,
         activation_policy=args.elastic_activation_policy,
         prefill_headroom_mib=args.elastic_prefill_headroom_mib,
+        future_policy=args.elastic_future_policy,
         stats_path=args.elastic_stats_path,
     )
     return config, sglang_argv, args.elastic_dry_run

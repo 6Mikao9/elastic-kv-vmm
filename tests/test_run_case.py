@@ -21,6 +21,16 @@ class RunCaseTest(unittest.TestCase):
         self.assertEqual(env["EKV_STATS_PATH"], "/tmp/v5.json")
         self.assertEqual(env["EKV_MODE"], "v5")
 
+    def test_future_stats_have_a_separate_path(self):
+        env = server_environment(
+            "baseline",
+            "/tmp/adapter.json",
+            {"EKV_FUTURE_STATS_PATH": "/stale/future.json"},
+            future_stats_path="/tmp/future.json",
+        )
+        self.assertEqual(env["EKV_FUTURE_STATS_PATH"], "/tmp/future.json")
+        self.assertNotIn("EKV_STATS_PATH", env)
+
 
 if __name__ == "__main__":
     unittest.main()

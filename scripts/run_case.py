@@ -21,14 +21,17 @@ URL = f"http://{HOST}:{PORT}"
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def server_environment(mode, stats_path, base=None):
+def server_environment(mode, stats_path, base=None, future_stats_path=None):
     """Build a clean server environment for one measured mode."""
     env = dict(os.environ if base is None else base)
     env["EKV_MODE"] = mode
     env["PYTHONUNBUFFERED"] = "1"
     env.pop("EKV_STATS_PATH", None)
+    env.pop("EKV_FUTURE_STATS_PATH", None)
     if mode != "baseline":
         env["EKV_STATS_PATH"] = str(stats_path)
+    if future_stats_path is not None:
+        env["EKV_FUTURE_STATS_PATH"] = str(future_stats_path)
     return env
 
 
@@ -101,8 +104,15 @@ def main(argv=None):
     output.mkdir(parents=True, exist_ok=True)
     log_path = output / "server.log"
     stats_path = output / "adapter_stats.json"
+    future_stats_path = output / "future_stats.json"
     result_path = output / "results.json"
-    for path in (log_path, stats_path, result_path, output / "results.correctness.json"):
+    for path in (
+        log_path,
+        stats_path,
+        future_stats_path,
+        result_path,
+        output / "results.correctness.json",
+    ):
         if path.exists():
             parser.error(f"output already exists: {path}; choose a new --output-dir")
 
@@ -110,17 +120,24 @@ def main(argv=None):
                "elastic_kv/launch.py", "elastic_kv/__main__.py",
                "elastic_kv/slots.py", "elastic_kv/graph_support.py",
                "elastic_kv/activation.py",
+               "adaptive_sparse/sglang_future_hook.py",
                "native/elastic_vmm.cpp", "benchmarks/client.py", "scripts/run_case.py")
+    future_policy = os.environ.get("EKV_FUTURE_POLICY", "off")
     manifest = {"mode": args.mode, "execution": args.execution, "model_label": args.label,
                 "retain_chunks": int(os.environ.get("EKV_RETAIN_CHUNKS", "1")),
                 "activation_policy": os.environ.get("EKV_ACTIVATION_POLICY", "off"),
                 "prefill_headroom_mib": int(os.environ.get("EKV_PREFILL_HEADROOM_MIB", "0")),
                 "prefill_chunk": int(os.environ.get("EKV_PREFILL_CHUNK", "2048")),
+                "future_policy": future_policy,
                 "sha256": {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
                            for name in sources}}
     (output / "source_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
-    env = server_environment(args.mode, stats_path)
+    env = server_environment(
+        args.mode,
+        stats_path,
+        future_stats_path=future_stats_path if future_policy != "off" else None,
+    )
     server_command = [
         sys.executable, "-m", "elastic_kv.launch",
         "--model-path", str(args.model_path.resolve()),

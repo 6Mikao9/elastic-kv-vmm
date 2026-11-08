@@ -24,6 +24,7 @@ docker run --rm --pull=never --gpus "device=$gpu" --network none --shm-size 1g \
     -e EKV_RETAIN_CHUNKS="${EKV_RETAIN_CHUNKS:-1}" \
     -e EKV_ACTIVATION_POLICY="${EKV_ACTIVATION_POLICY:-off}" \
     -e EKV_PREFILL_HEADROOM_MIB="${EKV_PREFILL_HEADROOM_MIB:-0}" \
+    -e EKV_FUTURE_POLICY="${EKV_FUTURE_POLICY:-off}" \
     -e EKV_PREFILL_CHUNK="${EKV_PREFILL_CHUNK:-2048}" \
     -e HF_HOME=/experiment/cache/e2e/hf -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
     -e XDG_CACHE_HOME=/experiment/cache/e2e/xdg -e TORCH_HOME=/experiment/cache/e2e/torch \
