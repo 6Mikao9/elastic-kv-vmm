@@ -17,6 +17,12 @@ import torch
 
 from . import activation
 from .backing import Backing
+from .config import (
+    DEFAULT_PREDICTIVE_PREWARM_MAX_CHUNKS,
+    DEFAULT_PREDICTIVE_PREWARM_MODE,
+    DEFAULT_PREDICTIVE_PREWARM_TTL_MS,
+    PREDICTIVE_PREWARM_MODES,
+)
 from .slots import FreeSlots
 
 MODE = os.environ.get("EKV_MODE", "baseline")
@@ -26,7 +32,6 @@ ALLOW_OVERLAP_SCHEDULE = os.environ.get(
 OVERLAP_SCHEDULE_ACTIVE = False
 VALID_MODES = ("baseline", "v0", "v1", "v2", "v3", "v4", "v5")
 HOST_FREE_MODES = ("v2", "v3", "v4")
-PREDICTIVE_PREWARM_MODES = ("off", "dry_run", "enforce")
 CONTROLLERS = []
 _installed = False
 
@@ -140,7 +145,7 @@ class Residency:
         if not 0 <= self.precommit_limit <= 16:
             raise ValueError("EKV_PRECOMMIT_MAX_CHUNKS must be in [0, 16]")
         self.predictive_prewarm_mode = os.environ.get(
-            "EKV_PREDICTIVE_PREWARM_MODE", "off"
+            "EKV_PREDICTIVE_PREWARM_MODE", DEFAULT_PREDICTIVE_PREWARM_MODE
         ).strip().lower()
         if self.predictive_prewarm_mode not in PREDICTIVE_PREWARM_MODES:
             raise ValueError(
@@ -149,10 +154,12 @@ class Residency:
         if self.predictive_prewarm_mode != "off" and MODE != "v5":
             raise ValueError("predictive prewarm requires EKV_MODE=v5")
         self.predictive_prewarm_ttl_ms = int(os.environ.get(
-            "EKV_PREDICTIVE_PREWARM_TTL_MS", "2000"
+            "EKV_PREDICTIVE_PREWARM_TTL_MS",
+            str(DEFAULT_PREDICTIVE_PREWARM_TTL_MS),
         ))
         self.predictive_prewarm_max_chunks = int(os.environ.get(
-            "EKV_PREDICTIVE_PREWARM_MAX_CHUNKS", "8"
+            "EKV_PREDICTIVE_PREWARM_MAX_CHUNKS",
+            str(DEFAULT_PREDICTIVE_PREWARM_MAX_CHUNKS),
         ))
         if self.predictive_prewarm_ttl_ms < 0:
             raise ValueError(
