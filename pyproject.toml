@@ -7,10 +7,12 @@ name = "elastic-kv-vmm"
 version = "0.1.0"
 description = "Demand-backed CUDA VMM KV storage for a pinned SGLang server"
 requires-python = ">=3.10"
-license = {text = "Apache-2.0"}
+license = "Apache-2.0"
 
 [project.scripts]
 elastic-sglang = "elastic_kv.launch:main"
+elastic-future-plan = "adaptive_sparse.future_plan:main"
 
-[tool.setuptools]
-packages = ["elastic_kv"]
+[tool.setuptools.packages.find]
+include = ["elastic_kv*", "adaptive_sparse*"]
+namespaces = true

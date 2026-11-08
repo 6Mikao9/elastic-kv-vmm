@@ -1,0 +1,294 @@
+{
+  "fifo": {
+    "admissions": [
+      {
+        "arrival_ms": 0,
+        "finish_ms": 3501,
+        "mode": "resident",
+        "prefill_workspace_bytes": 0,
+        "reason": "fits-resident",
+        "request_id": "long-rollout",
+        "resident_kv_bytes": 8000000,
+        "start_ms": 0
+      },
+      {
+        "arrival_ms": 10,
+        "finish_ms": 211,
+        "mode": "resident",
+        "prefill_workspace_bytes": 0,
+        "reason": "fits-resident",
+        "request_id": "tool-0",
+        "resident_kv_bytes": 500000,
+        "start_ms": 10
+      },
+      {
+        "arrival_ms": 10,
+        "finish_ms": 412,
+        "mode": "resident",
+        "prefill_workspace_bytes": 0,
+        "reason": "fits-resident",
+        "request_id": "tool-1",
+        "resident_kv_bytes": 500000,
+        "start_ms": 211
+      },
+      {
+        "arrival_ms": 10,
+        "finish_ms": 613,
+        "mode": "resident",
+        "prefill_workspace_bytes": 0,
+        "reason": "fits-resident",
+        "request_id": "tool-2",
+        "resident_kv_bytes": 500000,
+        "start_ms": 412
+      },
+      {
+        "arrival_ms": 10,
+        "finish_ms": 814,
+        "mode": "resident",
+        "prefill_workspace_bytes": 0,
+        "reason": "fits-resident",
+        "request_id": "tool-3",
+        "resident_kv_bytes": 500000,
+        "start_ms": 613
+      },
+      {
+        "arrival_ms": 10,
+        "finish_ms": 1015,
+        "mode": "resident",
+        "prefill_workspace_bytes": 0,
+        "reason": "fits-resident",
+        "request_id": "tool-4",
+        "resident_kv_bytes": 500000,
+        "start_ms": 814
+      }
+    ],
+    "deadline_misses": 3,
+    "makespan_ms": 3501,
+    "mode_switches": 0,
+    "peak_backed_bytes": 8500000,
+    "peak_memory_bytes": 8500000,
+    "policy": "fifo",
+    "sparse_requests": 0,
+    "throughput_requests_per_second": 1.713796058269066,
+    "weighted_completion_ms": 875.5454545454545
+  },
+  "future": {
+    "admissions": [
+      {
+        "arrival_ms": 0,
+        "finish_ms": 4376,
+        "mode": "hi-sparse",
+        "prefill_workspace_bytes": 0,
+        "reason": "lookahead-protects-imminent-demand",
+        "request_id": "long-rollout",
+        "resident_kv_bytes": 2000000,
+        "start_ms": 0
+      },
+      {
+        "arrival_ms": 10,
+        "finish_ms": 211,
+        "mode": "resident",
+        "prefill_workspace_bytes": 0,
+        "reason": "fits-resident",
+        "request_id": "tool-0",
+        "resident_kv_bytes": 500000,
+        "start_ms": 10
+      },
+      {
+        "arrival_ms": 10,
+        "finish_ms": 212,
+        "mode": "resident",
+        "prefill_workspace_bytes": 0,
+        "reason": "fits-resident",
+        "request_id": "tool-1",
+        "resident_kv_bytes": 500000,
+        "start_ms": 11
+      },
+      {
+        "arrival_ms": 10,
+        "finish_ms": 213,
+        "mode": "resident",
+        "prefill_workspace_bytes": 0,
+        "reason": "fits-resident",
+        "request_id": "tool-2",
+        "resident_kv_bytes": 500000,
+        "start_ms": 12
+      },
+      {
+        "arrival_ms": 10,
+        "finish_ms": 214,
+        "mode": "resident",
+        "prefill_workspace_bytes": 0,
+        "reason": "fits-resident",
+        "request_id": "tool-3",
+        "resident_kv_bytes": 500000,
+        "start_ms": 13
+      },
+      {
+        "arrival_ms": 10,
+        "finish_ms": 215,
+        "mode": "resident",
+        "prefill_workspace_bytes": 0,
+        "reason": "fits-resident",
+        "request_id": "tool-4",
+        "resident_kv_bytes": 500000,
+        "start_ms": 14
+      }
+    ],
+    "deadline_misses": 0,
+    "makespan_ms": 4376,
+    "mode_switches": 0,
+    "peak_backed_bytes": 4500000,
+    "peak_memory_bytes": 4500000,
+    "policy": "future",
+    "sparse_requests": 1,
+    "throughput_requests_per_second": 1.3711151736745886,
+    "weighted_completion_ms": 591.4545454545455
+  },
+  "longest": {
+    "admissions": [
+      {
+        "arrival_ms": 0,
+        "finish_ms": 3501,
+        "mode": "resident",
+        "prefill_workspace_bytes": 0,
+        "reason": "fits-resident",
+        "request_id": "long-rollout",
+        "resident_kv_bytes": 8000000,
+        "start_ms": 0
+      },
+      {
+        "arrival_ms": 10,
+        "finish_ms": 211,
+        "mode": "resident",
+        "prefill_workspace_bytes": 0,
+        "reason": "fits-resident",
+        "request_id": "tool-0",
+        "resident_kv_bytes": 500000,
+        "start_ms": 10
+      },
+      {
+        "arrival_ms": 10,
+        "finish_ms": 412,
+        "mode": "resident",
+        "prefill_workspace_bytes": 0,
+        "reason": "fits-resident",
+        "request_id": "tool-1",
+        "resident_kv_bytes": 500000,
+        "start_ms": 211
+      },
+      {
+        "arrival_ms": 10,
+        "finish_ms": 613,
+        "mode": "resident",
+        "prefill_workspace_bytes": 0,
+        "reason": "fits-resident",
+        "request_id": "tool-2",
+        "resident_kv_bytes": 500000,
+        "start_ms": 412
+      },
+      {
+        "arrival_ms": 10,
+        "finish_ms": 814,
+        "mode": "resident",
+        "prefill_workspace_bytes": 0,
+        "reason": "fits-resident",
+        "request_id": "tool-3",
+        "resident_kv_bytes": 500000,
+        "start_ms": 613
+      },
+      {
+        "arrival_ms": 10,
+        "finish_ms": 1015,
+        "mode": "resident",
+        "prefill_workspace_bytes": 0,
+        "reason": "fits-resident",
+        "request_id": "tool-4",
+        "resident_kv_bytes": 500000,
+        "start_ms": 814
+      }
+    ],
+    "deadline_misses": 3,
+    "makespan_ms": 3501,
+    "mode_switches": 0,
+    "peak_backed_bytes": 8500000,
+    "peak_memory_bytes": 8500000,
+    "policy": "longest",
+    "sparse_requests": 0,
+    "throughput_requests_per_second": 1.713796058269066,
+    "weighted_completion_ms": 875.5454545454545
+  },
+  "mode-aware": {
+    "admissions": [
+      {
+        "arrival_ms": 0,
+        "finish_ms": 3501,
+        "mode": "resident",
+        "prefill_workspace_bytes": 0,
+        "reason": "fits-resident",
+        "request_id": "long-rollout",
+        "resident_kv_bytes": 8000000,
+        "start_ms": 0
+      },
+      {
+        "arrival_ms": 10,
+        "finish_ms": 211,
+        "mode": "resident",
+        "prefill_workspace_bytes": 0,
+        "reason": "fits-resident",
+        "request_id": "tool-0",
+        "resident_kv_bytes": 500000,
+        "start_ms": 10
+      },
+      {
+        "arrival_ms": 10,
+        "finish_ms": 412,
+        "mode": "resident",
+        "prefill_workspace_bytes": 0,
+        "reason": "fits-resident",
+        "request_id": "tool-1",
+        "resident_kv_bytes": 500000,
+        "start_ms": 211
+      },
+      {
+        "arrival_ms": 10,
+        "finish_ms": 613,
+        "mode": "resident",
+        "prefill_workspace_bytes": 0,
+        "reason": "fits-resident",
+        "request_id": "tool-2",
+        "resident_kv_bytes": 500000,
+        "start_ms": 412
+      },
+      {
+        "arrival_ms": 10,
+        "finish_ms": 814,
+        "mode": "resident",
+        "prefill_workspace_bytes": 0,
+        "reason": "fits-resident",
+        "request_id": "tool-3",
+        "resident_kv_bytes": 500000,
+        "start_ms": 613
+      },
+      {
+        "arrival_ms": 10,
+        "finish_ms": 1015,
+        "mode": "resident",
+        "prefill_workspace_bytes": 0,
+        "reason": "fits-resident",
+        "request_id": "tool-4",
+        "resident_kv_bytes": 500000,
+        "start_ms": 814
+      }
+    ],
+    "deadline_misses": 3,
+    "makespan_ms": 3501,
+    "mode_switches": 0,
+    "peak_backed_bytes": 8500000,
+    "peak_memory_bytes": 8500000,
+    "policy": "mode-aware",
+    "sparse_requests": 0,
+    "throughput_requests_per_second": 1.713796058269066,
+    "weighted_completion_ms": 875.5454545454545
+  }
+}

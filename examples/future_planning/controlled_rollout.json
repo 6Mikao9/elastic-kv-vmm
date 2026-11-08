@@ -1,0 +1,21 @@
+{
+  "config": {
+    "memory_budget_bytes": 8500000,
+    "kv_bytes_per_token": 1000,
+    "prefill_workspace_bytes_per_token": 0,
+    "sparse_hot_tokens": 2000,
+    "prefill_tokens_per_ms": 1000,
+    "resident_decode_tokens_per_ms": 2,
+    "sparse_decode_tokens_per_ms": 1.6,
+    "max_active_requests": 8,
+    "lookahead_ms": 50
+  },
+  "requests": [
+    {"request_id": "long-rollout", "arrival_ms": 0, "prompt_tokens": 1000, "output_tokens": 7000, "kind": "rollout", "priority": 1},
+    {"request_id": "tool-0", "arrival_ms": 10, "prompt_tokens": 100, "output_tokens": 400, "kind": "tool", "priority": 2, "deadline_ms": 500},
+    {"request_id": "tool-1", "arrival_ms": 10, "prompt_tokens": 100, "output_tokens": 400, "kind": "tool", "priority": 2, "deadline_ms": 500},
+    {"request_id": "tool-2", "arrival_ms": 10, "prompt_tokens": 100, "output_tokens": 400, "kind": "tool", "priority": 2, "deadline_ms": 500},
+    {"request_id": "tool-3", "arrival_ms": 10, "prompt_tokens": 100, "output_tokens": 400, "kind": "tool", "priority": 2, "deadline_ms": 500},
+    {"request_id": "tool-4", "arrival_ms": 10, "prompt_tokens": 100, "output_tokens": 400, "kind": "tool", "priority": 2, "deadline_ms": 500}
+  ]
+}
