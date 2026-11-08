@@ -87,6 +87,12 @@ class ActivationTest(unittest.TestCase):
         requests = [
             SimpleNamespace(origin_input_ids=range(20), num_matched_prefix_tokens=5),
             SimpleNamespace(origin_input_ids=range(10)),
+            SimpleNamespace(
+                origin_input_ids=range(20),
+                prefix_indices=range(13),
+                kv=SimpleNamespace(kv_committed_len=12),
+                num_matched_prefix_tokens=5,
+            ),
             SimpleNamespace(origin_input_ids=[]),
         ]
 
@@ -94,10 +100,21 @@ class ActivationTest(unittest.TestCase):
             requests, bytes_per_token=8, max_bytes=100
         )
 
-        self.assertEqual(estimate.prompt_tokens, 25)
+        self.assertEqual(estimate.prompt_tokens, 32)
         self.assertEqual(estimate.bytes, 100)
-        self.assertEqual(estimate.requests, 2)
+        self.assertEqual(estimate.requests, 3)
         self.assertEqual(estimate.unestimated, 1)
+
+    def test_empty_batch_detection_supports_newer_sglang_method(self):
+        class Batches:
+            def __init__(self, size):
+                self.size = size
+
+            def batch_size(self):
+                return self.size
+
+        self.assertTrue(activation._batch_is_empty(Batches(0)))
+        self.assertFalse(activation._batch_is_empty(Batches(1)))
 
     def test_scoped_headroom_is_visible_only_inside_prefill_admission(self):
         with patch.multiple(

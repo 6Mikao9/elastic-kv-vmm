@@ -63,9 +63,22 @@ def _request_prompt_tokens(request):
         return None
     if total < 1:
         return None
+    matched_candidates = []
+    kv = getattr(request, "kv", None)
+    committed = getattr(kv, "kv_committed_len", None)
+    if isinstance(committed, int) and not isinstance(committed, bool) and committed >= 0:
+        matched_candidates.append(committed)
+    prefix_indices = getattr(request, "prefix_indices", None)
+    if prefix_indices is not None:
+        try:
+            matched_candidates.append(len(prefix_indices))
+        except TypeError:
+            pass
     matched = getattr(request, "num_matched_prefix_tokens", 0) or 0
     if isinstance(matched, bool) or not isinstance(matched, int) or matched < 0:
         return None
+    matched_candidates.append(matched)
+    matched = max(matched_candidates, default=0)
     return max(1, total - min(matched, total))
 
 
@@ -187,6 +200,8 @@ def _batch_is_empty(batch):
     if callable(is_empty):
         return bool(is_empty())
     batch_size = getattr(batch, "batch_size", None)
+    if callable(batch_size):
+        batch_size = batch_size()
     try:
         return batch_size is not None and int(batch_size) == 0
     except (TypeError, ValueError):
