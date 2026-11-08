@@ -9,7 +9,9 @@ from unittest.mock import patch
 import torch
 
 from elastic_kv.backing import (
-    Backing, DEFAULT_CHUNK_BYTES, _resolve_broker_path,
+    DEFAULT_CHUNK_BYTES,
+    Backing,
+    _resolve_broker_path,
 )
 from elastic_kv.global_broker import GlobalAdmissionBroker
 
@@ -174,6 +176,44 @@ class GlobalBrokerBackingTest(unittest.TestCase):
                 self.assertEqual(observer.available_bytes(), 2 * chunk)
             finally:
                 first.close()
+                observer.close()
+
+    def test_temporary_claim_blocks_same_backing_growth_until_released(self):
+        chunk = 1 << 20
+        with tempfile.TemporaryDirectory() as temporary:
+            path = os.path.join(temporary, "gpu0.sqlite")
+            environment = {
+                "EKV_GLOBAL_BROKER_PATH": path,
+                "EKV_GLOBAL_BROKER_MIB": "2",
+            }
+            with patch.dict(os.environ, environment, clear=False), patch(
+                "elastic_kv.backing._load_library", return_value=_FakeLibrary(2 * chunk)
+            ):
+                backing = Backing(2 * chunk, chunk, 0, library="claim.so")
+            observer = GlobalAdmissionBroker(
+                path, 2 * chunk, owner_id="observer", heartbeat_seconds=None
+            )
+            try:
+                self.assertTrue(
+                    backing.claim_broker_capacity("request-0", 2 * chunk)
+                )
+                self.assertEqual(observer.available_bytes(), 0)
+                with self.assertRaisesRegex(
+                    RuntimeError, "global VMM capacity exhausted"
+                ):
+                    backing.ensure([0])
+                self.assertEqual(
+                    backing.release_broker_claim("request-0"), 2 * chunk
+                )
+                self.assertEqual(backing.ensure([0]), 1)
+                self.assertEqual(
+                    backing.metrics["global_broker_denials"], 1
+                )
+                self.assertEqual(
+                    backing.metrics["global_broker_claim_releases"], 1
+                )
+            finally:
+                backing.close()
                 observer.close()
 
     def test_failed_native_close_retains_lease_until_teardown_retry(self):

@@ -219,6 +219,16 @@ class GlobalAdmissionBroker:
                 "ON leases(lease_key)"
             )
             connection.execute(
+                "CREATE TABLE IF NOT EXISTS claims "
+                "(owner TEXT NOT NULL, claim_key TEXT NOT NULL, "
+                "claim_kind TEXT NOT NULL, bytes INTEGER NOT NULL, "
+                "PRIMARY KEY(owner, claim_key))"
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS claims_claim_key_unique "
+                "ON claims(claim_key)"
+            )
+            connection.execute(
                 "CREATE TABLE IF NOT EXISTS tenants "
                 "(tenant_id TEXT PRIMARY KEY, weight REAL NOT NULL)"
             )
@@ -325,6 +335,7 @@ class GlobalAdmissionBroker:
             if not boot_changed and self._process_exists(int(pid)):
                 continue
             connection.execute("DELETE FROM leases WHERE owner=?", (owner,))
+            connection.execute("DELETE FROM claims WHERE owner=?", (owner,))
             connection.execute("DELETE FROM demands WHERE owner=?", (owner,))
             connection.execute("DELETE FROM owners WHERE owner=?", (owner,))
 
@@ -381,6 +392,12 @@ class GlobalAdmissionBroker:
                 if row is not None:
                     if row[0] == self.owner_id and int(row[1]) == size:
                         continue
+                    connection.rollback()
+                    raise RuntimeError(f"global broker lease key conflict: {key}")
+                claim = connection.execute(
+                    "SELECT owner, bytes FROM claims WHERE claim_key=?", (key,)
+                ).fetchone()
+                if claim is not None:
                     connection.rollback()
                     raise RuntimeError(f"global broker lease key conflict: {key}")
                 acquired.append((key, size))
@@ -459,6 +476,134 @@ class GlobalAdmissionBroker:
             starved_tenants=starved,
         )
 
+    def claim(
+        self, key: str, bytes: int, *, kind: str = "prefill"
+    ) -> LeaseDecision:
+        """Reserve non-mapped capacity that still shares the broker budget."""
+
+        self._ensure_open()
+        normalized = str(key)
+        if not normalized:
+            raise ValueError("broker claim key must be nonempty")
+        claim_kind = str(kind)
+        if not claim_kind or len(claim_kind) > 64:
+            raise ValueError("broker claim kind must be a short nonempty string")
+        if isinstance(bytes, bool) or not isinstance(bytes, int) or bytes < 1:
+            raise ValueError("broker claim bytes must be a positive integer")
+
+        started = time.monotonic()
+        attempts = 0
+        while True:
+            attempts += 1
+            decision = self._claim_once(normalized, bytes, claim_kind)
+            waited = time.monotonic() - started
+            retryable = decision.reason in {
+                "global-capacity-exhausted", "fair-share-yield"
+            }
+            remaining = self.reserve_wait_seconds - waited
+            if decision.admit or not retryable or remaining <= 0:
+                return replace(
+                    decision,
+                    retry_count=attempts - 1,
+                    waited_seconds=waited,
+                )
+            time.sleep(min(0.025, remaining))
+
+    def _claim_once(
+        self, key: str, size: int, kind: str
+    ) -> LeaseDecision:
+        now = time.time()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._prune_dead_owners(connection, now)
+            connection.execute(
+                "UPDATE owners SET last_seen=? WHERE owner=?", (now, self.owner_id)
+            )
+            lease = connection.execute(
+                "SELECT owner, bytes FROM leases WHERE lease_key=?", (key,)
+            ).fetchone()
+            claim = connection.execute(
+                "SELECT owner, bytes, claim_kind FROM claims WHERE claim_key=?", (key,)
+            ).fetchone()
+            if lease is not None:
+                connection.rollback()
+                raise RuntimeError(f"global broker claim key conflict: {key}")
+            if claim is not None:
+                if claim[0] != self.owner_id or int(claim[1]) != size or claim[2] != kind:
+                    connection.rollback()
+                    raise RuntimeError(f"global broker claim key conflict: {key}")
+                fair = self._fair_state(connection, now)
+                used = int(fair["used"])
+                tenant_usage = fair["usage"].get(self.tenant_id, 0)
+                connection.commit()
+                return LeaseDecision(
+                    True, "already-held", 0, used,
+                    self.capacity_bytes - used, tenant_id=self.tenant_id,
+                    tenant_usage_bytes=tenant_usage,
+                    fair_target_bytes=fair["targets"].get(self.tenant_id),
+                    starved_tenants=tuple(
+                        tenant for tenant in fair["starved"]
+                        if tenant != self.tenant_id
+                    ),
+                )
+
+            fair = self._fair_state(connection, now)
+            used = fair["used"]
+            tenant_usage = fair["usage"].get(self.tenant_id, 0)
+            target = fair["targets"].get(self.tenant_id)
+            starved = tuple(
+                tenant for tenant in fair["starved"] if tenant != self.tenant_id
+            )
+            if used + size > self.capacity_bytes:
+                decision = LeaseDecision(
+                    False, "global-capacity-exhausted", size, used,
+                    max(0, self.capacity_bytes - used), tenant_id=self.tenant_id,
+                    tenant_usage_bytes=tenant_usage, fair_target_bytes=target,
+                    starved_tenants=starved,
+                )
+                self._record_demand(connection, size, now)
+                connection.commit()
+                return decision
+            fair_yield = (
+                self.fair_mode == "enforce"
+                and target is not None
+                and tenant_usage + size > target
+                and bool(starved)
+            )
+            if fair_yield:
+                decision = LeaseDecision(
+                    False, "fair-share-yield", size, used,
+                    self.capacity_bytes - used, tenant_id=self.tenant_id,
+                    tenant_usage_bytes=tenant_usage, fair_target_bytes=target,
+                    starved_tenants=starved,
+                )
+                self._record_demand(connection, size, now)
+                connection.commit()
+                return decision
+            connection.execute(
+                "INSERT INTO claims(owner, claim_key, claim_kind, bytes) "
+                "VALUES(?, ?, ?, ?)",
+                (self.owner_id, key, kind, size),
+            )
+            connection.execute("DELETE FROM demands WHERE owner=?", (self.owner_id,))
+            connection.commit()
+
+        outstanding = used + size
+        reason = "admitted"
+        if (
+            self.fair_mode == "observe"
+            and target is not None
+            and tenant_usage + size > target
+            and starved
+        ):
+            reason = "fair-share-observed"
+        return LeaseDecision(
+            True, reason, size, outstanding, self.capacity_bytes - outstanding,
+            (key,), tenant_id=self.tenant_id,
+            tenant_usage_bytes=tenant_usage + size, fair_target_bytes=target,
+            starved_tenants=starved,
+        )
+
     def _record_demand(
         self, connection: sqlite3.Connection, requested: int, now: float
     ) -> None:
@@ -493,15 +638,20 @@ class GlobalAdmissionBroker:
             connection.execute("DELETE FROM demands WHERE expires_at <= ?", (now,))
         used = int(
             connection.execute(
-                "SELECT COALESCE(SUM(bytes), 0) FROM leases"
+                "SELECT COALESCE((SELECT SUM(bytes) FROM leases), 0) + "
+                "COALESCE((SELECT SUM(bytes) FROM claims), 0)"
             ).fetchone()[0]
         )
         usage = {
             str(tenant): int(bytes_used)
             for tenant, bytes_used in connection.execute(
-                "SELECT owners.tenant_id, SUM(leases.bytes) "
+                "SELECT tenant_id, SUM(bytes_used) FROM ("
+                "SELECT owners.tenant_id AS tenant_id, leases.bytes AS bytes_used "
                 "FROM leases JOIN owners ON owners.owner=leases.owner "
-                "WHERE owners.tenant_id IS NOT NULL GROUP BY owners.tenant_id"
+                "UNION ALL "
+                "SELECT owners.tenant_id AS tenant_id, claims.bytes AS bytes_used "
+                "FROM claims JOIN owners ON owners.owner=claims.owner) "
+                "WHERE tenant_id IS NOT NULL GROUP BY tenant_id"
             ).fetchall()
         }
         demand_query = "SELECT tenant_id, SUM(requested_bytes) FROM demands"
@@ -595,17 +745,43 @@ class GlobalAdmissionBroker:
             connection.commit()
         return released
 
+    def release_claim(self, key: str) -> int:
+        self._ensure_open()
+        normalized = str(key)
+        if not normalized:
+            return 0
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT bytes FROM claims WHERE owner=? AND claim_key=?",
+                (self.owner_id, normalized),
+            ).fetchone()
+            released = 0 if row is None else int(row[0])
+            if row is not None:
+                connection.execute(
+                    "DELETE FROM claims WHERE owner=? AND claim_key=?",
+                    (self.owner_id, normalized),
+                )
+            connection.execute(
+                "UPDATE owners SET last_seen=? WHERE owner=?",
+                (time.time(), self.owner_id),
+            )
+            connection.commit()
+        return released
+
     def release_all(self) -> int:
         self._ensure_open()
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             released = int(
                 connection.execute(
-                    "SELECT COALESCE(SUM(bytes), 0) FROM leases WHERE owner=?",
-                    (self.owner_id,),
+                    "SELECT COALESCE((SELECT SUM(bytes) FROM leases WHERE owner=?), 0) "
+                    "+ COALESCE((SELECT SUM(bytes) FROM claims WHERE owner=?), 0)",
+                    (self.owner_id, self.owner_id),
                 ).fetchone()[0]
             )
             connection.execute("DELETE FROM leases WHERE owner=?", (self.owner_id,))
+            connection.execute("DELETE FROM claims WHERE owner=?", (self.owner_id,))
             connection.execute("DELETE FROM demands WHERE owner=?", (self.owner_id,))
             connection.execute("DELETE FROM owners WHERE owner=?", (self.owner_id,))
             connection.commit()
@@ -615,7 +791,10 @@ class GlobalAdmissionBroker:
         self._ensure_open()
         with self._connection() as connection:
             return int(
-                connection.execute("SELECT COALESCE(SUM(bytes), 0) FROM leases").fetchone()[0]
+                connection.execute(
+                    "SELECT COALESCE((SELECT SUM(bytes) FROM leases), 0) + "
+                    "COALESCE((SELECT SUM(bytes) FROM claims), 0)"
+                ).fetchone()[0]
             )
 
     def available_bytes(self) -> int:
@@ -629,6 +808,22 @@ class GlobalAdmissionBroker:
             # a SQLite write lock just to observe a consistent WAL state.
             connection.execute("BEGIN")
             fair = self._fair_state(connection, now, prune_expired=False)
+            lease_bytes = int(
+                connection.execute(
+                    "SELECT COALESCE(SUM(bytes), 0) FROM leases"
+                ).fetchone()[0]
+            )
+            claim_bytes = int(
+                connection.execute(
+                    "SELECT COALESCE(SUM(bytes), 0) FROM claims"
+                ).fetchone()[0]
+            )
+            claims = {
+                str(key): {"kind": str(kind), "bytes": int(size)}
+                for key, kind, size in connection.execute(
+                    "SELECT claim_key, claim_kind, bytes FROM claims ORDER BY claim_key"
+                )
+            }
             connection.commit()
         outstanding = int(fair["used"])
         usage = fair["usage"]
@@ -642,6 +837,9 @@ class GlobalAdmissionBroker:
         return {
             "capacity_bytes": self.capacity_bytes,
             "outstanding_bytes": outstanding,
+            "lease_bytes": lease_bytes,
+            "claim_bytes": claim_bytes,
+            "claims": claims,
             "available_bytes": self.capacity_bytes - outstanding,
             "fair_mode": self.fair_mode,
             "tenant_id": self.tenant_id,
@@ -670,6 +868,7 @@ class GlobalAdmissionBroker:
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute("DELETE FROM leases WHERE owner=?", (self.owner_id,))
+            connection.execute("DELETE FROM claims WHERE owner=?", (self.owner_id,))
             connection.execute("DELETE FROM demands WHERE owner=?", (self.owner_id,))
             connection.execute("DELETE FROM owners WHERE owner=?", (self.owner_id,))
             connection.commit()

@@ -258,8 +258,54 @@ class DualBrokerRunnerTest(unittest.TestCase):
         self.assertEqual(snapshot["starved_tenants"], ["b"])
         self.assertEqual(snapshot["tenants_over_target_with_demand"], [])
         self.assertFalse(snapshot["overcommitted"])
+        self.assertEqual(snapshot["claim_bytes"], 0)
         self.assertEqual(snapshot["owners"]["owner-a"]["leased_bytes"], 70)
         self.assertEqual(snapshot["owners"]["owner-b"]["lease_count"], 1)
+
+    def test_snapshot_counts_temporary_claims_in_aggregate_and_owner_usage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "broker.sqlite"
+            now = time.time()
+            connection = sqlite3.connect(path)
+            try:
+                connection.executescript(
+                    "CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+                    "INSERT INTO metadata VALUES('capacity_bytes', '100'),"
+                    "('fair_mode', 'off');"
+                    "CREATE TABLE owners(owner TEXT PRIMARY KEY, pid INTEGER, "
+                    "last_seen REAL, tenant_id TEXT);"
+                    "CREATE TABLE leases(owner TEXT, lease_key TEXT, bytes INTEGER);"
+                    "CREATE TABLE claims(owner TEXT, claim_key TEXT, "
+                    "claim_kind TEXT, bytes INTEGER);"
+                    "CREATE TABLE tenants(tenant_id TEXT PRIMARY KEY, weight REAL);"
+                    "CREATE TABLE demands(owner TEXT, tenant_id TEXT, "
+                    "requested_bytes INTEGER, expires_at REAL);"
+                )
+                connection.execute(
+                    "INSERT INTO owners VALUES(?, ?, ?, ?)",
+                    ("owner-a", 101, now, None),
+                )
+                connection.executemany(
+                    "INSERT INTO leases VALUES(?, ?, ?)",
+                    (("owner-a", "kv-0", 60),),
+                )
+                connection.executemany(
+                    "INSERT INTO claims VALUES(?, ?, ?, ?)",
+                    (("owner-a", "prefill-0", "prefill", 30),),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            snapshot = read_broker_snapshot(path)
+        self.assertEqual(snapshot["outstanding_bytes"], 90)
+        self.assertEqual(snapshot["lease_bytes"], 60)
+        self.assertEqual(snapshot["claim_bytes"], 30)
+        self.assertEqual(
+            snapshot["claims"]["prefill-0"],
+            {"kind": "prefill", "bytes": 30},
+        )
+        self.assertEqual(snapshot["owners"]["owner-a"]["leased_bytes"], 90)
+        self.assertEqual(snapshot["owners"]["owner-a"]["lease_count"], 2)
 
     def test_missing_snapshot_is_uninitialized(self):
         with tempfile.TemporaryDirectory() as directory:

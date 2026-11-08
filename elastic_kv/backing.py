@@ -12,7 +12,6 @@ import torch
 
 from .global_broker import GlobalAdmissionBroker
 
-
 DEFAULT_CHUNK_BYTES = 2 << 20
 _INVALID = (1 << 64) - 1
 
@@ -136,6 +135,7 @@ class Backing:
         self._poisoned = False
         self._broker = None
         self._broker_leases = set()
+        self._broker_claims = {}
         try:
             broker_path = os.environ.get("EKV_GLOBAL_BROKER_PATH")
             broker_mib = int(os.environ.get("EKV_GLOBAL_BROKER_MIB", "0"))
@@ -206,6 +206,12 @@ class Backing:
             "global_broker_retries": 0,
             "global_broker_wait_ns": 0,
             "global_broker_released_chunks": 0,
+            "global_broker_claim_checks": 0,
+            "global_broker_claim_denials": 0,
+            "global_broker_claim_retries": 0,
+            "global_broker_claim_wait_ns": 0,
+            "global_broker_claim_releases": 0,
+            "global_broker_peak_claim_bytes": 0,
         }
 
     def _error(self):
@@ -263,6 +269,10 @@ class Backing:
     def broker_snapshot(self):
         return None if self._broker is None else self._broker.snapshot()
 
+    @property
+    def has_global_broker(self):
+        return self._broker is not None
+
     def _broker_key(self, index):
         return f"{self._broker.owner_id}/device-{self.device}/chunk-{index}"
 
@@ -305,6 +315,62 @@ class Backing:
         self._broker.release(keys)
         self._broker_leases.difference_update(keys)
         self._metrics["global_broker_released_chunks"] += len(keys)
+
+    def claim_broker_capacity(self, key, byte_count, *, kind="prefill"):
+        """Reserve temporary non-mapped capacity in the aggregate broker.
+
+        ``None`` means this backing has no broker. ``True`` or ``False``
+        describes an actual broker admission decision. The caller owns the
+        returned claim until ``release_broker_claim`` or backing teardown.
+        """
+
+        if self._broker is None:
+            return None
+        normalized = str(key)
+        if not normalized:
+            raise ValueError("broker claim key must be nonempty")
+        normalized_kind = str(kind)
+        if not normalized_kind or len(normalized_kind) > 64:
+            raise ValueError("broker claim kind must be a short nonempty string")
+        byte_count = operator.index(byte_count)
+        if byte_count < 1:
+            raise ValueError("broker claim bytes must be positive")
+        full_key = (
+            f"{self._broker.owner_id}/device-{self.device}/"
+            f"claim/{normalized_kind}/{normalized}"
+        )
+        self._metrics["global_broker_claim_checks"] += 1
+        decision = self._broker.claim(
+            full_key, byte_count, kind=normalized_kind
+        )
+        self._metrics["global_broker_claim_retries"] += decision.retry_count
+        self._metrics["global_broker_claim_wait_ns"] += int(
+            decision.waited_seconds * 1_000_000_000
+        )
+        if not decision.admit:
+            self._metrics["global_broker_claim_denials"] += 1
+            return False
+        self._broker_claims[full_key] = byte_count
+        self._metrics["global_broker_peak_claim_bytes"] = max(
+            self._metrics["global_broker_peak_claim_bytes"],
+            sum(self._broker_claims.values()),
+        )
+        return True
+
+    def release_broker_claim(self, key, *, kind="prefill"):
+        if self._broker is None:
+            return 0
+        normalized = str(key)
+        normalized_kind = str(kind)
+        full_key = (
+            f"{self._broker.owner_id}/device-{self.device}/"
+            f"claim/{normalized_kind}/{normalized}"
+        )
+        released = self._broker.release_claim(full_key)
+        self._broker_claims.pop(full_key, None)
+        if released:
+            self._metrics["global_broker_claim_releases"] += 1
+        return released
 
     @property
     def raw(self):
@@ -413,6 +479,7 @@ class Backing:
         self._finalizer.detach()
         self._broker = None
         self._broker_leases.clear()
+        self._broker_claims.clear()
         if self._lifecycle.handle is None:
             self._mapped.clear()
             self._precommitted.clear()

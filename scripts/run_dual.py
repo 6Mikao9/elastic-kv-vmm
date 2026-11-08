@@ -438,15 +438,26 @@ def read_broker_snapshot(path):
         connection = sqlite3.connect(uri, uri=True, timeout=0.1)
         connection.execute("BEGIN")
         metadata = dict(connection.execute("SELECT key, value FROM metadata"))
+        has_claims = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='claims'"
+        ).fetchone() is not None
         now = time.time()
         capacity = int(metadata["capacity_bytes"])
+        usage_query = (
+            "SELECT tenant_id, SUM(bytes_used) FROM ("
+            "SELECT owners.tenant_id AS tenant_id, leases.bytes AS bytes_used "
+            "FROM leases JOIN owners ON owners.owner=leases.owner "
+            + (
+                "UNION ALL SELECT owners.tenant_id AS tenant_id, claims.bytes "
+                "AS bytes_used FROM claims JOIN owners "
+                "ON owners.owner=claims.owner "
+                if has_claims else ""
+            )
+            + ") WHERE tenant_id IS NOT NULL GROUP BY tenant_id"
+        )
         usage = {
             str(tenant): int(bytes_used)
-            for tenant, bytes_used in connection.execute(
-                "SELECT owners.tenant_id, SUM(leases.bytes) "
-                "FROM leases JOIN owners ON owners.owner=leases.owner "
-                "WHERE owners.tenant_id IS NOT NULL GROUP BY owners.tenant_id"
-            )
+            for tenant, bytes_used in connection.execute(usage_query)
         }
         demands = {
             str(tenant): int(requested)
@@ -479,30 +490,56 @@ def read_broker_snapshot(path):
             if usage.get(tenant, 0) >= targets[tenant]
             and any(other != tenant for other in starved)
         )
-        outstanding = int(
-            connection.execute(
-                "SELECT COALESCE(SUM(bytes), 0) FROM leases"
-            ).fetchone()[0]
-        )
+        lease_bytes = int(connection.execute(
+            "SELECT COALESCE(SUM(bytes), 0) FROM leases"
+        ).fetchone()[0])
+        claim_bytes = 0 if not has_claims else int(connection.execute(
+            "SELECT COALESCE(SUM(bytes), 0) FROM claims"
+        ).fetchone()[0])
+        outstanding = lease_bytes + claim_bytes
+        claims = {} if not has_claims else {
+            str(key): {"kind": str(kind), "bytes": int(size)}
+            for key, kind, size in connection.execute(
+                "SELECT claim_key, claim_kind, bytes FROM claims ORDER BY claim_key"
+            )
+        }
+        # Keep metadata lookup separate so an owner with no resources remains
+        # visible and temporary prefill claims share the same per-owner totals.
+        owner_metadata = {
+            str(owner): (int(pid), tenant, float(last_seen))
+            for owner, pid, tenant, last_seen in connection.execute(
+                "SELECT owner, pid, tenant_id, last_seen FROM owners"
+            )
+        }
+        owner_usage = {
+            str(owner): (int(bytes_used), int(resource_count))
+            for owner, bytes_used, resource_count in connection.execute(
+                "SELECT owner, COALESCE(SUM(bytes), 0), COUNT(*) FROM ("
+                "SELECT owner, bytes, 1 AS present FROM leases "
+                + (
+                    "UNION ALL SELECT owner, bytes, 1 FROM claims "
+                    if has_claims else ""
+                )
+                + ") GROUP BY owner"
+            )
+        }
         owners = {
             str(owner): {
-                "pid": int(pid),
+                "pid": pid,
                 "tenant_id": tenant,
-                "last_seen": float(last_seen),
-                "leased_bytes": int(bytes_used),
-                "lease_count": int(lease_count),
+                "last_seen": last_seen,
+                "leased_bytes": owner_usage.get(owner, (0, 0))[0],
+                "lease_count": owner_usage.get(owner, (0, 0))[1],
             }
-            for owner, pid, tenant, last_seen, bytes_used, lease_count in connection.execute(
-                "SELECT owners.owner, owners.pid, owners.tenant_id, owners.last_seen, "
-                "COALESCE(SUM(leases.bytes), 0), COUNT(leases.lease_key) "
-                "FROM owners LEFT JOIN leases ON leases.owner=owners.owner "
-                "GROUP BY owners.owner ORDER BY owners.owner"
-            )
+            for owner, (pid, tenant, last_seen) in owner_metadata.items()
         }
         return {
             "status": "ready",
             "capacity_bytes": capacity,
             "outstanding_bytes": outstanding,
+            "lease_bytes": lease_bytes,
+            "claim_bytes": claim_bytes,
+            "claims": claims,
             "available_bytes": capacity - outstanding,
             "fair_mode": metadata.get("fair_mode", "off"),
             "tenant_usage_bytes": usage,

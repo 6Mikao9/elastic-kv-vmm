@@ -24,6 +24,25 @@ def _race_for_lease(path, index, barrier, results):
         broker.close()
 
 
+def _race_for_mixed_capacity(path, index, barrier, results):
+    broker = GlobalAdmissionBroker(
+        path,
+        3,
+        owner_id=f"mixed-worker-{index}-{__import__('os').getpid()}",
+        heartbeat_seconds=None,
+    )
+    try:
+        barrier.wait(timeout=10)
+        if index % 2:
+            decision = broker.claim(f"claim-{index}", 1)
+        else:
+            decision = broker.reserve({f"lease-{index}": 1})
+        results.put(decision.admit)
+        barrier.wait(timeout=10)
+    finally:
+        broker.close()
+
+
 class GlobalAdmissionBrokerTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -86,6 +105,85 @@ class GlobalAdmissionBrokerTest(unittest.TestCase):
             self.assertEqual(broker.outstanding_bytes(), 4)
         finally:
             broker.close()
+
+    def test_prefill_claim_competes_with_vmm_leases(self):
+        lease_owner = self.broker("lease-owner", capacity=100)
+        prefill_owner = self.broker("prefill-owner", capacity=100)
+        try:
+            self.assertTrue(lease_owner.reserve({"kv-0": 60}).admit)
+            claimed = prefill_owner.claim("decode/prefill-0", 30)
+            self.assertTrue(claimed.admit)
+            denied = lease_owner.reserve({"kv-1": 20})
+            self.assertFalse(denied.admit)
+            self.assertEqual(denied.reason, "global-capacity-exhausted")
+            snapshot = lease_owner.snapshot()
+            self.assertEqual(snapshot["outstanding_bytes"], 90)
+            self.assertEqual(snapshot["lease_bytes"], 60)
+            self.assertEqual(snapshot["claim_bytes"], 30)
+            self.assertEqual(
+                snapshot["claims"]["decode/prefill-0"],
+                {"kind": "prefill", "bytes": 30},
+            )
+
+            self.assertEqual(prefill_owner.release_claim("decode/prefill-0"), 30)
+            self.assertTrue(lease_owner.reserve({"kv-1": 20}).admit)
+        finally:
+            lease_owner.close()
+            prefill_owner.close()
+
+    def test_claim_is_idempotent_and_conflicts_across_kinds(self):
+        broker = self.broker("owner", capacity=10)
+        try:
+            first = broker.claim("prefill-0", 4, kind="prefill")
+            second = broker.claim("prefill-0", 4, kind="prefill")
+            self.assertEqual(first.reason, "admitted")
+            self.assertEqual(second.reason, "already-held")
+            self.assertEqual(second.required_bytes, 0)
+            self.assertEqual(broker.outstanding_bytes(), 4)
+            with self.assertRaisesRegex(RuntimeError, "claim key conflict"):
+                broker.claim("prefill-0", 5, kind="prefill")
+            with self.assertRaisesRegex(RuntimeError, "claim key conflict"):
+                broker.claim("prefill-0", 4, kind="rollout")
+            with self.assertRaisesRegex(RuntimeError, "lease key conflict"):
+                broker.reserve({"prefill-0": 4})
+        finally:
+            broker.close()
+
+    def test_release_all_and_close_release_temporary_claims(self):
+        first = self.broker("first", capacity=10)
+        second = self.broker("second", capacity=10)
+        try:
+            first.reserve({"kv-0": 3})
+            first.claim("prefill-0", 4)
+            self.assertEqual(first.release_all(), 7)
+            self.assertTrue(second.reserve({"kv-1": 7}).admit)
+            first.claim("prefill-1", 2)
+            first.close()
+            self.assertEqual(second.outstanding_bytes(), 7)
+            self.assertTrue(second.reserve({"kv-2": 2}).admit)
+        finally:
+            first.close()
+            second.close()
+
+    def test_process_race_combines_leases_and_claims_atomically(self):
+        context = multiprocessing.get_context("spawn")
+        workers = 8
+        barrier = context.Barrier(workers)
+        results = context.Queue()
+        processes = [
+            context.Process(
+                target=_race_for_mixed_capacity,
+                args=(str(self.path), index, barrier, results),
+            )
+            for index in range(workers)
+        ]
+        for process in processes:
+            process.start()
+        outcomes = [results.get(timeout=15) for _ in processes]
+        for process in processes:
+            process.join(timeout=15)
+            self.assertEqual(process.exitcode, 0)
+        self.assertEqual(sum(outcomes), 3)
 
     def test_same_key_cannot_be_claimed_by_two_owners(self):
         first = self.broker("first")
