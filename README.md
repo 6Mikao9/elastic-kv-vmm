@@ -164,7 +164,11 @@ weights and short-lived demand records for weighted soft fairness; they still
 cannot preempt live KV in a process that does not participate. See the
 [cross-instance broker design](docs/GLOBAL_VMM_BROKER_ZH.md)
 for lease lifetimes, failure semantics, multi-GPU state paths and the paired
-validation matrix.
+validation matrix. The dense [dual-instance runner](scripts/run_dual.py) now
+accepts one fresh broker file plus per-model tenant and weight values, samples
+broker capacity/usage/demand and whole-device NVML together, and runs `a-hot`,
+`b-hot` and `both-active` phases. The full arm and acceptance protocol is in
+the [dual-instance validation plan](docs/DUAL_INSTANCE_VALIDATION_ZH.md).
 
 `EKV_PREFILL_HEADROOM_SCOPED=1` (or `--elastic-prefill-headroom-scoped`) makes
 the static fallback apply only while native prefill admission is active.

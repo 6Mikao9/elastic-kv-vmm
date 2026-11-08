@@ -65,7 +65,11 @@ returns exit status 1.
 
 The separate dual-instance experiment uses `scripts/run_dual.py`. The
 single-instance runs do not demonstrate global memory arbitration or
-actual out-of-memory recovery. The dual runner has no global memory broker.
+actual out-of-memory recovery. Its optional global-broker arm assigns a
+stable tenant and weight to each server, uses one VMM capacity, and records
+read-only broker snapshots alongside adapter and whole-device NVML samples.
+This is cooperative admission and reclamation, not cross-process live-KV
+preemption.
 
 The recorded dual runs use `active_sample_count`, a snapshot of the sample
 list at request completion. Their legacy `peak_device_used_bytes` field

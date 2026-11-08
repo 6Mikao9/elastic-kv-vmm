@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# Usage: container_dual.sh GPU MODEL_HUB MODE OUTPUT
+# Usage: container_dual.sh GPU MODEL_HUB MODE OUTPUT [run_dual.py flags]
 gpu=$1; hub=$2; mode=$3; output=$4
+shift 4
 root=$(cd "$(dirname "$0")/.." && pwd)
 image=${SGLANG_IMAGE:-training-sandbox:torch280-cu128}
 model_a=models--Qwen--Qwen3-0.6B-Base/snapshots/da87bfb608c14b7cf20ba1ce41287e8de496c0cd
@@ -28,4 +29,4 @@ docker run --rm --pull=never --gpus "device=$gpu" --network none --shm-size 1g \
     -e CUDA_CACHE_PATH=/experiment/cache/dual/cuda -e PYTHONDONTWRITEBYTECODE=1 \
     --entrypoint python3 "$image" scripts/run_dual.py \
     --model-a "/hf/hub/$model_a" --model-b "/hf/hub/$model_b" \
-    --mode "$mode" --output-dir "/experiment/$output"
+    --mode "$mode" --output-dir "/experiment/$output" "$@"

@@ -181,7 +181,9 @@ PyTorch allocator cache、Graph private pool 和 activation workspace 仍然由�
 - MiniMax 的 indexer、权重、activation 和 Graph pool 不在当前 VMM 预算内。
 - 同进程、同一完整 prefix 的 resident donor 已能直接服务 HiSparse Top-K；跨实例
   共享前缀、部分 block 共享和 donor 完成后的 pinning 尚未接入。
-- 还没有使用真实双实例、多 TP 规模完成端到端时延和 OOM 对照。
+- 还没有使用真实双实例、多 TP 规模完成端到端时延和 OOM 对照；dense
+  双实例的可执行 arm、采样字段和验收条件见
+  [双实例验证设计](DUAL_INSTANCE_VALIDATION_ZH.md)。
 - 公平预算仍只覆盖 VMM-backed KV；prefill 激活、权重、PyTorch cache 和 Graph
   private pool 仍是外部预算。
 

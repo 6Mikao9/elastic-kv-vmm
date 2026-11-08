@@ -31,9 +31,11 @@ for cooperative demotion. A request that would claim a complete-GPU history
 under live fairness pressure falls back to native HiSparse before allocating
 that history; all TP ranks use the conservative common result. Ownership remains
 with the original process: a lease is transferred only after successful
-`cuMemUnmap` and release. The next evidence needed is a paired two-instance GPU
-run comparing `off`, `observe`, `enforce`, an unfair long-lived burst and a
-load-reversal arm. Until that run, the implemented weighted targets,
+`cuMemUnmap` and release. The dense dual-instance runner now exposes `off`,
+`observe` and `enforce` with per-model tenants, samples broker and NVML state,
+and executes `a-hot`, `b-hot` and `both-active` phases. The next evidence is a
+paired GPU run, including an unfair long-lived burst; MiniMax still needs its
+request-level pair driver. Until that run, the implemented weighted targets,
 anti-starvation, request-admission fallback and bounded retry are CPU and
 multi-process SQLite evidence, not an end-to-end throughput or latency result.
 
