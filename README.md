@@ -10,6 +10,8 @@ The [Phase 2 report](docs/RESULTS_PHASE2.md) covers allocator optimization, Grap
 
 The new launch and worker-install path has a separate real-service smoke in [the framework report](docs/SGLANG_FRAMEWORK_SMOKE.md). It verifies eager and graph-pad execution, exact probe agreement, VMM backing telemetry and whole-device memory on the current branch; its two repeats are preliminary evidence rather than a replacement for Phase 2.
 
+The optional future-aware scheduler hook has a separate real A100 smoke in [the scheduler report](docs/FUTURE_SCHEDULER_SMOKE.md). It reordered a hinted two-request queue inside native SGLang and retained native order for unhinted traffic. That run uses a newer SGLang revision without the pinned VMM adapter, so it validates the scheduler path rather than a combined VMM/HiSparse runtime.
+
 ## Request-level HiSparse
 
 The MiniMax prototype lets selected long requests keep full GPU history while other requests use the native CPU history and fixed GPU hot buffer. Under a main-KV backing budget, it can demote and promote active requests at safe eager boundaries. The sparse attention selection remains unchanged in both modes. VMM reclaims whole physical chunks after their page references disappear.
@@ -94,6 +96,12 @@ bash scripts/container_case.sh 0 "$MODEL_HUB" "$MODEL_REL" \
 Use a fresh output directory for every run. Substitute `baseline` or `v0`–`v4` for ablations. Set `EKV_EXECUTION=graph-pad` for capture batches 1, 2, 4, 8 (including additional 3/5/3-request padding probes), or `graph` for exact batches 1–8. `EKV_RETAIN_CHUNKS=8` selects the warm retention policy. These are environment variables on the container script. The Qwen3-4B snapshot revision is recorded in `environment.json`. Never copy weights into this repository.
 
 For an existing isolated environment, the primary entry point is `python3 -m elastic_kv` (or `elastic-sglang` after installing `pyproject.toml`). It validates elastic settings before importing SGLang, installs the adapter, and forwards the remaining arguments to SGLang. `python3 -m elastic_kv.launch` remains compatible with the experiment scripts. The module entry point is required so the adapter is installed in the spawned scheduler process as well as the launcher. See [server usage](docs/SERVER.md); `EKV_STATS_PATH` optionally records residency telemetry.
+
+For the separate future-ordering path, set `EKV_FUTURE_POLICY=deadline` and
+optionally `EKV_FUTURE_STATS_PATH=/path/to/future-stats.json`. This requires an
+SGLang revision with `kv_hints`; the pinned VMM adapter is skipped only when the
+mode is `baseline`. See [the scheduler integration design](docs/FUTURE_PLANNER_DESIGN.md)
+and [smoke script](scripts/container_future_smoke.sh).
 
 Summarize only explicitly selected completed runs:
 
