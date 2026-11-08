@@ -139,10 +139,17 @@ class Backing:
         try:
             broker_path = os.environ.get("EKV_GLOBAL_BROKER_PATH")
             broker_mib = int(os.environ.get("EKV_GLOBAL_BROKER_MIB", "0"))
+            fair_mode = os.environ.get(
+                "EKV_GLOBAL_BROKER_FAIR_MODE", "off"
+            ).strip().lower()
             if bool(broker_path) != (broker_mib > 0):
                 raise ValueError(
                     "global VMM broker requires both EKV_GLOBAL_BROKER_PATH and "
                     "a positive EKV_GLOBAL_BROKER_MIB"
+                )
+            if fair_mode != "off" and not broker_path:
+                raise ValueError(
+                    "fair global VMM broker requires an enabled broker path"
                 )
             if broker_path:
                 stale = float(
@@ -152,6 +159,16 @@ class Backing:
                     raise ValueError(
                         "EKV_GLOBAL_BROKER_STALE_SECONDS must be positive"
                     )
+                tenant_id = os.environ.get("EKV_GLOBAL_BROKER_TENANT") or None
+                tenant_weight = float(
+                    os.environ.get("EKV_GLOBAL_BROKER_TENANT_WEIGHT", "1")
+                )
+                demand_ttl = float(
+                    os.environ.get("EKV_GLOBAL_BROKER_DEMAND_TTL_SECONDS", "10")
+                )
+                reserve_wait = float(
+                    os.environ.get("EKV_GLOBAL_BROKER_WAIT_MS", "0")
+                ) / 1000.0
                 resource_id = _gpu_resource_id(self.device)
                 self._broker = GlobalAdmissionBroker(
                     _resolve_broker_path(broker_path, resource_id),
@@ -159,6 +176,11 @@ class Backing:
                     stale_after_seconds=stale,
                     heartbeat_seconds=max(0.1, min(30.0, stale / 3)),
                     resource_id=resource_id,
+                    tenant_id=tenant_id,
+                    tenant_weight=tenant_weight,
+                    fair_mode=fair_mode,
+                    demand_ttl_seconds=demand_ttl,
+                    reserve_wait_seconds=reserve_wait,
                 )
                 self._lifecycle.broker = self._broker
         except Exception:
@@ -181,6 +203,8 @@ class Backing:
             "peak_backed_bytes": 0,
             "global_broker_reservations": 0,
             "global_broker_denials": 0,
+            "global_broker_retries": 0,
+            "global_broker_wait_ns": 0,
             "global_broker_released_chunks": 0,
         }
 
@@ -250,11 +274,20 @@ class Backing:
         )
         if not decision.admit:
             self._metrics["global_broker_denials"] += 1
+            self._metrics["global_broker_retries"] += decision.retry_count
+            self._metrics["global_broker_wait_ns"] += int(
+                decision.waited_seconds * 1_000_000_000
+            )
             raise RuntimeError(
-                "global VMM capacity exhausted: "
+                "global VMM capacity exhausted or fair-share yield: "
+                f"reason={decision.reason} "
                 f"required={decision.required_bytes} "
                 f"available={decision.available_bytes}"
             )
+        self._metrics["global_broker_retries"] += decision.retry_count
+        self._metrics["global_broker_wait_ns"] += int(
+            decision.waited_seconds * 1_000_000_000
+        )
         self._broker_leases.update(decision.acquired_keys)
         self._metrics["global_broker_reservations"] += len(decision.acquired_keys)
         return decision.acquired_keys

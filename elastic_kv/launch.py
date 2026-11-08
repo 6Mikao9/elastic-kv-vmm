@@ -12,6 +12,7 @@ from .config import (
     ACTIVATION_POLICIES,
     ADMISSION_POLICIES,
     FUTURE_POLICIES,
+    GLOBAL_BROKER_FAIR_MODES,
     MODES,
     ElasticConfig,
 )
@@ -77,6 +78,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--elastic-global-broker-mib", type=int)
     parser.add_argument("--elastic-global-broker-stale-seconds", type=int)
     parser.add_argument(
+        "--elastic-global-broker-fair-mode", choices=GLOBAL_BROKER_FAIR_MODES
+    )
+    parser.add_argument("--elastic-global-broker-tenant")
+    parser.add_argument("--elastic-global-broker-tenant-weight", type=float)
+    parser.add_argument(
+        "--elastic-global-broker-demand-ttl-seconds", type=float
+    )
+    parser.add_argument("--elastic-global-broker-wait-ms", type=int)
+    parser.add_argument(
         "--elastic-dry-run",
         action="store_true",
         help="validate and print the resolved backend settings without importing SGLang",
@@ -108,6 +118,13 @@ def resolve_config(argv: Sequence[str]) -> tuple[ElasticConfig, list[str], bool]
         global_broker_path=args.elastic_global_broker_path,
         global_broker_mib=args.elastic_global_broker_mib,
         global_broker_stale_seconds=args.elastic_global_broker_stale_seconds,
+        global_broker_fair_mode=args.elastic_global_broker_fair_mode,
+        global_broker_tenant=args.elastic_global_broker_tenant,
+        global_broker_tenant_weight=args.elastic_global_broker_tenant_weight,
+        global_broker_demand_ttl_seconds=(
+            args.elastic_global_broker_demand_ttl_seconds
+        ),
+        global_broker_wait_ms=args.elastic_global_broker_wait_ms,
     )
     return config, sglang_argv, args.elastic_dry_run
 

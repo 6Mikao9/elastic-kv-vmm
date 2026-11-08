@@ -124,6 +124,25 @@ launches, pass a directory or a `{gpu}` path template so every physical GPU gets
 its own state file, for example `/run/ekv/gpu-{gpu}.sqlite`. Resource metadata
 rejects accidental reuse of one file across GPUs.
 
+For cooperative fair sharing between two models, assign every process of one
+model a stable tenant and weight. Start with `observe` to verify the target and
+demand signals without changing allocation, then use `enforce` when every
+participant reaches the scheduler hook:
+
+```bash
+--elastic-global-broker-fair-mode enforce \
+--elastic-global-broker-tenant qwen-a \
+--elastic-global-broker-tenant-weight 3 \
+--elastic-global-broker-demand-ttl-seconds 10 \
+--elastic-global-broker-wait-ms 0
+```
+
+An over-share owner is denied *new* leases while another tenant has an unmet
+demand. Dense V5 caps `available_size()` by the tenant's remaining share and
+MiniMax treats the same signal as pressure before aggregate exhaustion. The
+broker never unmaps another process's live KV. Wait-based retry is optional and
+limited to 5 seconds because it can delay the calling scheduler.
+
 The MiniMax scheduler can consume the same broker state. Set
 `EKV_ADAPTIVE_GLOBAL_BROKER_HEADROOM_BYTES` to the local VMM bytes it should
 keep available and `EKV_ADAPTIVE_GLOBAL_BROKER_LOW_BYTES` to the higher recovery
@@ -132,9 +151,11 @@ and promotion waits for stable recovery. Both values are required together and
 the low watermark must be higher. This is cooperative pressure, not a command
 to forcibly unmap another process: every participating instance must run a
 scheduler boundary. The mechanism covers VMM-backed KV only, uses first-come
-leases, does not include weights, PyTorch workspace or activation allocations,
-does not enforce per-model fairness, and cannot preempt live KV in a process
-that does not participate. See the [cross-instance broker design](docs/GLOBAL_VMM_BROKER_ZH.md)
+leases by default, and does not include weights, PyTorch workspace or activation
+allocations. `observe` and `enforce` modes add explicit tenant ids, positive
+weights and short-lived demand records for weighted soft fairness; they still
+cannot preempt live KV in a process that does not participate. See the
+[cross-instance broker design](docs/GLOBAL_VMM_BROKER_ZH.md)
 for lease lifetimes, failure semantics, multi-GPU state paths and the paired
 validation matrix.
 
@@ -169,8 +190,11 @@ retained as an incumbent when the expansion cap is reached. Search telemetry is
 exported as `search_expansions`, `search_truncated` and `fallback_policy`.
 `search_exact` distinguishes a completed search from a capped incumbent. Use
 `--policies fifo future oracle` to limit offline work; an emitted policy is
-automatically included and its simulation is reused. This is an offline
-planning upper bound, not a scheduler hot-path algorithm.
+automatically included and its simulation is reused. Each result also carries
+`oracle_gap` metrics when the comparison includes oracle. A negative makespan
+gap is possible because deadline misses and weighted completion are optimized
+before makespan. This is an offline planning upper bound, not a scheduler
+hot-path algorithm.
 The same executor can treat each planned timestamp as an earliest admission
 time, bound the observed in-flight set, prioritize deadline-bearing requests,
 and demote only newly admitted long requests when the live predicted KV set
@@ -246,8 +270,8 @@ See the [integration map](docs/INTEGRATION.md) for changed components, Graph lif
 - VMM admission completes before the allocator publishes IDs to the forward pass. Reclamation waits for device work to finish. Slot zero remains backed.
 - `v0` and `v1` reclaim empty chunks on logical frees. The later arms defer reclamation until the instance is idle; they therefore do not promise prompt return of all slack under a permanently busy workload.
 - A fixed virtual address is not sufficient to make arbitrary unmapping safe. SGLang Graph padding uses a permanently backed sink row and maps real slots before replay. Overlap scheduling, speculative decoding, HiCache/PD transfers, prefix-cache retention and hybrid recurrent states remain unsupported. vLLM Graph execution remains unsupported.
-- CUDA allocation failures are fail-stop. A successfully mapped earlier plane may remain allocated until worker teardown if a later plane fails. There is no transactional OOM recovery or multi-tenant fair share; the optional broker recovers a dead owner's leases only after proving the process or boot generation is gone.
-- A shared SQLite VMM broker can prevent independently mapped K/V chunks from exceeding one configured aggregate capacity, and both instances still release idle backing to the driver. It has no per-model fair share, live-KV transfer, forced physical OOM or safe preemption of another model. Model weights and activation allocators remain outside its budget.
+- CUDA allocation failures are fail-stop. A successfully mapped earlier plane may remain allocated until worker teardown if a later plane fails. There is no transactional OOM recovery or hard per-tenant partition; the optional broker can apply cooperative weighted soft shares and recovers a dead owner's leases only after proving the process or boot generation is gone.
+- A shared SQLite VMM broker can prevent independently mapped K/V chunks from exceeding one configured aggregate capacity, and both instances still release idle backing to the driver. `EKV_GLOBAL_BROKER_FAIR_MODE=enforce` adds weighted soft shares between explicit tenants and records unmet demand for anti-starvation. Dense V5 admission and MiniMax demotion both consume the result. The broker can deny growth but cannot unmap another live process's KV or transfer live KV, so fairness is cooperative, soft and limited to VMM-backed KV. Model weights and activation allocators remain outside its budget, and no dual-instance GPU throughput comparison has yet been completed.
 - Optional V5 activation policies measure prefill demand, trim unused retained KV chunks before prefill under pressure, and return actually releasable PyTorch cache before new VMM commitment. They never evict live KV or release Graph pools. Headroom is empirical; unresolved pressure is recorded, not converted into scheduler backpressure. This is not a guaranteed activation-budget lender or OOM recovery system.
 
 ## Related work

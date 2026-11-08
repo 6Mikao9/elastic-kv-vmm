@@ -1,5 +1,7 @@
 import multiprocessing
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -163,6 +165,159 @@ class GlobalAdmissionBrokerTest(unittest.TestCase):
             finally:
                 survivor.close()
                 dead.close()
+
+    def test_fair_share_blocks_over_share_growth_for_starved_tenant(self):
+        first = self.broker(
+            "first", capacity=10, tenant_id="model-a", fair_mode="enforce"
+        )
+        second = self.broker(
+            "second", capacity=10, tenant_id="model-b", fair_mode="enforce"
+        )
+        try:
+            self.assertTrue(first.reserve({"a-0": 10}).admit)
+            denied = second.reserve({"b-0": 2})
+            self.assertEqual(denied.reason, "global-capacity-exhausted")
+            self.assertEqual(first.release(["a-0"]), 10)
+            first.reserve({"a-1": 8})
+            yielded = first.reserve({"a-2": 2})
+            self.assertFalse(yielded.admit)
+            self.assertEqual(yielded.reason, "fair-share-yield")
+            self.assertEqual(yielded.starved_tenants, ("model-b",))
+            self.assertTrue(second.reserve({"b-0": 2}).admit)
+        finally:
+            first.close()
+            second.close()
+
+    def test_fair_share_reports_weighted_tp_targets(self):
+        first = self.broker(
+            "first", capacity=100, tenant_id="model-a", tenant_weight=3,
+            fair_mode="observe",
+        )
+        second = self.broker(
+            "second", capacity=100, tenant_id="model-b", tenant_weight=1,
+            fair_mode="observe",
+        )
+        try:
+            first.reserve({"a-0": 100})
+            self.assertFalse(second.reserve({"b-0": 1}).admit)
+            self.assertEqual(first.snapshot()["fair_target_bytes"], 75)
+            self.assertEqual(second.snapshot()["fair_target_bytes"], 25)
+            self.assertEqual(second.snapshot()["tenant_deficit_bytes"], 25)
+        finally:
+            first.close()
+            second.close()
+
+    def test_observe_mode_records_would_yield_but_does_not_block(self):
+        first = self.broker(
+            "first", capacity=10, tenant_id="model-a", fair_mode="observe"
+        )
+        second = self.broker(
+            "second", capacity=10, tenant_id="model-b", fair_mode="observe"
+        )
+        try:
+            first.reserve({"a-0": 10})
+            self.assertFalse(second.reserve({"b-0": 1}).admit)
+            first.release(["a-0"])
+            first.reserve({"a-1": 8})
+            observed = first.reserve({"a-2": 2})
+            self.assertTrue(observed.admit)
+            self.assertEqual(observed.reason, "fair-share-observed")
+            self.assertTrue(first.snapshot()["fair_share_would_yield"])
+        finally:
+            first.close()
+            second.close()
+
+    def test_bounded_wait_succeeds_after_cooperating_owner_releases(self):
+        first = self.broker("first", capacity=1)
+        second = self.broker("second", capacity=1, reserve_wait_seconds=0.5)
+        self.assertTrue(first.reserve({"a-0": 1}).admit)
+
+        def release():
+            time.sleep(0.05)
+            first.release(["a-0"])
+
+        thread = threading.Thread(target=release)
+        thread.start()
+        try:
+            decision = second.reserve({"b-0": 1})
+            self.assertTrue(decision.admit)
+            self.assertGreater(decision.retry_count, 0)
+            self.assertGreater(decision.waited_seconds, 0)
+        finally:
+            thread.join(timeout=2)
+            first.close()
+            second.close()
+
+    def test_expired_demand_stops_protecting_an_idle_tenant(self):
+        from unittest.mock import patch
+
+        now = [100.0]
+        with patch("elastic_kv.global_broker.time.time", side_effect=lambda: now[0]):
+            first = self.broker(
+                "first", capacity=10, tenant_id="model-a", fair_mode="enforce",
+                demand_ttl_seconds=5,
+            )
+            second = self.broker(
+                "second", capacity=10, tenant_id="model-b", fair_mode="enforce",
+                demand_ttl_seconds=5,
+            )
+            try:
+                first.reserve({"a-0": 10})
+                self.assertFalse(second.reserve({"b-0": 1}).admit)
+                first.release(["a-0"])
+                first.reserve({"a-1": 8})
+                now[0] = 106.0
+                self.assertTrue(first.reserve({"a-2": 2}).admit)
+            finally:
+                first.close()
+                second.close()
+
+    def test_snapshot_ignores_expired_demand_without_a_write_transaction(self):
+        from unittest.mock import patch
+
+        now = [100.0]
+        with patch("elastic_kv.global_broker.time.time", side_effect=lambda: now[0]):
+            first = self.broker(
+                "first", capacity=10, tenant_id="model-a", fair_mode="enforce",
+                demand_ttl_seconds=5,
+            )
+            second = self.broker(
+                "second", capacity=10, tenant_id="model-b", fair_mode="enforce",
+                demand_ttl_seconds=5,
+            )
+            try:
+                first.reserve({"a-0": 10})
+                self.assertFalse(second.reserve({"b-0": 1}).admit)
+                first.release(["a-0"])
+                first.reserve({"a-1": 8})
+                self.assertTrue(first.snapshot()["fair_share_would_yield"])
+
+                now[0] = 106.0
+                self.assertFalse(first.snapshot()["fair_share_would_yield"])
+                self.assertTrue(first.reserve({"a-2": 2}).admit)
+            finally:
+                first.close()
+                second.close()
+
+    def test_fair_configuration_must_be_unambiguous(self):
+        with self.assertRaisesRegex(ValueError, "stable tenant_id"):
+            GlobalAdmissionBroker(
+                self.path, 10, fair_mode="enforce", heartbeat_seconds=None
+            )
+        owner = self.broker(
+            "owner", capacity=10, tenant_id="model", fair_mode="off"
+        )
+        try:
+            with self.assertRaisesRegex(ValueError, "fair mode does not match"):
+                self.broker(
+                    "other", capacity=10, tenant_id="model", fair_mode="enforce"
+                )
+        finally:
+            owner.close()
+        with self.assertRaisesRegex(ValueError, r"within \[0, 5\]"):
+            GlobalAdmissionBroker(
+                self.path, 10, heartbeat_seconds=None, reserve_wait_seconds=5.1
+            )
 
     def test_invalid_values_are_rejected(self):
         with self.assertRaises(ValueError):

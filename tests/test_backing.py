@@ -75,6 +75,21 @@ class _FakeLibrary:
 
 
 class GlobalBrokerBackingTest(unittest.TestCase):
+    def test_fair_broker_environment_requires_a_broker_path(self):
+        chunk = 1 << 20
+        with patch.dict(
+            os.environ,
+            {
+                "EKV_GLOBAL_BROKER_FAIR_MODE": "enforce",
+                "EKV_GLOBAL_BROKER_TENANT": "model-a",
+            },
+            clear=True,
+        ), patch(
+            "elastic_kv.backing._load_library", return_value=_FakeLibrary(2 * chunk)
+        ):
+            with self.assertRaisesRegex(ValueError, "enabled broker path"):
+                Backing(2 * chunk, chunk, 0, library="missing-broker.so")
+
     def test_broker_path_can_be_partitioned_by_physical_gpu(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = os.path.join(temporary, "brokers")

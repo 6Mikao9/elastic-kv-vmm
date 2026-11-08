@@ -35,6 +35,11 @@ class ElasticConfigTest(unittest.TestCase):
                 "EKV_GLOBAL_BROKER_PATH": "/tmp/gpu0-broker.sqlite",
                 "EKV_GLOBAL_BROKER_MIB": "6144",
                 "EKV_GLOBAL_BROKER_STALE_SECONDS": "90",
+                "EKV_GLOBAL_BROKER_FAIR_MODE": "enforce",
+                "EKV_GLOBAL_BROKER_TENANT": "qwen-a",
+                "EKV_GLOBAL_BROKER_TENANT_WEIGHT": "3.5",
+                "EKV_GLOBAL_BROKER_DEMAND_TTL_SECONDS": "7.5",
+                "EKV_GLOBAL_BROKER_WAIT_MS": "125",
             }
         )
         self.assertEqual(config.chunk_mib, 4)
@@ -53,6 +58,11 @@ class ElasticConfigTest(unittest.TestCase):
         self.assertEqual(config.global_broker_path, "/tmp/gpu0-broker.sqlite")
         self.assertEqual(config.global_broker_mib, 6144)
         self.assertEqual(config.global_broker_stale_seconds, 90)
+        self.assertEqual(config.global_broker_fair_mode, "enforce")
+        self.assertEqual(config.global_broker_tenant, "qwen-a")
+        self.assertEqual(config.global_broker_tenant_weight, 3.5)
+        self.assertEqual(config.global_broker_demand_ttl_seconds, 7.5)
+        self.assertEqual(config.global_broker_wait_ms, 125)
 
     def test_activation_policy_requires_v5(self):
         with self.assertRaisesRegex(ValueError, "require elastic mode v5"):
@@ -92,6 +102,24 @@ class ElasticConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires both a path"):
             ElasticConfig(global_broker_mib=1024)
 
+    def test_fair_global_broker_requires_tenant_and_matching_mode(self):
+        with self.assertRaisesRegex(ValueError, "requires a tenant"):
+            ElasticConfig(global_broker_fair_mode="enforce")
+        with self.assertRaisesRegex(ValueError, "enabled broker path"):
+            ElasticConfig(
+                global_broker_fair_mode="enforce",
+                global_broker_tenant="qwen",
+            )
+        config = ElasticConfig(
+            global_broker_path="/tmp/gpu0.sqlite",
+            global_broker_mib=1024,
+            global_broker_fair_mode="enforce",
+            global_broker_tenant="qwen",
+        )
+        self.assertEqual(config.as_env()["EKV_GLOBAL_BROKER_TENANT"], "qwen")
+        with self.assertRaisesRegex(ValueError, "between 0 and 5000"):
+            ElasticConfig(global_broker_wait_ms=5001)
+
     def test_cli_overrides_leave_sglang_arguments_untouched(self):
         config, upstream, dry_run = resolve_config(
             [
@@ -122,6 +150,16 @@ class ElasticConfigTest(unittest.TestCase):
                 "6144",
                 "--elastic-global-broker-stale-seconds",
                 "90",
+                "--elastic-global-broker-fair-mode",
+                "enforce",
+                "--elastic-global-broker-tenant",
+                "qwen-a",
+                "--elastic-global-broker-tenant-weight",
+                "2.5",
+                "--elastic-global-broker-demand-ttl-seconds",
+                "8",
+                "--elastic-global-broker-wait-ms",
+                "150",
                 "--model-path",
                 "/models/qwen",
                 "--port",
@@ -144,6 +182,11 @@ class ElasticConfigTest(unittest.TestCase):
                 config.global_broker_path,
                 config.global_broker_mib,
                 config.global_broker_stale_seconds,
+                config.global_broker_fair_mode,
+                config.global_broker_tenant,
+                config.global_broker_tenant_weight,
+                config.global_broker_demand_ttl_seconds,
+                config.global_broker_wait_ms,
             ),
             (
                 "v5",
@@ -160,6 +203,11 @@ class ElasticConfigTest(unittest.TestCase):
                 "/tmp/gpu0.sqlite",
                 6144,
                 90,
+                "enforce",
+                "qwen-a",
+                2.5,
+                8.0,
+                150,
             ),
         )
         self.assertEqual(upstream, ["--model-path", "/models/qwen", "--port", "30000"])

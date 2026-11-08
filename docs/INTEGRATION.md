@@ -72,8 +72,10 @@ chunks-to-tokens calculation. The prefill headroom remains an estimate, and
 transactional allocation failure and exact activation ownership remain separate
 work. An optional [cross-process broker](../elastic_kv/global_broker.py) now
 leases aggregate VMM chunks before mapping and exposes its remaining bytes to
-dense V5 admission. Its capacity covers only mapped VMM backing, uses a
-first-come policy and does not preempt another process's live KV. A caller that
+dense V5 admission. Its optional explicit-tenant `observe`/`enforce` modes add
+weighted soft shares and short demand records; `off` remains first-come. Its
+capacity covers only mapped VMM backing and it does not preempt another
+process's live KV. A caller that
 never reaches the broker, such as another runtime's original CUDA allocator,
 remains outside the guarantee. Dead owners are reclaimed only after the stale
 interval when their PID is gone or the boot ID changed; a live hung owner keeps
@@ -119,7 +121,7 @@ backing while keeping the sink resident. vLLM retains its software block
 table and logical paging. See [vLLM adapter](../vllm_integration/adapter.py)
 and [launcher](../vllm_integration/launch.py).
 
-Mixed Full/SWA/Mamba pools, live KV eviction, per-model fair shares and
-cross-process KV preemption remain separate integration targets. Removing
+Mixed Full/SWA/Mamba pools, live KV eviction, exact byte-level hard partitions
+and cross-process KV preemption remain separate integration targets. Removing
 attention's software page lookup requires changes to the kernel and indexing
 path in addition to VMM.

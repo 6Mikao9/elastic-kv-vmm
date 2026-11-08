@@ -60,6 +60,11 @@ SGLang or touch CUDA.
 | `--elastic-global-broker-path` | unset | shared SQLite state for one physical GPU |
 | `--elastic-global-broker-mib` | `0` | aggregate VMM backing capacity; must be positive with a path |
 | `--elastic-global-broker-stale-seconds` | `120` | minimum age before a demonstrably dead owner's leases are recovered |
+| `--elastic-global-broker-fair-mode` | `off` | `off`, `observe`, or cooperative `enforce` weighted fairness |
+| `--elastic-global-broker-tenant` | unset | stable fairness identity; required by observe/enforce |
+| `--elastic-global-broker-tenant-weight` | `1` | positive weight shared by every owner of the tenant |
+| `--elastic-global-broker-demand-ttl-seconds` | `10` | lifetime of a denied request's starvation signal |
+| `--elastic-global-broker-wait-ms` | `0` | bounded lease retry from 0 to 5000 ms |
 
 The CLI currently launches the guarded dense-MHA scope documented in
 [integration](INTEGRATION.md). Unsupported SGLang configurations fail at
@@ -82,8 +87,10 @@ the same `--elastic-global-broker-path` and the same aggregate
 a `{gpu}` template such as `/run/ekv/gpu-{gpu}.sqlite`. The SQLite transaction is
 the cross-process admission point, and a lease is kept until the corresponding
 chunk is unambiguously unmapped. This coordinates VMM backing only. Weights,
-PyTorch caches and activations are outside the capacity, admission is first-come
-rather than fair, and another process's live KV is not forcibly preempted.
+PyTorch caches and activations are outside the capacity. The default remains
+first-come. `observe` reports weighted shares and would-yield decisions;
+`enforce` adds cooperative soft fairness, and another process's live KV is never
+forcibly preempted.
 Stale leases are removed only when the owner process is provably gone or the
 machine boot ID changed; failed mapping or teardown therefore fails safe by
 retaining capacity until a later successful close or crash recovery.
@@ -136,6 +143,14 @@ backing, and all participants must reach the scheduler hook. This is a
 cooperative multi-instance policy over VMM KV leases; it does not budget model
 weights or activation allocators and does not force eviction inside an
 uncooperative process.
+
+For a fair two-model deployment on one GPU, give every process of each model
+the same explicit tenant and weight. The broker records denied demand for a
+short TTL; an over-share model is then denied further growth while the starved
+model exists. Its local scheduler must notice `fairness_pressure` and demote
+safe requests before retrying. Fairness is active only with `enforce`; use
+`observe` for a no-effect measurement arm. The state file binds the mode and
+weights, so do not change them while live owners exist.
 
 Set `--elastic-future-ordering-horizon-ms` (or `EKV_FUTURE_ORDERING_HORIZON_MS`)
 to make deadline reordering fall back to

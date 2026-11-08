@@ -15,13 +15,24 @@ changing the attention addressing model:
    admission guarantees; never reclaim live KV to manufacture headroom. The
    V5 physical-admission slice now reports a conservative combined KV-plus-
    prefill token budget through SGLang's native `available_size()` call. A
-   per-GPU SQLite broker now provides cross-process VMM leases and dense/MiniMax
-   pressure signals. Per-model fair share, exact activation ownership and
-   transactional OOM recovery remain open.
+   per-GPU SQLite broker now provides cross-process VMM leases, dense/MiniMax
+   pressure signals, and opt-in weighted soft fairness between explicit tenant
+   ids. Exact hard partitions, activation ownership and transactional OOM
+   recovery remain open.
 5. Add a vLLM implementation using existing local model snapshots read-only,
    and validate correctness, memory and serving efficiency against vLLM's
    own baseline.
 6. Publish tested code, reproduction commands, raw measurements and limitations.
+
+The tenant fairness slice is opt-in and defaults off. Denied growth writes a
+bounded demand record; Dense V5 stops admitting a starved tenant's competitor,
+and MiniMax uses the same signal for cooperative demotion. Ownership remains
+with the original process: a lease is transferred only after successful
+`cuMemUnmap` and release. The next evidence needed is a paired two-instance GPU
+run comparing `off`, `observe`, `enforce`, an unfair long-lived burst and a
+load-reversal arm. Until that run, the implemented weighted targets,
+anti-starvation and bounded retry are CPU and multi-process SQLite evidence,
+not an end-to-end throughput or latency result.
 
 ## Request-level HiSparse phase
 

@@ -460,6 +460,79 @@ class AdapterCompatibilityTest(unittest.TestCase):
         )
         self.assertEqual(ctrl.counters["physical_global_broker_limited_calls"], 1)
 
+    def test_physical_admission_stops_growth_under_enforced_fair_pressure(self):
+        ctrl = object.__new__(adapter.Residency)
+        ctrl.admission_policy = "physical"
+        ctrl.pool = SimpleNamespace(device="cuda:0")
+        ctrl.arenas = [SimpleNamespace(
+            planes=1,
+            mapped_chunks={0},
+            backing=SimpleNamespace(
+                broker_available_bytes=10_000,
+                broker_snapshot={
+                    "capacity_bytes": 10_000,
+                    "outstanding_bytes": 2_000,
+                    "available_bytes": 8_000,
+                    "fair_mode": "enforce",
+                    "fair_target_bytes": 2_500,
+                    "tenant_usage_bytes": 2_000,
+                    "fairness_pressure": True,
+                },
+            ),
+        )]
+        ctrl.chunk_bytes = 1_000
+        ctrl.slot_bytes = 100
+        ctrl.prefill_headroom_bytes = 0
+        ctrl.counters = {}
+        ctrl.precommitted = set()
+
+        with patch.object(
+            adapter.torch.cuda, "mem_get_info", return_value=(10_000, 10_000)
+        ):
+            admitted = ctrl.physical_available_tokens(30, [(1, 31)])
+
+        self.assertEqual(admitted, 9)
+        self.assertEqual(
+            ctrl.counters["physical_global_broker_fair_available_bytes"], 0
+        )
+        self.assertEqual(
+            ctrl.counters["physical_global_broker_fair_limited_calls"], 1
+        )
+
+    def test_fair_mode_still_allows_borrowing_without_a_starved_tenant(self):
+        ctrl = object.__new__(adapter.Residency)
+        ctrl.admission_policy = "physical"
+        ctrl.pool = SimpleNamespace(device="cuda:0")
+        ctrl.arenas = [SimpleNamespace(
+            planes=1,
+            mapped_chunks={0},
+            backing=SimpleNamespace(
+                broker_available_bytes=1_000,
+                broker_snapshot={
+                    "capacity_bytes": 10_000,
+                    "outstanding_bytes": 9_000,
+                    "available_bytes": 1_000,
+                    "fair_mode": "enforce",
+                    "fair_target_bytes": 5_000,
+                    "tenant_usage_bytes": 9_000,
+                    "fairness_pressure": False,
+                },
+            ),
+        )]
+        ctrl.chunk_bytes = 1_000
+        ctrl.slot_bytes = 100
+        ctrl.prefill_headroom_bytes = 0
+        ctrl.counters = {}
+        ctrl.precommitted = set()
+
+        with patch.object(
+            adapter.torch.cuda, "mem_get_info", return_value=(10_000, 10_000)
+        ):
+            admitted = ctrl.physical_available_tokens(30, [(1, 31)])
+
+        self.assertEqual(admitted, 19)
+        self.assertNotIn("physical_global_broker_fair_limited_calls", ctrl.counters)
+
     def test_logical_admission_does_not_query_cuda(self):
         ctrl = object.__new__(adapter.Residency)
         ctrl.admission_policy = "logical"

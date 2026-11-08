@@ -78,10 +78,14 @@ def _broker_snapshot(tracker):
         raise RuntimeError("invalid global VMM broker snapshot")
     if available != capacity - outstanding:
         raise RuntimeError("inconsistent global VMM broker snapshot")
+    fairness_pressure = value.get("fairness_pressure", False)
+    if not isinstance(fairness_pressure, bool):
+        raise RuntimeError("invalid global VMM broker fairness pressure")
     return {
         "capacity_bytes": capacity,
         "outstanding_bytes": outstanding,
         "available_bytes": available,
+        "fairness_pressure": fairness_pressure,
     }
 
 
@@ -480,6 +484,7 @@ class SchedulerBudget:
                       "time_cap_rejections_promotion": 0,
                       "global_broker_observations": 0,
                       "global_broker_pressure_observations": 0,
+                      "global_broker_fair_pressure_observations": 0,
                       "global_broker_min_available_bytes": None,
                       "global_broker_max_outstanding_bytes": 0,
                       "global_broker_min_capacity_bytes": None,
@@ -593,7 +598,10 @@ class SchedulerBudget:
             self.stats["global_broker_max_outstanding_bytes"],
             max(capacity - value for capacity, value in zip(capacities, available)),
         )
-        return minimum_available
+        fair_pressure = any(bool(item[6]) for item in states)
+        if fair_pressure:
+            self.stats["global_broker_fair_pressure_observations"] += 1
+        return minimum_available, fair_pressure
 
     def observe_future_prefill(self, plan, effective_headroom=0, *, tp_fallback=False,
                                boundary="prefill"):
@@ -672,12 +680,17 @@ class SchedulerBudget:
             backed, force, now - self.last_change >= self.dwell, force_promote,
             None if snapshot is None else snapshot["available_bytes"],
             None if snapshot is None else snapshot["capacity_bytes"],
+            None if snapshot is None else snapshot["fairness_pressure"],
         )
         states = exchange(local)
         if self.broker_headroom_bytes and any(
-                item[4] is None or item[5] is None for item in states):
+                item[4] is None or item[5] is None or item[6] is None
+                for item in states):
             raise RuntimeError("global broker pressure must be configured on every TP rank")
-        broker_available = self.observe_broker(states)
+        if self.broker_headroom_bytes:
+            broker_available, broker_fair_pressure = self.observe_broker(states)
+        else:
+            broker_available, broker_fair_pressure = 0, False
         headroom = future_headroom
         if prefill:
             headroom = max(self.headroom, headroom)
@@ -687,7 +700,10 @@ class SchedulerBudget:
         )
         broker_pressure = (
             self.broker_headroom_bytes > 0
-            and broker_available < self.broker_headroom_bytes
+            and (
+                broker_available < self.broker_headroom_bytes
+                or broker_fair_pressure
+            )
         )
         pressure = local_pressure or broker_pressure
         force = all(item[1] for item in states)
@@ -710,14 +726,21 @@ class SchedulerBudget:
                 tracker.backing.backed_bytes, local[1], local[2], local[3],
                 None if post_snapshot is None else post_snapshot["available_bytes"],
                 None if post_snapshot is None else post_snapshot["capacity_bytes"],
+                None if post_snapshot is None else post_snapshot["fairness_pressure"],
             )
             states = exchange(post_local)
-            broker_available = self.observe_broker(states)
+            if self.broker_headroom_bytes:
+                broker_available, broker_fair_pressure = self.observe_broker(states)
+            else:
+                broker_available, broker_fair_pressure = 0, False
             peak = max(item[0] for item in states) + headroom
             local_pressure = self.budget > 0 and peak > self.budget
             broker_pressure = (
                 self.broker_headroom_bytes > 0
-                and broker_available < self.broker_headroom_bytes
+                and (
+                    broker_available < self.broker_headroom_bytes
+                    or broker_fair_pressure
+                )
             )
             pressure = local_pressure or broker_pressure
         if self.trim_low_water and self.low and not pressure and not force and peak >= self.low:
@@ -741,7 +764,10 @@ class SchedulerBudget:
             self.low_since = now
         stable = self.low_since is not None and now - self.low_since >= self.stable
         if self.broker_headroom_bytes:
-            broker_relaxed = broker_available >= self.broker_low_bytes
+            broker_relaxed = (
+                broker_available >= self.broker_low_bytes
+                and not broker_fair_pressure
+            )
             if broker_relaxed:
                 if self.broker_low_since is None:
                     self.broker_low_since = now

@@ -224,17 +224,20 @@ class Residency:
             free = after
 
         usable = max(0, free - prefill_headroom)
-        broker_available = [
-            value
-            for arena in self.arenas
-            if (
-                value := getattr(
-                    getattr(arena, "backing", None),
-                    "broker_available_bytes",
-                    None,
-                )
-            ) is not None
-        ]
+        broker_available = []
+        broker_snapshots = []
+        for arena in self.arenas:
+            backing = getattr(arena, "backing", None)
+            snapshot = getattr(backing, "broker_snapshot", None)
+            if callable(snapshot):
+                snapshot = snapshot()
+            if isinstance(snapshot, dict):
+                broker_snapshots.append(snapshot)
+                value = snapshot.get("available_bytes")
+            else:
+                value = getattr(backing, "broker_available_bytes", None)
+            if value is not None:
+                broker_available.append(value)
         if broker_available:
             global_available = min(broker_available)
             self.counters["physical_global_broker_available_bytes"] = (
@@ -245,6 +248,25 @@ class Residency:
                     self.counters.get("physical_global_broker_limited_calls", 0) + 1
                 )
             usable = min(usable, global_available)
+        fair_available = []
+        for snapshot in broker_snapshots:
+            if snapshot.get("fair_mode") != "enforce":
+                continue
+            if snapshot.get("fairness_pressure"):
+                fair_available.append(0)
+        if fair_available:
+            tenant_available = min(fair_available)
+            self.counters["physical_global_broker_fair_available_bytes"] = (
+                tenant_available
+            )
+            if tenant_available < usable:
+                self.counters["physical_global_broker_fair_limited_calls"] = (
+                    self.counters.get(
+                        "physical_global_broker_fair_limited_calls", 0
+                    )
+                    + 1
+                )
+            usable = min(usable, tenant_available)
         chunk_budget = usable // chunk_cost
         backed_chunks = set(self.precommitted)
         if self.arenas:

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import json
+import math
 import os
 from typing import Mapping
 
@@ -28,6 +29,7 @@ DEFAULT_FUTURE_POLICY = "off"
 DEFAULT_PRECOMMIT_CHUNKS = 0
 DEFAULT_FUTURE_ORDERING_HORIZON_MS = 0
 DEFAULT_GLOBAL_BROKER_STALE_SECONDS = 120
+GLOBAL_BROKER_FAIR_MODES = ("off", "observe", "enforce")
 
 
 def _integer(name: str, value: object, *, minimum: int) -> int:
@@ -49,6 +51,19 @@ def _boolean(name: str, value: object) -> bool:
     if normalized in ("0", "false", "no", "off"):
         return False
     raise ValueError(f"{name} must be a boolean")
+
+
+def _number(name: str, value: object, *, minimum: float, inclusive: bool) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a number") from exc
+    if not math.isfinite(parsed) or parsed < minimum or (
+        not inclusive and parsed == minimum
+    ):
+        relation = "at least" if inclusive else "greater than"
+        raise ValueError(f"{name} must be {relation} {minimum}")
+    return parsed
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +88,11 @@ class ElasticConfig:
     global_broker_path: str | None = None
     global_broker_mib: int = 0
     global_broker_stale_seconds: int = DEFAULT_GLOBAL_BROKER_STALE_SECONDS
+    global_broker_fair_mode: str = "off"
+    global_broker_tenant: str | None = None
+    global_broker_tenant_weight: float = 1.0
+    global_broker_demand_ttl_seconds: float = 10.0
+    global_broker_wait_ms: int = 0
 
     def __post_init__(self) -> None:
         if self.mode not in MODES:
@@ -109,9 +129,37 @@ class ElasticConfig:
             raise ValueError("global_broker_mib must be nonnegative")
         if self.global_broker_stale_seconds < 1:
             raise ValueError("global_broker_stale_seconds must be positive")
+        if self.global_broker_fair_mode not in GLOBAL_BROKER_FAIR_MODES:
+            raise ValueError("unknown global broker fair mode")
+        if self.global_broker_fair_mode != "off" and not self.global_broker_tenant:
+            raise ValueError("fair global broker requires a tenant name")
+        if (
+            self.global_broker_tenant is not None
+            and (
+                not self.global_broker_tenant.strip()
+                or len(self.global_broker_tenant) > 128
+            )
+        ):
+            raise ValueError("global broker tenant must be a short nonempty string")
+        if (
+            not math.isfinite(self.global_broker_tenant_weight)
+            or not 0 < self.global_broker_tenant_weight <= 1e6
+        ):
+            raise ValueError("global broker tenant weight must be in (0, 1e6]")
+        if (
+            not math.isfinite(self.global_broker_demand_ttl_seconds)
+            or self.global_broker_demand_ttl_seconds <= 0
+        ):
+            raise ValueError("global broker demand TTL must be positive")
+        if not 0 <= self.global_broker_wait_ms <= 5_000:
+            raise ValueError("global broker wait must be between 0 and 5000 ms")
         if bool(self.global_broker_path) != (self.global_broker_mib > 0):
             raise ValueError(
                 "global broker requires both a path and a positive capacity"
+            )
+        if self.global_broker_fair_mode != "off" and not self.global_broker_path:
+            raise ValueError(
+                "fair global broker requires an enabled broker path and capacity"
             )
         if self.activation_policy != "off" and self.mode != "v5":
             raise ValueError("activation policies require elastic mode v5")
@@ -211,6 +259,27 @@ class ElasticConfig:
                 ),
                 minimum=1,
             ),
+            global_broker_fair_mode=env.get(
+                "EKV_GLOBAL_BROKER_FAIR_MODE", "off"
+            ).strip().lower(),
+            global_broker_tenant=env.get("EKV_GLOBAL_BROKER_TENANT") or None,
+            global_broker_tenant_weight=_number(
+                "EKV_GLOBAL_BROKER_TENANT_WEIGHT",
+                env.get("EKV_GLOBAL_BROKER_TENANT_WEIGHT", "1"),
+                minimum=0,
+                inclusive=False,
+            ),
+            global_broker_demand_ttl_seconds=_number(
+                "EKV_GLOBAL_BROKER_DEMAND_TTL_SECONDS",
+                env.get("EKV_GLOBAL_BROKER_DEMAND_TTL_SECONDS", "10"),
+                minimum=0,
+                inclusive=False,
+            ),
+            global_broker_wait_ms=_integer(
+                "EKV_GLOBAL_BROKER_WAIT_MS",
+                env.get("EKV_GLOBAL_BROKER_WAIT_MS", "0"),
+                minimum=0,
+            ),
         )
 
     def with_overrides(
@@ -234,6 +303,11 @@ class ElasticConfig:
         global_broker_path: str | None = None,
         global_broker_mib: int | None = None,
         global_broker_stale_seconds: int | None = None,
+        global_broker_fair_mode: str | None = None,
+        global_broker_tenant: str | None = None,
+        global_broker_tenant_weight: float | None = None,
+        global_broker_demand_ttl_seconds: float | None = None,
+        global_broker_wait_ms: int | None = None,
     ) -> "ElasticConfig":
         changes = {
             key: value
@@ -259,6 +333,14 @@ class ElasticConfig:
                 ("global_broker_path", global_broker_path),
                 ("global_broker_mib", global_broker_mib),
                 ("global_broker_stale_seconds", global_broker_stale_seconds),
+                ("global_broker_fair_mode", global_broker_fair_mode),
+                ("global_broker_tenant", global_broker_tenant),
+                ("global_broker_tenant_weight", global_broker_tenant_weight),
+                (
+                    "global_broker_demand_ttl_seconds",
+                    global_broker_demand_ttl_seconds,
+                ),
+                ("global_broker_wait_ms", global_broker_wait_ms),
             )
             if value is not None
         }
@@ -291,6 +373,14 @@ class ElasticConfig:
             "EKV_GLOBAL_BROKER_STALE_SECONDS": str(
                 self.global_broker_stale_seconds
             ),
+            "EKV_GLOBAL_BROKER_FAIR_MODE": self.global_broker_fair_mode,
+            "EKV_GLOBAL_BROKER_TENANT_WEIGHT": str(
+                self.global_broker_tenant_weight
+            ),
+            "EKV_GLOBAL_BROKER_DEMAND_TTL_SECONDS": str(
+                self.global_broker_demand_ttl_seconds
+            ),
+            "EKV_GLOBAL_BROKER_WAIT_MS": str(self.global_broker_wait_ms),
         }
         if self.stats_path is not None:
             result["EKV_STATS_PATH"] = self.stats_path
@@ -298,6 +388,8 @@ class ElasticConfig:
             result["EKV_FUTURE_STATS_PATH"] = self.future_stats_path
         if self.global_broker_path is not None:
             result["EKV_GLOBAL_BROKER_PATH"] = self.global_broker_path
+        if self.global_broker_tenant is not None:
+            result["EKV_GLOBAL_BROKER_TENANT"] = self.global_broker_tenant
         return result
 
     def apply(self, environ: dict[str, str] | None = None) -> None:
@@ -310,6 +402,8 @@ class ElasticConfig:
             target.pop("EKV_FUTURE_STATS_PATH", None)
         if self.global_broker_path is None:
             target.pop("EKV_GLOBAL_BROKER_PATH", None)
+        if self.global_broker_tenant is None:
+            target.pop("EKV_GLOBAL_BROKER_TENANT", None)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -333,6 +427,13 @@ class ElasticConfig:
             "global_broker_path": self.global_broker_path,
             "global_broker_mib": self.global_broker_mib,
             "global_broker_stale_seconds": self.global_broker_stale_seconds,
+            "global_broker_fair_mode": self.global_broker_fair_mode,
+            "global_broker_tenant": self.global_broker_tenant,
+            "global_broker_tenant_weight": self.global_broker_tenant_weight,
+            "global_broker_demand_ttl_seconds": (
+                self.global_broker_demand_ttl_seconds
+            ),
+            "global_broker_wait_ms": self.global_broker_wait_ms,
         }
 
     def to_json(self) -> str:

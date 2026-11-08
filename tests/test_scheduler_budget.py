@@ -155,6 +155,38 @@ class SchedulerBudgetTest(unittest.TestCase):
             )
             self.assertEqual(policy.promote.call_count, int(now == 4))
 
+    def test_fair_share_pressure_triggers_before_global_capacity_exhaustion(self):
+        policy = SchedulerBudget(
+            0, 0, 0, 0, broker_headroom_bytes=10, broker_low_bytes=20
+        )
+        backing = B(
+            backed_bytes=40,
+            broker_snapshot={
+                "capacity_bytes": 100,
+                "outstanding_bytes": 70,
+                "available_bytes": 30,
+                "fairness_pressure": True,
+            },
+        )
+        tracker = B(
+            backing=backing, refs={}, chunk_bytes=40,
+            trim_quiescent=lambda: 0,
+        )
+        ctrl = B(
+            _ekv_resident=set(),
+            wait_for_pending_backup=lambda: None,
+            padded_buffer_size=0,
+            mem_pool_device=B(adaptive_vmm=tracker, page_size=1),
+        )
+        policy.boundary(
+            B(reqs=[]), ctrl, lambda value: (value, value), lambda: None,
+            prefill=True, now=0,
+        )
+        self.assertEqual(policy.stats["pressure_observations"], 1)
+        self.assertEqual(
+            policy.stats["global_broker_fair_pressure_observations"], 2
+        )
+
     def test_global_broker_pressure_requires_snapshot_on_every_rank(self):
         policy = SchedulerBudget(
             0, 0, 0, 0, broker_headroom_bytes=10, broker_low_bytes=20
