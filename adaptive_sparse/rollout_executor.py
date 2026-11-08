@@ -109,11 +109,10 @@ def make_kv_hints(
         FutureHint.from_payload(payload)
     except (TypeError, ValueError) as exc:
         raise RolloutExecutionError(f"invalid runtime service-time hint: {exc}") from exc
-    action_version = (
-        ACTION_VERSION
-        if prefill_tokens_per_s is not None or decode_tokens_per_s is not None
-        else LEGACY_ACTION_VERSION
+    has_service_rates = any(
+        name in payload for name in ("prefill_tokens_per_s", "decode_tokens_per_s")
     )
+    action_version = ACTION_VERSION if has_service_rates else LEGACY_ACTION_VERSION
     request_id = submission.request_id
     return {
         "protocol_version": "1",

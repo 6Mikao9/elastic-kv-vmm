@@ -107,6 +107,21 @@ class RolloutExecutorTest(unittest.TestCase):
         ):
             make_kv_hints(submission(), prefill_tokens_per_s=0)
 
+    def test_payload_rates_force_v3_action_version(self):
+        base = submission()
+        planned = replace(
+            base,
+            hint={
+                **base.hint,
+                "prefill_tokens_per_s": 4_000.0,
+                "decode_tokens_per_s": 1_000.0,
+            },
+        )
+
+        envelope = make_kv_hints(planned)
+
+        self.assertEqual(envelope["actions"][0]["action_version"], "3")
+
     def test_measured_rates_upgrade_only_later_hints_to_v3(self):
         base = submission()
         hints = {
