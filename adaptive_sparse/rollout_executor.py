@@ -29,7 +29,7 @@ from .elastic_admission import (
     decide_elastic_admission,
 )
 from .future_plan import RolloutPlan, RolloutSubmission
-from .service_time import ServiceTimeEstimator
+from .service_time import ServiceTimeEstimator, estimate_service_duration_ms
 from .sglang_future_hook import (
     ACTION_VERSION,
     LEGACY_ACTION_VERSION,
@@ -424,8 +424,37 @@ class _PendingRequest:
         )
 
 
+def _duration_ms(
+    submission: RolloutSubmission,
+    hint: FutureHint,
+    *,
+    fallback_ms: float,
+    prefill_tokens_per_s: float | None,
+    decode_tokens_per_s: float | None,
+) -> float:
+    return estimate_service_duration_ms(
+        prompt_tokens=submission.prompt_tokens,
+        output_tokens=submission.output_tokens,
+        fallback_ms=fallback_ms,
+        prefill_tokens_per_s=(
+            hint.prefill_tokens_per_s
+            if hint.prefill_tokens_per_s is not None
+            else prefill_tokens_per_s
+        ),
+        decode_tokens_per_s=(
+            hint.decode_tokens_per_s
+            if hint.decode_tokens_per_s is not None
+            else decode_tokens_per_s
+        ),
+    )
+
+
 def _select_due(
-    due: Sequence[RolloutSubmission], policy: str
+    due: Sequence[RolloutSubmission],
+    policy: str,
+    *,
+    prefill_tokens_per_s: float | None = None,
+    decode_tokens_per_s: float | None = None,
 ) -> RolloutSubmission:
     if policy == "timeline":
         return min(due, key=lambda item: (item.submit_at_ms, item.request_id))
@@ -435,7 +464,15 @@ def _select_due(
     def key(item: RolloutSubmission) -> tuple[object, ...]:
         hint = FutureHint.from_payload(dict(item.hint))
         if item.deadline_ms is not None:
-            predicted_duration = max(1, item.estimated_finish_ms - item.submit_at_ms)
+            predicted_duration = _duration_ms(
+                item,
+                hint,
+                fallback_ms=max(
+                    1, item.estimated_finish_ms - item.submit_at_ms
+                ),
+                prefill_tokens_per_s=prefill_tokens_per_s,
+                decode_tokens_per_s=decode_tokens_per_s,
+            )
             return (
                 0,
                 item.deadline_ms,
@@ -537,6 +574,15 @@ def _measure_result(
                 "elastic_future_peak_over_budget": (
                     admission.future_peak_over_budget
                 ),
+                "service_time_feedback_applied": (
+                    admission.service_time_feedback_applied
+                ),
+                "service_time_current_duration_ms": (
+                    admission.service_time_current_duration_ms
+                ),
+                "service_time_calibrated_future_requests": (
+                    admission.service_time_calibrated_future_requests
+                ),
             }
         )
     return row
@@ -637,7 +683,19 @@ def _execute_managed_rollout(
                 clock.sleep(poll_interval_s)
                 continue
 
-            submission = _select_due(due, queue_policy)
+            feedback_rates = (
+                {}
+                if service_time_estimator is None
+                else service_time_estimator.rates()
+            )
+            submission = _select_due(
+                due,
+                queue_policy,
+                prefill_tokens_per_s=feedback_rates.get(
+                    "prefill_tokens_per_s"
+                ),
+                decode_tokens_per_s=feedback_rates.get("decode_tokens_per_s"),
+            )
             active_bytes = sum(item.hold_bytes for item in pending)
             admission = None
             if elastic_kv_config is not None:
@@ -647,10 +705,31 @@ def _execute_managed_rollout(
                     config=elastic_kv_config,
                     future_submissions=queue,
                     now_ms=now_ms,
+                    prefill_tokens_per_s=feedback_rates.get(
+                        "prefill_tokens_per_s"
+                    ),
+                    decode_tokens_per_s=feedback_rates.get(
+                        "decode_tokens_per_s"
+                    ),
                 )
                 if admission.defer_for_budget:
-                    predicted_duration = max(
-                        1, submission.estimated_finish_ms - submission.submit_at_ms
+                    submission_hint = FutureHint.from_payload(
+                        dict(submission.hint)
+                    )
+                    predicted_duration = _duration_ms(
+                        submission,
+                        submission_hint,
+                        fallback_ms=max(
+                            1,
+                            submission.estimated_finish_ms
+                            - submission.submit_at_ms,
+                        ),
+                        prefill_tokens_per_s=feedback_rates.get(
+                            "prefill_tokens_per_s"
+                        ),
+                        decode_tokens_per_s=feedback_rates.get(
+                            "decode_tokens_per_s"
+                        ),
                     )
                     deadline_forced = bool(
                         allow_deadline_overcommit
@@ -669,11 +748,6 @@ def _execute_managed_rollout(
             dispatch_ms = (clock.now() - origin) * 1000.0
             dispatch_lateness_ms = dispatch_ms - submission.submit_at_ms
             capacity_delay_ms = max(0.0, dispatch_lateness_ms)
-            feedback_rates = (
-                {}
-                if service_time_estimator is None
-                else service_time_estimator.rates()
-            )
             spec: dict[str, object] = {
                 "request_id": submission.request_id,
                 "input_tokens": submission.prompt_tokens,

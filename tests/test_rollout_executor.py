@@ -133,14 +133,14 @@ class RolloutExecutorTest(unittest.TestCase):
             RolloutSubmission(
                 request_id=request_id,
                 planned_arrival_ms=0,
-                submit_at_ms=0,
-                estimated_finish_ms=20,
+                submit_at_ms=100 if request_id == "fourth" else 0,
+                estimated_finish_ms=120,
                 kind="tool",
                 prompt_tokens=32,
                 output_tokens=8,
                 hint=dict(hints),
             )
-            for request_id in ("first", "second")
+            for request_id in ("first", "second", "third", "fourth")
         ]
         seen = {}
 
@@ -154,7 +154,7 @@ class RolloutExecutorTest(unittest.TestCase):
                 "tpot_s": 0.001,
             }
 
-        estimator = ServiceTimeEstimator(alpha=1.0)
+        estimator = ServiceTimeEstimator(alpha=1.0, min_samples=3)
         result = execute_rollout(
             "http://server/generate",
             rows,
@@ -162,21 +162,27 @@ class RolloutExecutorTest(unittest.TestCase):
             max_inflight=1,
             poll_interval_ms=1,
             max_submit_lateness_ms=10_000,
+            clock=FakeClock(),
             service_time_estimator=estimator,
         )
 
         self.assertEqual(seen["first"]["actions"][0]["action_version"], "2")
-        second_action = seen["second"]["actions"][0]
-        self.assertEqual(second_action["action_version"], "3")
-        self.assertEqual(second_action["payload"]["prefill_tokens_per_s"], 4_000.0)
-        self.assertEqual(second_action["payload"]["decode_tokens_per_s"], 1_000.0)
+        self.assertEqual(seen["second"]["actions"][0]["action_version"], "2")
+        self.assertEqual(seen["third"]["actions"][0]["action_version"], "2")
+        fourth_action = seen["fourth"]["actions"][0]
+        self.assertEqual(fourth_action["action_version"], "3")
+        self.assertEqual(fourth_action["payload"]["prefill_tokens_per_s"], 4_000.0)
+        self.assertEqual(fourth_action["payload"]["decode_tokens_per_s"], 1_000.0)
         telemetry = result["summary"]["service_time_estimator"]
-        self.assertEqual(telemetry["prefill_samples"], 2)
-        self.assertEqual(telemetry["decode_samples"], 2)
+        self.assertEqual(telemetry["prefill_samples"], 4)
+        self.assertEqual(telemetry["decode_samples"], 4)
+        self.assertEqual(telemetry["min_samples"], 3)
         by_id = {row["request_id"]: row for row in result["requests"]}
         self.assertIsNone(by_id["first"]["service_time_prefill_tokens_per_s_hint"])
+        self.assertIsNone(by_id["second"]["service_time_prefill_tokens_per_s_hint"])
+        self.assertIsNone(by_id["third"]["service_time_prefill_tokens_per_s_hint"])
         self.assertEqual(
-            by_id["second"]["service_time_prefill_tokens_per_s_hint"],
+            by_id["fourth"]["service_time_prefill_tokens_per_s_hint"],
             4_000.0,
         )
 
@@ -488,6 +494,56 @@ class RolloutExecutorTest(unittest.TestCase):
         self.assertEqual(seen, ["urgent", "background"])
         self.assertEqual(result["requests"][0]["request_id"], "urgent")
         self.assertGreater(result["summary"]["max_capacity_delay_ms"], 0)
+
+    def test_calibrated_duration_breaks_equal_static_deadline_slack(self):
+        def timed(request_id, prompt_tokens, output_tokens):
+            return RolloutSubmission(
+                request_id=request_id,
+                planned_arrival_ms=0,
+                submit_at_ms=0,
+                estimated_finish_ms=100,
+                kind="tool",
+                prompt_tokens=prompt_tokens,
+                output_tokens=output_tokens,
+                hint={
+                    "release_after_ms": 0,
+                    "deadline_after_ms": 5_000,
+                    "expected_output_tokens": output_tokens,
+                    "weight": 1.0,
+                    "kind": "tool",
+                    "residence": "resident",
+                },
+                deadline_ms=5_000,
+            )
+
+        requests = [timed("a-short", 1, 1), timed("z-long", 100, 100)]
+        seen = []
+
+        def generate(url, spec, timeout, stream):
+            seen.append(spec["request_id"])
+            return {
+                "_started_perf_s": time.perf_counter(),
+                "end_to_end_s": 0.001,
+                "output_tokens": spec["requested_output_tokens"],
+                "ttft_s": 0.0005,
+                "tpot_s": 0.0001,
+            }
+
+        execute_rollout(
+            "http://server/generate",
+            requests,
+            generator=generate,
+            max_inflight=1,
+            queue_policy="deadline",
+            poll_interval_ms=1,
+            max_submit_lateness_ms=10_000,
+            service_time_estimator=ServiceTimeEstimator(
+                prefill_tokens_per_s=100,
+                decode_tokens_per_s=100,
+            ),
+        )
+
+        self.assertEqual(seen, ["z-long", "a-short"])
 
     def test_executes_at_planned_time_and_measures_deadline(self):
         clock = FakeClock()

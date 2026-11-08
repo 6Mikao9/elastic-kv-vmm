@@ -13,8 +13,56 @@ from dataclasses import dataclass
 
 DEFAULT_PREFILL_TOKENS_PER_S = 8_000.0
 DEFAULT_DECODE_TOKENS_PER_S = 20_000.0
+DEFAULT_MIN_SAMPLES = 3
 MIN_SERVICE_RATE = 1e-3
 MAX_SERVICE_RATE = 1e9
+
+
+def estimate_service_duration_ms(
+    *,
+    prompt_tokens: int,
+    output_tokens: int,
+    fallback_ms: float,
+    prefill_tokens_per_s: float | None = None,
+    decode_tokens_per_s: float | None = None,
+) -> float:
+    """Estimate request duration without changing the no-feedback path.
+
+    If neither measured rate is available, callers retain the planner's static
+    duration exactly.  Once either rate exists, the missing direction uses the
+    existing conservative default, matching the SGLang ordering hook.
+    """
+
+    for name, value in (
+        ("prompt_tokens", prompt_tokens),
+        ("output_tokens", output_tokens),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"{name} must be a positive integer")
+    if (
+        isinstance(fallback_ms, bool)
+        or not isinstance(fallback_ms, (int, float))
+        or not math.isfinite(fallback_ms)
+        or fallback_ms <= 0
+    ):
+        raise ValueError("fallback_ms must be finite and positive")
+    if prefill_tokens_per_s is None and decode_tokens_per_s is None:
+        return float(fallback_ms)
+    prefill_rate = (
+        DEFAULT_PREFILL_TOKENS_PER_S
+        if prefill_tokens_per_s is None
+        else _validated_rate(prefill_tokens_per_s, "prefill_tokens_per_s")
+    )
+    decode_rate = (
+        DEFAULT_DECODE_TOKENS_PER_S
+        if decode_tokens_per_s is None
+        else _validated_rate(decode_tokens_per_s, "decode_tokens_per_s")
+    )
+    return max(
+        1.0,
+        1000.0 * prompt_tokens / prefill_rate
+        + 1000.0 * output_tokens / decode_rate,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +77,7 @@ class ServiceTimeSnapshot:
     clipped_decode_samples: int
     rejected_samples: int
     alpha: float
+    min_samples: int
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -40,22 +89,25 @@ class ServiceTimeSnapshot:
             "clipped_decode_samples": self.clipped_decode_samples,
             "rejected_samples": self.rejected_samples,
             "alpha": self.alpha,
+            "min_samples": self.min_samples,
         }
 
 
 class ServiceTimeEstimator:
     """Maintain separate EWMA rates for prefill and decode service time.
 
-    A rate is emitted only after at least one valid completion sample.  Until
-    then callers should retain their existing conservative defaults.  Samples
-    below ``MIN_SERVICE_RATE`` or above ``MAX_SERVICE_RATE`` are clipped and
-    counted so malformed or pathological timings cannot dominate the estimate.
+    A measured rate is emitted only after ``min_samples`` valid completions.
+    Until then callers should retain their existing conservative defaults.
+    Samples below ``MIN_SERVICE_RATE`` or above ``MAX_SERVICE_RATE`` are clipped
+    and counted so malformed or pathological timings cannot dominate the
+    estimate.
     """
 
     def __init__(
         self,
         *,
         alpha: float = 0.2,
+        min_samples: int = DEFAULT_MIN_SAMPLES,
         prefill_tokens_per_s: float | None = None,
         decode_tokens_per_s: float | None = None,
     ) -> None:
@@ -66,11 +118,20 @@ class ServiceTimeEstimator:
             or not 0.0 < alpha <= 1.0
         ):
             raise ValueError("alpha must be finite and in (0, 1]")
+        if (
+            isinstance(min_samples, bool)
+            or not isinstance(min_samples, int)
+            or min_samples < 1
+        ):
+            raise ValueError("min_samples must be a positive integer")
         self._alpha = float(alpha)
+        self._min_samples = min_samples
         self._prefill = self._optional_seed(
             prefill_tokens_per_s, "prefill_tokens_per_s"
         )
         self._decode = self._optional_seed(decode_tokens_per_s, "decode_tokens_per_s")
+        self._prefill_seeded = self._prefill is not None
+        self._decode_seeded = self._decode is not None
         self._prefill_samples = 0
         self._decode_samples = 0
         self._clipped_prefill_samples = 0
@@ -127,15 +188,19 @@ class ServiceTimeEstimator:
             self._rejected_samples += 1
 
     def rates(self) -> dict[str, float]:
-        """Return only fields that have a measured or seeded value."""
+        """Return ready feedback fields without leaking an immature EWMA."""
 
-        snapshot = self.snapshot()
-        result: dict[str, float] = {}
-        if snapshot.prefill_tokens_per_s is not None:
-            result["prefill_tokens_per_s"] = snapshot.prefill_tokens_per_s
-        if snapshot.decode_tokens_per_s is not None:
-            result["decode_tokens_per_s"] = snapshot.decode_tokens_per_s
-        return result
+        with self._lock:
+            result: dict[str, float] = {}
+            if self._prefill is not None and (
+                self._prefill_seeded or self._prefill_samples >= self._min_samples
+            ):
+                result["prefill_tokens_per_s"] = self._prefill
+            if self._decode is not None and (
+                self._decode_seeded or self._decode_samples >= self._min_samples
+            ):
+                result["decode_tokens_per_s"] = self._decode
+            return result
 
     def snapshot(self) -> ServiceTimeSnapshot:
         with self._lock:
@@ -151,6 +216,7 @@ class ServiceTimeEstimator:
             clipped_decode_samples=self._clipped_decode_samples,
             rejected_samples=self._rejected_samples,
             alpha=self._alpha,
+            min_samples=self._min_samples,
         )
 
 

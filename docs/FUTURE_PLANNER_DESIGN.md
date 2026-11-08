@@ -79,7 +79,7 @@ action version 2 在 HTTP 实际发送时同时写入 `deadline_after_ms` 和同
 `perf_counter` 时钟域下的 `deadline_absolute_ms`。scheduler 接收请求后使用绝对
 值计算剩余时间，因此网络、tokenization 和跨进程排队不会被误算成额外 slack。
 旧 action version 1 仍按 scheduler 相对时间解释，以保持兼容。执行器默认发送
-version 2；启用实测服务时间反馈后，取得样本的后续请求升级为 version 3，并
+version 2；启用实测服务时间反馈后，累计至少 3 个有效样本的后续请求升级为 version 3，并
 额外携带 `prefill_tokens_per_s` 与 `decode_tokens_per_s`。该绝对时钟假定
 orchestrator 与 SGLang 位于同一主机。跨机部署需要
 改用经过校准的 Unix clock 或显式时钟偏移。所有数字都要做有限值、非负值和上限
@@ -201,9 +201,9 @@ observed_prefill_rate = prompt_tokens / ttft_s
 observed_decode_rate  = 1 / tpot_s
 ```
 
-每个方向分别使用 EWMA，默认 `alpha=0.2`。首个有效样本之前不伪造测量值，
-调度器继续使用保守的 `8,000 token/s` prefill 与 `20,000 token/s` decode 默认值；
-取得样本后，执行器把两项估计写入新请求的 `elastic.future` action v3。action
+每个方向分别使用 EWMA，默认 `alpha=0.2`。累计至少 3 个有效完成样本之前不伪造
+测量值，调度器继续使用保守的 `8,000 token/s` prefill 与 `20,000 token/s` decode
+默认值；达到门槛后，执行器把两项估计写入新请求的 `elastic.future` action v3。action
 v1/v2 的载荷、排序和兼容行为保持不变，只有 v3 可以携带
 `prefill_tokens_per_s` 与 `decode_tokens_per_s`。
 
@@ -212,11 +212,36 @@ v1/v2 的载荷、排序和兼容行为保持不变，只有 v3 可以携带
 请求在真实服务端的排队和调度时间，因此这里得到的是“有效服务速率”，不是
 GPU prefill 峰值算力。实验启用入口为 `--service-time-feedback`
 （MiniMax runner 为 `--future-service-time-feedback`），结果摘要会输出两条
-EWMA、样本数、截断数和拒绝数。该反馈默认关闭；开启后由执行器在已完成的
+EWMA、样本门槛、样本数、截断数和拒绝数。该反馈默认关闭；开启后由执行器在已完成的
 in-flight 请求被回收后，为后续派发请求附带最新速率。
 每个结果行同时记录 `service_time_prefill_tokens_per_s_hint` 与
 `service_time_decode_tokens_per_s_hint`，从而可以核对某个请求实际收到的是
 冷启动默认值还是某次 EWMA 快照。
+
+达到样本门槛后，实测速率不仅参与队列排序，也进入 VMM 准入和请求级
+resident/HiSparse 决策。当前请求和 lookahead 内未来请求都按
+
+```text
+duration = prompt_tokens / prefill_rate + expected_output_tokens / decode_rate
+```
+
+重新估计。较快的实测完成时间可以结束一个本会被误判为重叠的未来窗口，从而
+保留完整驻留；较慢的完成时间会延长重叠区间，使执行器提前预留未来 KV 或把当前
+请求降为 host-backed。只测得一个方向时，另一方向继续使用
+`8,000 token/s` / `20,000 token/s` 的保守默认值。没有可用反馈时，准入严格沿用
+原计划中的静态时长，开关关闭不会改变旧行为。
+
+逐请求 telemetry 新增：
+
+- `service_time_feedback_applied`：本次准入是否使用了请求 hint 或执行器 EWMA 的
+  至少一个实测速率；
+- `service_time_current_duration_ms`：用于排序、重叠窗口和 deadline 计算的当前
+  请求预测时长；
+- `service_time_calibrated_future_requests`：本次未来容量峰值中实际按实测速率
+  重新计算的未来请求数。
+
+这些字段是预测输入的去向审计，不代表服务端渲染时间、GPU 计算时间或端到端收益
+已经被独立验证。
 
 没有足够样本、样本持续越界或 TP 侧观测不一致时仍应使用宽裕默认值，不能仅凭
 短窗口 EWMA 声称 deadline 可满足。真实收益必须比较关闭/开启反馈的两组相同
@@ -612,6 +637,13 @@ KV 与 prefill workspace 共同使峰值越界时记为
 prefill 漏记。汇总记录
 `future_reservation_admissions`、`future_reservation_demotions` 与
 `prefill_headroom_demotions`。
+
+启用服务时间反馈后，当前请求时长以及未来请求的重叠区间改用最新 EWMA 重算；
+准入前默认等待 3 个有效完成样本，避免首个噪声样本引发降级。每个请求的
+`service_time_feedback_applied`、`service_time_current_duration_ms` 与
+`service_time_calibrated_future_requests` 用于确认反馈是否真正进入容量判断。
+没有 ready rate 时，`current_duration` 等于原 planner 静态时长，未来请求也走
+原静态路径，从而保持关闭反馈时的确定性。
 
 这是已知未来控制面的容量策略，不是对未知线上请求的预测。共享前缀或跨请求
 共享物理 chunk 仍应使用实际 owner index 抵扣；当前 CPU 测试只验证确定性预算

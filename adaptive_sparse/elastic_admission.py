@@ -8,11 +8,12 @@ only new requests when active KV would cross the configured budget.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 from typing import Iterable
 
 from .future_plan import PlannerConfig, RolloutSubmission
+from .service_time import estimate_service_duration_ms
 from .sglang_future_hook import FutureHint
 
 
@@ -103,6 +104,9 @@ class ElasticAdmissionDecision:
     future_effective_peak_bytes: int = 0
     prefill_over_budget: bool = False
     future_peak_over_budget: bool = False
+    service_time_feedback_applied: bool = False
+    service_time_current_duration_ms: float = 0.0
+    service_time_calibrated_future_requests: int = 0
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -126,6 +130,13 @@ class ElasticAdmissionDecision:
             "future_effective_peak_bytes": self.future_effective_peak_bytes,
             "prefill_over_budget": self.prefill_over_budget,
             "future_peak_over_budget": self.future_peak_over_budget,
+            "service_time_feedback_applied": self.service_time_feedback_applied,
+            "service_time_current_duration_ms": (
+                self.service_time_current_duration_ms
+            ),
+            "service_time_calibrated_future_requests": (
+                self.service_time_calibrated_future_requests
+            ),
         }
 
 
@@ -147,13 +158,41 @@ def _preferred_residence(
     return "resident", "planned-resident"
 
 
+def _predicted_duration_ms(
+    submission: RolloutSubmission,
+    hint: FutureHint,
+    *,
+    fallback_ms: float,
+    prefill_tokens_per_s: float | None,
+    decode_tokens_per_s: float | None,
+) -> float:
+    return estimate_service_duration_ms(
+        prompt_tokens=submission.prompt_tokens,
+        output_tokens=submission.output_tokens,
+        fallback_ms=fallback_ms,
+        prefill_tokens_per_s=(
+            hint.prefill_tokens_per_s
+            if hint.prefill_tokens_per_s is not None
+            else prefill_tokens_per_s
+        ),
+        decode_tokens_per_s=(
+            hint.decode_tokens_per_s
+            if hint.decode_tokens_per_s is not None
+            else decode_tokens_per_s
+        ),
+    )
+
+
 def _future_reservation(
     submission: RolloutSubmission,
     future_submissions: Iterable[RolloutSubmission],
     *,
     now_ms: float,
     config: ElasticKVConfig,
-) -> tuple[int, int, int]:
+    current_duration_ms: float,
+    prefill_tokens_per_s: float | None,
+    decode_tokens_per_s: float | None,
+) -> tuple[int, int, int, int]:
     """Reserve bounded capacity for more urgent requests that can overlap now.
 
     The executor receives a known rollout schedule. Counting every queued
@@ -173,13 +212,12 @@ def _future_reservation(
     """
 
     if config.lookahead_ms == 0:
-        return 0, 0, 0
+        return 0, 0, 0, 0
     current_hint = FutureHint.from_payload(dict(submission.hint))
-    current_finish_ms = now_ms + max(
-        1, submission.estimated_finish_ms - submission.submit_at_ms
-    )
+    current_finish_ms = now_ms + current_duration_ms
     horizon_end_ms = now_ms + config.lookahead_ms
     reservations: list[tuple[int, int, int, int, str | None, int]] = []
+    calibrated_future_requests = 0
     for future in future_submissions:
         if future.request_id == submission.request_id:
             continue
@@ -196,9 +234,22 @@ def _future_reservation(
         has_higher_weight = future_hint.weight > current_hint.weight
         if not has_deadline and not has_higher_weight:
             continue
-        predicted_duration_ms = max(
-            1, future.estimated_finish_ms - future.submit_at_ms
+        predicted_duration_ms = _predicted_duration_ms(
+            future,
+            future_hint,
+            fallback_ms=max(
+                1, future.estimated_finish_ms - future.submit_at_ms
+            ),
+            prefill_tokens_per_s=prefill_tokens_per_s,
+            decode_tokens_per_s=decode_tokens_per_s,
         )
+        if (
+            future_hint.prefill_tokens_per_s is not None
+            or future_hint.decode_tokens_per_s is not None
+            or prefill_tokens_per_s is not None
+            or decode_tokens_per_s is not None
+        ):
+            calibrated_future_requests += 1
         deadline_needs_protection = has_deadline
         if has_deadline and future.deadline_ms is not None:
             earliest_finish_ms = (
@@ -235,7 +286,7 @@ def _future_reservation(
             break
 
     if not reservations:
-        return 0, 0, 0
+        return 0, 0, 0, calibrated_future_requests
 
     events: dict[int, tuple[list[int], list[int]]] = {}
     for index, (start_ms, finish_ms, *_rest) in enumerate(reservations):
@@ -270,7 +321,12 @@ def _future_reservation(
             sum(reservations[index][3] for index in active),
         )
 
-    return peak_kv_bytes, peak_prefill_bytes, len(reservations)
+    return (
+        peak_kv_bytes,
+        peak_prefill_bytes,
+        len(reservations),
+        calibrated_future_requests,
+    )
 
 
 def decide_elastic_admission(
@@ -280,6 +336,8 @@ def decide_elastic_admission(
     config: ElasticKVConfig,
     future_submissions: Iterable[RolloutSubmission] = (),
     now_ms: float | None = None,
+    prefill_tokens_per_s: float | None = None,
+    decode_tokens_per_s: float | None = None,
 ) -> ElasticAdmissionDecision:
     """Choose a mode and report whether admission should wait for capacity.
 
@@ -313,8 +371,35 @@ def decide_elastic_admission(
     sparse_bytes = config.hold_bytes(submission, "host_backed")
     workspace_bytes = config.prefill_workspace_bytes(submission)
     chosen, reason = _preferred_residence(submission, config)
-    future_kv_bytes, future_prefill_bytes, future_count = _future_reservation(
-        submission, queued, now_ms=now_ms, config=config
+    static_duration_ms = max(
+        1, submission.estimated_finish_ms - submission.submit_at_ms
+    )
+    current_duration_ms = _predicted_duration_ms(
+        submission,
+        hint,
+        fallback_ms=static_duration_ms,
+        prefill_tokens_per_s=prefill_tokens_per_s,
+        decode_tokens_per_s=decode_tokens_per_s,
+    )
+    feedback_applied = bool(
+        hint.prefill_tokens_per_s is not None
+        or hint.decode_tokens_per_s is not None
+        or prefill_tokens_per_s is not None
+        or decode_tokens_per_s is not None
+    )
+    (
+        future_kv_bytes,
+        future_prefill_bytes,
+        future_count,
+        calibrated_future_requests,
+    ) = _future_reservation(
+        submission,
+        queued,
+        now_ms=now_ms,
+        config=config,
+        current_duration_ms=current_duration_ms,
+        prefill_tokens_per_s=prefill_tokens_per_s,
+        decode_tokens_per_s=decode_tokens_per_s,
     )
     future_bytes = future_kv_bytes + future_prefill_bytes
 
@@ -359,4 +444,7 @@ def decide_elastic_admission(
         future_effective_peak_bytes=effective_peak,
         prefill_over_budget=prefill_peak > config.memory_budget_bytes,
         future_peak_over_budget=effective_peak > config.memory_budget_bytes,
+        service_time_feedback_applied=feedback_applied,
+        service_time_current_duration_ms=current_duration_ms,
+        service_time_calibrated_future_requests=calibrated_future_requests,
     )

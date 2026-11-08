@@ -225,6 +225,87 @@ class ElasticAdmissionTest(unittest.TestCase):
         self.assertEqual(decision.future_effective_peak_bytes, 728)
         self.assertFalse(decision.defer_for_budget)
 
+    def test_calibrated_fast_completion_removes_nonoverlapping_future_guard(self):
+        current = submission("background", weight=1.0, estimated_finish_ms=100)
+        urgent = submission(
+            "urgent",
+            weight=2.0,
+            submit_at_ms=50,
+            estimated_finish_ms=150,
+        )
+        config = ElasticKVConfig(
+            memory_budget_bytes=700,
+            kv_bytes_per_token=2,
+            sparse_hot_tokens=64,
+            lookahead_ms=700,
+        )
+
+        static = decide_elastic_admission(
+            current,
+            active_bytes=0,
+            config=config,
+            future_submissions=(current, urgent),
+            now_ms=0,
+        )
+        calibrated = decide_elastic_admission(
+            current,
+            active_bytes=0,
+            config=config,
+            future_submissions=(current, urgent),
+            now_ms=0,
+            prefill_tokens_per_s=1_000_000,
+            decode_tokens_per_s=1_000_000,
+        )
+
+        self.assertEqual(static.reason, "imminent-future-demotion")
+        self.assertEqual(static.future_reserved_requests, 1)
+        self.assertFalse(static.service_time_feedback_applied)
+        self.assertEqual(static.service_time_current_duration_ms, 100.0)
+        self.assertEqual(static.service_time_calibrated_future_requests, 0)
+        self.assertEqual(calibrated.chosen_residence, "resident")
+        self.assertEqual(calibrated.future_reserved_requests, 0)
+        self.assertTrue(calibrated.service_time_feedback_applied)
+        self.assertLessEqual(calibrated.service_time_current_duration_ms, 1.0)
+
+    def test_calibrated_slow_completion_extends_overlap_and_reserves_future_kv(self):
+        current = submission("background", weight=1.0, estimated_finish_ms=10)
+        urgent = submission(
+            "urgent",
+            weight=2.0,
+            submit_at_ms=50,
+            estimated_finish_ms=100,
+        )
+        config = ElasticKVConfig(
+            memory_budget_bytes=700,
+            kv_bytes_per_token=2,
+            sparse_hot_tokens=64,
+            lookahead_ms=700,
+        )
+
+        static = decide_elastic_admission(
+            current,
+            active_bytes=0,
+            config=config,
+            future_submissions=(current, urgent),
+            now_ms=0,
+        )
+        calibrated = decide_elastic_admission(
+            current,
+            active_bytes=0,
+            config=config,
+            future_submissions=(current, urgent),
+            now_ms=0,
+            prefill_tokens_per_s=10,
+            decode_tokens_per_s=10,
+        )
+
+        self.assertEqual(static.chosen_residence, "resident")
+        self.assertEqual(static.future_reserved_requests, 0)
+        self.assertEqual(calibrated.reason, "imminent-future-demotion")
+        self.assertEqual(calibrated.future_reserved_bytes, 400)
+        self.assertEqual(calibrated.future_reserved_requests, 1)
+        self.assertEqual(calibrated.service_time_calibrated_future_requests, 1)
+
     def test_future_prefill_only_pressure_gets_prefill_reason(self):
         current = submission("current", prompt=1, output=199, weight=1.0)
         urgent = submission("urgent", weight=2.0, submit_at_ms=20)
