@@ -53,8 +53,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--elastic-retain-chunks", type=int)
     parser.add_argument("--elastic-activation-policy", choices=ACTIVATION_POLICIES)
     parser.add_argument("--elastic-prefill-headroom-mib", type=int)
+    parser.add_argument("--elastic-precommit-chunks", type=int, choices=range(5))
+    parser.add_argument("--elastic-precommit-max-chunks", type=int)
     parser.add_argument("--elastic-future-policy", choices=FUTURE_POLICIES)
+    parser.add_argument("--elastic-future-ordering-horizon-ms", type=int)
     parser.add_argument("--elastic-stats-path")
+    parser.add_argument("--elastic-future-stats-path")
     parser.add_argument(
         "--elastic-dry-run",
         action="store_true",
@@ -72,8 +76,12 @@ def resolve_config(argv: Sequence[str]) -> tuple[ElasticConfig, list[str], bool]
         retain_chunks=args.elastic_retain_chunks,
         activation_policy=args.elastic_activation_policy,
         prefill_headroom_mib=args.elastic_prefill_headroom_mib,
+        precommit_chunks=args.elastic_precommit_chunks,
+        precommit_max_chunks=args.elastic_precommit_max_chunks,
         future_policy=args.elastic_future_policy,
+        future_ordering_horizon_ms=args.elastic_future_ordering_horizon_ms,
         stats_path=args.elastic_stats_path,
+        future_stats_path=args.elastic_future_stats_path,
     )
     return config, sglang_argv, args.elastic_dry_run
 

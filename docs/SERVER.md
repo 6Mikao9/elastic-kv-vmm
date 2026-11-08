@@ -40,16 +40,22 @@ SGLang or touch CUDA.
 | `--elastic-retain-chunks` | `1` | at least the sink chunk |
 | `--elastic-activation-policy` | `off` | requires `v5` unless `off` |
 | `--elastic-prefill-headroom-mib` | `0` | nonnegative integer |
+| `--elastic-precommit-chunks` | `0` | bounded chunk lookahead from 0 to 4 |
+| `--elastic-precommit-max-chunks` | `1` | must cover the lookahead |
 | `--elastic-future-policy` | `off` | `deadline`; native `kv_hints` or the built-in 0.5.2 compatibility path |
+| `--elastic-future-ordering-horizon-ms` | `0` | nonnegative; zero keeps native horizon behavior |
 | `--elastic-stats-path` | unset | atomic JSON telemetry destination |
+| `--elastic-future-stats-path` | unset | separate future-hook telemetry destination |
 
 The CLI currently launches the guarded dense-MHA scope documented in
 [integration](INTEGRATION.md). Unsupported SGLang configurations fail at
 startup rather than silently running with an incorrect backing layout.
 
-Set `EKV_FUTURE_STATS_PATH` to atomically export scheduler hook counters from
-`adaptive_sparse.sglang_future_hook`; these are separate from the VMM adapter's
-`EKV_STATS_PATH` file.
+Set `--elastic-future-stats-path` (or `EKV_FUTURE_STATS_PATH`) to atomically
+export scheduler hook counters from `adaptive_sparse.sglang_future_hook`; these
+are separate from the VMM adapter's `--elastic-stats-path` file. The launcher
+also exposes the existing bounded VMM precommit controls, so spawned workers
+receive the exact same validated settings.
 
 The MiniMax eager scheduler can additionally aggregate known-future waiting
 requests into a bounded prefill reservation.  Set
@@ -63,7 +69,8 @@ prefill-pressure migration path. `EKV_FUTURE_PREFILL_HORIZON_MS`,
 headroom for native allocation; it does not create future KV or activation
 buffers eagerly. See [the future planner design](FUTURE_PLANNER_DESIGN.md#53-已知未来请求的-prefill-预留).
 
-Set `EKV_FUTURE_ORDERING_HORIZON_MS` to make deadline reordering fall back to
+Set `--elastic-future-ordering-horizon-ms` (or `EKV_FUTURE_ORDERING_HORIZON_MS`)
+to make deadline reordering fall back to
 the native queue when any request is still farther than that horizon from its
 release time. Deadline hints without `expected_output_tokens` also preserve the
 native order instead of using an optimistic one-token decode estimate.

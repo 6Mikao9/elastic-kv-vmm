@@ -99,7 +99,7 @@ bash scripts/container_case.sh 0 "$MODEL_HUB" "$MODEL_REL" \
 
 Use a fresh output directory for every run. Substitute `baseline` or `v0`–`v4` for ablations. Set `EKV_EXECUTION=graph-pad` for capture batches 1, 2, 4, 8 (including additional 3/5/3-request padding probes), or `graph` for exact batches 1–8. `EKV_RETAIN_CHUNKS=8` selects the warm retention policy. The opt-in `EKV_PRECOMMIT_CHUNKS=1` maps the next logical chunk across every KV plane and starts its required zeroing on an independent CUDA stream; `EKV_PRECOMMIT_MAX_CHUNKS` caps the speculative chunks kept across a mixed workload. These are environment variables on the container script. The Qwen3-4B snapshot revision is recorded in `environment.json`. Never copy weights into this repository.
 
-For an existing isolated environment, the primary entry point is `python3 -m elastic_kv` (or `elastic-sglang` after installing `pyproject.toml`). It validates elastic settings before importing SGLang, installs the adapter, and forwards the remaining arguments to SGLang. `python3 -m elastic_kv.launch` remains compatible with the experiment scripts. The module entry point is required so the adapter is installed in the spawned scheduler process as well as the launcher. See [server usage](docs/SERVER.md); `EKV_STATS_PATH` optionally records residency telemetry.
+For an existing isolated environment, the primary entry point is `python3 -m elastic_kv` (or `elastic-sglang` after installing `pyproject.toml`). It validates elastic settings before importing SGLang, installs the adapter, and forwards the remaining arguments to SGLang. The launcher now owns precommit lookahead, future-ordering horizon and both telemetry destinations as well as their `EKV_*` environment equivalents, so spawned SGLang workers receive one validated manifest. `python3 -m elastic_kv.launch` remains compatible with the experiment scripts. The module entry point is required so the adapter is installed in the spawned scheduler process as well as the launcher. See [server usage](docs/SERVER.md); `EKV_STATS_PATH` optionally records residency telemetry.
 
 For the separate future-ordering path, set `EKV_FUTURE_POLICY=deadline` and
 optionally `EKV_FUTURE_STATS_PATH=/path/to/future-stats.json`. On SGLang 0.5.2,
@@ -114,6 +114,15 @@ The known-future planner now has a live executor that consumes its
 original absolute deadline, and records planned versus actual latency and
 residency. A matching unhinted control arm can be run with `--no-hints` for
 paired real-serving measurements.
+The offline comparison also includes a bounded `oracle` policy. It searches
+request order, resident/HiSparse placement and intentional idle transitions;
+identical request signatures are collapsed, and the existing `future` plan is
+retained as an incumbent when the expansion cap is reached. Search telemetry is
+exported as `search_expansions`, `search_truncated` and `fallback_policy`.
+`search_exact` distinguishes a completed search from a capped incumbent. Use
+`--policies fifo future oracle` to limit offline work; an emitted policy is
+automatically included and its simulation is reused. This is an offline
+planning upper bound, not a scheduler hot-path algorithm.
 The same executor can treat each planned timestamp as an earliest admission
 time, bound the observed in-flight set, prioritize deadline-bearing requests,
 and demote only newly admitted long requests when the live predicted KV set

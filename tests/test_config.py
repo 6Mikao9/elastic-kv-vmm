@@ -23,14 +23,22 @@ class ElasticConfigTest(unittest.TestCase):
                 "EKV_RETAIN_CHUNKS": "8",
                 "EKV_ACTIVATION_POLICY": "both",
                 "EKV_PREFILL_HEADROOM_MIB": "512",
+                "EKV_PRECOMMIT_CHUNKS": "2",
+                "EKV_PRECOMMIT_MAX_CHUNKS": "3",
                 "EKV_FUTURE_POLICY": "deadline",
+                "EKV_FUTURE_ORDERING_HORIZON_MS": "2000",
+                "EKV_FUTURE_STATS_PATH": "/tmp/future.json",
             }
         )
         self.assertEqual(config.chunk_mib, 4)
         self.assertEqual(config.retain_chunks, 8)
         self.assertEqual(config.activation_policy, "both")
         self.assertEqual(config.prefill_headroom_mib, 512)
+        self.assertEqual(config.precommit_chunks, 2)
+        self.assertEqual(config.precommit_max_chunks, 3)
         self.assertEqual(config.future_policy, "deadline")
+        self.assertEqual(config.future_ordering_horizon_ms, 2000)
+        self.assertEqual(config.future_stats_path, "/tmp/future.json")
 
     def test_activation_policy_requires_v5(self):
         with self.assertRaisesRegex(ValueError, "require elastic mode v5"):
@@ -44,6 +52,12 @@ class ElasticConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unknown future policy"):
             ElasticConfig(future_policy="predict-everything")
 
+    def test_precommit_budget_is_validated(self):
+        with self.assertRaisesRegex(ValueError, "between 0 and 4"):
+            ElasticConfig(precommit_chunks=5)
+        with self.assertRaisesRegex(ValueError, "must cover"):
+            ElasticConfig(precommit_chunks=2, precommit_max_chunks=1)
+
     def test_cli_overrides_leave_sglang_arguments_untouched(self):
         config, upstream, dry_run = resolve_config(
             [
@@ -53,6 +67,14 @@ class ElasticConfigTest(unittest.TestCase):
                 "8",
                 "--elastic-future-policy",
                 "deadline",
+                "--elastic-precommit-chunks",
+                "2",
+                "--elastic-precommit-max-chunks",
+                "4",
+                "--elastic-future-ordering-horizon-ms",
+                "1500",
+                "--elastic-future-stats-path",
+                "/tmp/future.json",
                 "--model-path",
                 "/models/qwen",
                 "--port",
@@ -60,8 +82,16 @@ class ElasticConfigTest(unittest.TestCase):
             ]
         )
         self.assertEqual(
-            (config.mode, config.retain_chunks, config.future_policy),
-            ("v5", 8, "deadline"),
+            (
+                config.mode,
+                config.retain_chunks,
+                config.future_policy,
+                config.precommit_chunks,
+                config.precommit_max_chunks,
+                config.future_ordering_horizon_ms,
+                config.future_stats_path,
+            ),
+            ("v5", 8, "deadline", 2, 4, 1500, "/tmp/future.json"),
         )
         self.assertEqual(upstream, ["--model-path", "/models/qwen", "--port", "30000"])
         self.assertFalse(dry_run)
