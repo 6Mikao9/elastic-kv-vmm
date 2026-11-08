@@ -21,6 +21,7 @@ ACTION_TYPE = "elastic.future"
 ACTION_VERSION = "1"
 POLICY_ENV = "EKV_FUTURE_POLICY"
 STATS_PATH_ENV = "EKV_FUTURE_STATS_PATH"
+HORIZON_ENV = "EKV_FUTURE_ORDERING_HORIZON_MS"
 POLICIES = ("off", "deadline")
 _STATS_INTERVAL_S = 0.25
 
@@ -34,6 +35,7 @@ _stats = {
     "unreleased_requests": 0,
     "fallback_missing_hint": 0,
     "fallback_invalid_hint": 0,
+    "fallback_horizon": 0,
     "fallback_exception": 0,
     "telemetry_errors": 0,
 }
@@ -130,8 +132,13 @@ def _request_age_ms(request: Any, now_s: float) -> float:
 def _prompt_tokens(request: Any) -> int:
     ids = getattr(request, "origin_input_ids", None)
     if ids is None:
-        return 1
-    total = len(ids)
+        raise ValueError("request prompt length is unavailable")
+    try:
+        total = len(ids)
+    except TypeError as exc:
+        raise ValueError("request prompt ids are not a sequence") from exc
+    if total < 1:
+        raise ValueError("request prompt cannot be empty")
     cached = getattr(request, "num_matched_prefix_tokens", 0) or 0
     if isinstance(cached, bool) or not isinstance(cached, int) or cached < 0:
         raise ValueError("matched prefix length is invalid")
@@ -145,6 +152,7 @@ def order_requests(
     prefill_tokens_per_s: float = 8_000.0,
     decode_tokens_per_s: float = 20_000.0,
     priority_sign: int | None = None,
+    horizon_ms: int | None = None,
 ) -> list[Any]:
     """Return a stable deadline-aware order or the exact native order.
 
@@ -156,19 +164,26 @@ def order_requests(
     queue = list(requests)
     if not queue:
         return queue
-    hints = []
+    decorated_hints = []
     for request in queue:
         hint = _extract_hint(request)
         if hint is None:
             _stats["fallback_missing_hint"] += 1
             return queue
-        hints.append(hint)
+        age_ms = _request_age_ms(request, now_s)
+        if horizon_ms is not None and hint.release_after_ms - age_ms > horizon_ms:
+            _stats["fallback_horizon"] += 1
+            return queue
+        decorated_hints.append((hint, age_ms))
 
     decorated = []
-    for native_order, (request, hint) in enumerate(zip(queue, hints)):
-        age_ms = _request_age_ms(request, now_s)
+    for native_order, (request, (hint, age_ms)) in enumerate(
+        zip(queue, decorated_hints)
+    ):
         released = age_ms >= hint.release_after_ms
         prefill_ms = 1000.0 * _prompt_tokens(request) / prefill_tokens_per_s
+        if hint.deadline_after_ms is not None and hint.expected_output_tokens is None:
+            raise ValueError("deadline planning requires expected_output_tokens")
         decode_ms = 1000.0 * (hint.expected_output_tokens or 1) / decode_tokens_per_s
         estimated_request_ms = prefill_ms + decode_ms
         latest_start = (
@@ -235,6 +250,7 @@ def apply_to_waiting_queue(
     *,
     now_s: float | None = None,
     priority_sign: int | None = None,
+    horizon_ms: int | None = None,
 ) -> None:
     """Mutate a queue only after a complete successful planning pass."""
     _stats["ticks"] += 1
@@ -244,6 +260,7 @@ def apply_to_waiting_queue(
             waiting_queue,
             now_s=time.perf_counter() if now_s is None else now_s,
             priority_sign=priority_sign,
+            horizon_ms=horizon_ms,
         )
         planned_hints = [_extract_hint(request) for request in planned]
         if all(hint is not None for hint in planned_hints):
@@ -309,6 +326,10 @@ def install() -> None:
         raise ValueError(f"unknown {POLICY_ENV}")
     if policy == "off":
         return
+    horizon_raw = os.environ.get(HORIZON_ENV)
+    horizon_ms = None if horizon_raw in (None, "") else int(horizon_raw)
+    if horizon_ms is not None and horizon_ms < 0:
+        raise ValueError(f"{HORIZON_ENV} must be non-negative")
     try:
         # Do not replace the native transport on revisions that already expose
         # it (including development images used by the real scheduler smoke).
@@ -339,7 +360,9 @@ def install() -> None:
             if getattr(self, "enable_priority_scheduling", False)
             else None
         )
-        apply_to_waiting_queue(waiting_queue, priority_sign=priority_sign)
+        apply_to_waiting_queue(
+            waiting_queue, priority_sign=priority_sign, horizon_ms=horizon_ms
+        )
         return result
 
     elastic_calc_priority._elastic_future_hook = True

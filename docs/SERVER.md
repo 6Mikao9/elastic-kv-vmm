@@ -50,3 +50,19 @@ startup rather than silently running with an incorrect backing layout.
 Set `EKV_FUTURE_STATS_PATH` to atomically export scheduler hook counters from
 `adaptive_sparse.sglang_future_hook`; these are separate from the VMM adapter's
 `EKV_STATS_PATH` file.
+
+The MiniMax eager scheduler can additionally aggregate known-future waiting
+requests into a bounded prefill reservation.  Set
+`EKV_FUTURE_PREFILL_MODE=dry_run` to export demand without changing admission,
+or `enforce` with a positive `EKV_ADAPTIVE_BUDGET_BYTES` to trigger the existing
+prefill-pressure migration path. `EKV_FUTURE_PREFILL_HORIZON_MS`,
+`EKV_FUTURE_PREFILL_MAX_BYTES`,
+`EKV_FUTURE_PREFILL_ACTIVATION_BYTES_PER_TOKEN`, and
+`EKV_FUTURE_PREFILL_AUTO_RESIDENT_TOKENS` bound the estimate.  This reserves
+headroom for native allocation; it does not create future KV or activation
+buffers eagerly. See [the future planner design](FUTURE_PLANNER_DESIGN.md#53-已知未来请求的-prefill-预留).
+
+Set `EKV_FUTURE_ORDERING_HORIZON_MS` to make deadline reordering fall back to
+the native queue when any request is still farther than that horizon from its
+release time. Deadline hints without `expected_output_tokens` also preserve the
+native order instead of using an optimistic one-token decode estimate.

@@ -62,7 +62,7 @@ class RequestProfile:
             raise ValueError(f"{self.request_id}: arrival_ms must be non-negative")
         if self.prompt_tokens < 1 or self.output_tokens < 1:
             raise ValueError(f"{self.request_id}: prompt and output must be positive")
-        if self.priority <= 0:
+        if not math.isfinite(self.priority) or self.priority <= 0:
             raise ValueError(f"{self.request_id}: priority must be positive")
         if self.deadline_ms is not None and self.deadline_ms < self.arrival_ms:
             raise ValueError(f"{self.request_id}: deadline precedes arrival")
@@ -235,7 +235,7 @@ def _future_contention(
     an otherwise faster resident placement less attractive.
     """
 
-    if not future or mode is ResidencyMode.HI_SPARSE:
+    if (not pending and not future) or mode is ResidencyMode.HI_SPARSE:
         return 0
     finish = now_ms + _duration_ms(request, mode, config)
     spend = active_bytes + _hold_bytes(request, mode, config)

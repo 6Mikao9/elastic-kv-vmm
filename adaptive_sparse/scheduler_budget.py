@@ -1,6 +1,7 @@
 """MiniMax eager scheduler integration for budget-triggered demotion."""
 
 from collections import Counter
+from dataclasses import replace
 from functools import wraps
 from fractions import Fraction
 import hashlib
@@ -15,9 +16,18 @@ from .adaptive_runtime import MigrationFatal
 from .migration import (
     abort_demote, abort_promote, commit_demote, commit_promote, plan_demote_pages, prepare_demote, prepare_promote,
 )
+from .future_prefill import (
+    FuturePrefillConfig, effective_prefill_headroom, empty_plan,
+    plan_future_prefill, reconcile_tp_plan,
+)
 
 
-SCHEDULER_SHA256 = "fc96ed4b680fdf55621a5397f844cfd4cbd30213f44eec8a888b7cce75cafe60"
+SCHEDULER_SHA256S = frozenset({
+    # Pinned MiniMax development image used by the request-level experiments.
+    "fc96ed4b680fdf55621a5397f844cfd4cbd30213f44eec8a888b7cce75cafe60",
+    # lmsysorg/sglang:latest with SGLang 0.5.17 (audited wrapper boundary).
+    "1d4a7683e32f0862cf5b03be33e5ec23f9d112e59546d391e28fa222fcd1619b",
+})
 LOG = logging.getLogger(__name__)
 
 
@@ -80,6 +90,16 @@ class SchedulerBudget:
                       "slack_reclaim_actions": 0, "slack_reclaim_bytes": 0,
                       "low_water_slack_actions": 0, "low_water_slack_bytes": 0,
                       "broker_rejected_promotions": 0,
+                      "future_prefill_ticks": 0, "future_prefill_selected": 0,
+                      "future_prefill_reserve_bytes": 0,
+                      "future_prefill_effective_headroom_bytes": 0,
+                      "future_prefill_deferred": 0,
+                      "future_prefill_missing_hint": 0,
+                      "future_prefill_invalid_hint": 0,
+                      "future_prefill_unestimated": 0,
+                      "future_prefill_capped": 0,
+                      "future_prefill_tp_fallbacks": 0,
+                      "future_prefill_pressure_observations": 0,
                       "min_live_bytes": None, "max_live_bytes": 0,
                       "min_reclaimable_bytes": None, "max_reclaimable_bytes": 0}
         self.steps = 0
@@ -135,6 +155,23 @@ class SchedulerBudget:
             self.stats[high] = max(self.stats[high], value)
         return reclaimable
 
+    def observe_future_prefill(self, plan, effective_headroom=0, *, tp_fallback=False):
+        """Publish the latest bounded waiting-queue reservation snapshot."""
+
+        stats = self.stats
+        stats["future_prefill_ticks"] += 1
+        stats["future_prefill_selected"] = plan.selected_count
+        stats["future_prefill_reserve_bytes"] = plan.reserve_bytes
+        stats["future_prefill_effective_headroom_bytes"] = int(effective_headroom)
+        stats["future_prefill_deferred"] = plan.deferred_count
+        stats["future_prefill_missing_hint"] = plan.missing_hint_count
+        stats["future_prefill_invalid_hint"] = plan.invalid_hint_count
+        stats["future_prefill_unestimated"] = plan.unestimated_count
+        stats["future_prefill_capped"] = plan.capped_count
+        if tp_fallback:
+            stats["future_prefill_tp_fallbacks"] += 1
+        self.publish()
+
     def trim_slack(self, coordinator, tracker, exchange, synchronize, reclaimable,
                    *, low_water=False):
         if not any(exchange(reclaimable)):
@@ -160,7 +197,8 @@ class SchedulerBudget:
                 self.stats["low_water_slack_bytes"] += released
             self.publish()
 
-    def boundary(self, batch, coordinator, exchange, synchronize, *, prefill, now):
+    def boundary(self, batch, coordinator, exchange, synchronize, *, prefill, now,
+                 future_headroom=0):
         tracker = coordinator.mem_pool_device.adaptive_vmm
         self.observe_residency(batch, coordinator._ekv_resident, now)
         if not prefill and not batch.is_empty():
@@ -176,20 +214,20 @@ class SchedulerBudget:
             return
         local = (backed, force, now - self.last_change >= self.dwell, force_promote)
         states = exchange(local)
-        pressure = self.budget > 0 and max(item[0] for item in states) + (
-            self.headroom if prefill else 0
-        ) > self.budget
+        headroom = max(self.headroom, int(future_headroom)) if prefill else 0
+        pressure = self.budget > 0 and max(item[0] for item in states) + headroom > self.budget
         force = all(item[1] for item in states)
         reclaimable = self.observe_backing(tracker)
-        peak = max(item[0] for item in states) + (self.headroom if prefill else 0)
+        peak = max(item[0] for item in states) + headroom
         if pressure:
             self.stats["pressure_observations"] += 1
+            if future_headroom > 0:
+                self.stats["future_prefill_pressure_observations"] += 1
             self.low_since = None
             self.trim_slack(coordinator, tracker, exchange, synchronize, reclaimable)
-            peak = max(exchange(tracker.backing.backed_bytes)) + (self.headroom if prefill else 0)
+            peak = max(exchange(tracker.backing.backed_bytes)) + headroom
             pressure = peak > self.budget
         if self.trim_low_water and self.low and not pressure and not force and peak >= self.low:
-            headroom = self.headroom if prefill else 0
             live = len(tracker.refs) * tracker.chunk_bytes
             host_long = any(
                 request.kv.req_pool_idx is not None
@@ -477,23 +515,41 @@ def install_scheduler_budget():
     max_group = int(os.environ.get("EKV_ADAPTIVE_MAX_GROUP", "1"))
     capture_plans = os.environ.get("EKV_ADAPTIVE_PLAN_CAPTURE") == "1"
     trim_low_water = os.environ.get("EKV_ADAPTIVE_TRIM_LOW_WATER") == "1"
-    if not budget and not force and not promote:
+    future_mode = os.environ.get("EKV_FUTURE_PREFILL_MODE", "off")
+    future_config = FuturePrefillConfig(
+        mode=future_mode,
+        horizon_ms=int(os.environ.get("EKV_FUTURE_PREFILL_HORIZON_MS", "2000")),
+        max_reserve_bytes=int(os.environ.get(
+            "EKV_FUTURE_PREFILL_MAX_BYTES", str(256 << 20)
+        )),
+        activation_bytes_per_token=int(os.environ.get(
+            "EKV_FUTURE_PREFILL_ACTIVATION_BYTES_PER_TOKEN", "0"
+        )),
+        auto_resident_output_tokens=int(os.environ.get(
+            "EKV_FUTURE_PREFILL_AUTO_RESIDENT_TOKENS", "128"
+        )),
+    )
+    if not budget and not force and not promote and future_mode == "off":
         return
     if (min(budget, headroom, force, dwell, low, stable, promote) < 0 or observe < 1 or cap < 1 or max_group not in (1, 2)
             or (low and low >= budget) or (promote and (not force or promote <= force))):
         raise ValueError("adaptive scheduler settings must be nonnegative")
+    if future_mode == "enforce" and budget <= 0:
+        raise ValueError("future prefill enforce mode requires a positive adaptive budget")
     import torch
     from sglang.srt.managers import scheduler
     from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
     from sglang.srt.runtime_context import get_disagg, get_schedule, get_server_args, get_spec
 
-    if hashlib.sha256(Path(scheduler.__file__).read_bytes()).hexdigest() != SCHEDULER_SHA256:
-        raise RuntimeError("unaudited scheduler budget source")
+    source_sha256 = hashlib.sha256(Path(scheduler.__file__).read_bytes()).hexdigest()
+    if source_sha256 not in SCHEDULER_SHA256S:
+        raise RuntimeError(f"unaudited scheduler budget source: {source_sha256}")
     cls = scheduler.Scheduler
     if getattr(cls, "_ekv_adaptive_budget_installed", False):
         return
 
     def run(self, batch, prefill):
+        now = time.monotonic()
         coordinator = self.hisparse_coordinator
         if not hasattr(self, "_ekv_adaptive_budget"):
             if (coordinator is None or not coordinator.is_m3_hisparse
@@ -520,10 +576,35 @@ def install_scheduler_budget():
             torch.distributed.all_gather_object(replies, value, group=coordinator.tp_group)
             return replies
 
+        reservation = empty_plan(future_mode)
+        tp_fallback = False
+        if prefill and future_mode != "off":
+            pool = coordinator.mem_pool_device
+            local_config = replace(
+                future_config, sparse_hot_tokens=coordinator.device_buffer_size
+            )
+            reservation = plan_future_prefill(
+                self.waiting_queue,
+                now_s=time.perf_counter(),
+                kv_bytes_per_token=pool.layer_num * (
+                    pool.bytes_per_token_k + pool.bytes_per_token_v
+                ),
+                config=local_config,
+            )
+            if coordinator.tp_world_size > 1:
+                signatures = exchange(reservation.signature)
+                reservation, tp_fallback = reconcile_tp_plan(reservation, signatures)
+        future_headroom = effective_prefill_headroom(
+            reservation, headroom, future_mode
+        )
+        if prefill and future_mode != "off":
+            self._ekv_adaptive_budget.observe_future_prefill(
+                reservation, future_headroom, tp_fallback=tp_fallback
+            )
         self._ekv_adaptive_budget.boundary(
             batch, coordinator, exchange,
             lambda: torch.cuda.synchronize(coordinator.mem_pool_device.device),
-            prefill=prefill, now=time.monotonic(),
+            prefill=prefill, now=now, future_headroom=future_headroom,
         )
 
     prefill = cls.get_new_batch_prefill
@@ -531,7 +612,8 @@ def install_scheduler_budget():
 
     @wraps(prefill)
     def before_prefill(self, running_batch):
-        if budget and (self.waiting_queue or self.chunked_req is not None):
+        if (future_mode != "off" or budget) and (
+                self.waiting_queue or self.chunked_req is not None):
             run(self, running_batch, True)
         return prefill(self, running_batch)
 

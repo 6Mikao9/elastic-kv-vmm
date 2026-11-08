@@ -9,9 +9,41 @@ from adaptive_sparse.scheduler_budget import (
     SchedulerBudget, _chunk_release_counts, _rank_demotions, _releasable,
     _releasable_counts, _releasable_pair,
 )
+from adaptive_sparse.future_prefill import empty_plan
 
 
 class SchedulerBudgetTest(unittest.TestCase):
+    def test_future_reservation_telemetry_is_latest_snapshot(self):
+        policy = SchedulerBudget(100, 0, 0, 0)
+        policy.observe_future_prefill(empty_plan("dry_run"), 0)
+        self.assertEqual(policy.stats["future_prefill_ticks"], 1)
+        self.assertEqual(policy.stats["future_prefill_selected"], 0)
+
+    def test_future_headroom_can_trigger_prefill_pressure(self):
+        policy = SchedulerBudget(100, 10, 0, 0)
+        backing = B(backed_bytes=85)
+        tracker = B(backing=backing, refs={1: 1}, chunk_bytes=85)
+        ctrl = B(_ekv_resident=set(), padded_buffer_size=4,
+                 mem_pool_device=B(adaptive_vmm=tracker, page_size=1))
+        policy.boundary(
+            B(reqs=[]), ctrl, lambda value: (value, value), lambda: None,
+            prefill=True, now=0, future_headroom=20,
+        )
+        self.assertEqual(policy.stats["pressure_observations"], 1)
+        self.assertEqual(policy.stats["future_prefill_pressure_observations"], 1)
+
+    def test_future_headroom_uses_maximum_of_base_and_reservation(self):
+        policy = SchedulerBudget(100, 10, 0, 0)
+        backing = B(backed_bytes=89)
+        tracker = B(backing=backing, refs={1: 1}, chunk_bytes=89)
+        ctrl = B(_ekv_resident=set(),
+                 mem_pool_device=B(adaptive_vmm=tracker))
+        policy.boundary(
+            B(reqs=[]), ctrl, lambda value: (value, value), lambda: None,
+            prefill=True, now=0, future_headroom=11,
+        )
+        self.assertEqual(policy.stats["pressure_observations"], 0)
+
     def test_cached_release_counts_match_page_union(self):
         random = Random(137)
         for trial in range(100):

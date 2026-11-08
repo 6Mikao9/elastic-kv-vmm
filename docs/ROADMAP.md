@@ -52,6 +52,16 @@ ledger. This closes a concrete accounting gap between request-count capacity and
 future physical KV demand. Its transition cost and serving benefit still require
 GPU measurement.
 
+Known-future prefill reservation now aggregates the bounded footprint of
+requests inside a configurable horizon.  Request-level full or hot-set KV and
+an optional measured activation term are checked against one byte cap; TP
+ranks atomically fall back to zero reservation when their plans disagree.
+`dry_run` exports the demand, while `enforce` feeds it into the existing
+prefill-pressure migration path.  The planner never allocates for future
+requests and SGLang's `PrefillAdder` remains authoritative.  The activation
+coefficient defaults to zero until calibrated because no source-level estimate
+has yet been validated on the target MiniMax workload.
+
 ### Performance targets and next optimizations (2026-11-04)
 
 The dynamic policy has two reference targets: approach fully GPU-resident

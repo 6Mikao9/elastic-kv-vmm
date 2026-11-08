@@ -36,7 +36,8 @@ if int(os.environ.get("EKV_RESIDENT_LIMIT", "0")):
 
     install_request_residency()
 
-if os.environ.get("EKV_ADAPTIVE_STATS_DIR"):
+if any(name.startswith("EKV_ADAPTIVE_") or name == "EKV_FUTURE_PREFILL_MODE"
+       for name in os.environ):
     from adaptive_sparse.scheduler_budget import install_scheduler_budget
 
     install_scheduler_budget()

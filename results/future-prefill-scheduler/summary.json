@@ -1,0 +1,35 @@
+{
+  "scope": "CPU and source-compatibility validation for known-future prefill reservation",
+  "container": {
+    "image": "lmsysorg/sglang:latest",
+    "image_id": "sha256:1cc022f1ddc29b84449b588a872c0e9cab2fc1268a36ef5449fe6956ef774f2a",
+    "sglang_version": "0.5.17",
+    "scheduler_sha256": "1d4a7683e32f0862cf5b03be33e5ec23f9d112e59546d391e28fa222fcd1619b",
+    "network": "none",
+    "gpu_requested": false
+  },
+  "tests": {
+    "command": "python -m unittest discover -s tests -v",
+    "passed": 157,
+    "skipped": 3,
+    "failed": 0,
+    "report": "tests-0.5.17-r7.log",
+    "report_sha256": "7ba33ad05c075b7f50e14689c99167a1de73e8b4f1e99993f6933fe6412f4eaa"
+  },
+  "remote_source": {
+    "host_directory": "/home/liuyuntao/experiments/elastic-kv-vmm-5090-20261108/src-r7",
+    "bytes": 7486813
+  },
+  "validated": [
+    "resident and host-backed prefill byte estimates",
+    "bounded horizon and complete-request byte cap",
+    "dry-run telemetry and enforce pressure path",
+    "TP reservation-plan disagreement fallback",
+    "native PrefillAdder remains the final admission authority"
+  ],
+  "not_claimed": [
+    "GPU serving throughput or latency gain",
+    "calibrated MiniMax prefill activation bytes per token",
+    "full TP serving execution for this revision"
+  ]
+}

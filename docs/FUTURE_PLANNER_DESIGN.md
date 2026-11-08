@@ -18,8 +18,10 @@ GPU 结果出来前，不把规划收益写成已证实的性能收益。
 `residence` 与预计输出长度变成一个确定性的“是否占用完整 GPU KV 槽”决策，
 并由 `adaptive_sparse/request_residency.py` 仅在
 `EKV_RESIDENT_HINT_POLICY=adaptive` 时启用。默认 `off` 保持此前的长请求默认
-策略，避免改变已有实验。当前消费点只覆盖请求进入 HiSparse staging 时的选择，
-尚未把未来的 prefill 激活硬预算或运行中抢占纳入同一次决策。
+策略，避免改变已有实验。`adaptive_sparse/future_prefill.py` 进一步把 horizon
+内等待请求的完整 KV、HiSparse 热集和可选 activation 预测聚合为有界预算，
+在 eager prefill boundary 上通过 `dry_run` 或 `enforce` 消费。运行中抢占仍是
+已有 `SchedulerBudget` 的独立动作；两者共用同一预算观测，但尚未求在线最优解。
 
 ## 1. 要解决的问题
 
@@ -281,9 +283,71 @@ allocator，也不能把预测变成硬 OOM 保证。动态 demotion 在物理�
 总预测，动态升级时会扣除从 staging 基线到当前长度已经生成的 token。升级迁移在
 清理 host hot buffer 时只释放当前 reservation，保留 baseline，使后续
 demote/promote 仍按同一生成进度扣减；只有真实请求完成或 abort 才删除 baseline。
-请求完成与中止则无条件清理残留承诺。当前在 SGLang 0.5.17 镜像内
-139 项测试通过、3 项因无 GPU 跳过；在线迁移开销、预测误差和端到端
+请求完成与中止则无条件清理残留承诺。加入 prefill reservation 回归后，当前在
+SGLang 0.5.17 镜像内 157 项测试通过、3 项因无 GPU 跳过；在线迁移开销、预测误差和端到端
 收益仍需真实 serving 配对实验。
+
+### 5.3 已知未来请求的 prefill 预留
+
+`adaptive_sparse/future_prefill.py` 把 waiting queue 中的 hint 聚合为一次有界
+预留。它只计算字节和建议，不分配 GPU 内存，也不会替代 `PrefillAdder`。每个
+prefill boundary 都从当前 queue 重新计算；没有跨 tick 的陈旧 reservation。因此
+请求离开队列或越过 `horizon` 后，旧建议自然失效。现有
+`EKV_ADAPTIVE_DWELL_SECONDS` 继续负责迁移防抖。
+
+SGLang 0.5.17 源码审计确认 `get_new_batch_prefill()` 在进入
+`_get_new_batch_prefill_raw()` 后依次执行原生 priority、构造 `PrefillAdder`、
+入队检查和会改变请求长度的 `add_one_req()`。因此 hook 在
+`get_new_batch_prefill()` 外层执行时仍在原生排序和准入之前；它只用 hint 估算
+headroom，随后仍调用原方法。当前允许的 `scheduler.py` SHA256 为
+`1d4a7683…1619b`（0.5.17）和 `fc96ed4b…afe60`（MiniMax 固定开发镜像）。
+
+单个请求的保守估计为：
+
+```text
+prompt = 未命中的 prompt token
+auto  -> expected_output >= threshold ? resident : host_backed
+
+resident kv = (prompt + expected_output) * kv_bytes_per_token
+host_backed kv = min(prompt + expected_output, native_hot_tokens)
+                 * kv_bytes_per_token
+
+reservation = kv + prompt * activation_bytes_per_token
+```
+
+`resident` 缺少输出长度预测时不进入预留；显式 `host_backed` 仍可按
+`min(prompt, native_hot_tokens)` 预留有界热集。所有完整条目按 waiting queue
+顺序装入 `max_reserve_bytes`，装不下的请求整条跳过，不记录会造成误导的部分
+字节。TP 各 rank 交换 plan signature；任一 rank 不一致时所有 rank 同时回退为
+零预留。
+
+| 环境变量 | 默认值 | 作用 |
+|---|---:|---|
+| `EKV_FUTURE_PREFILL_MODE` | `off` | `off`、`dry_run` 或 `enforce` |
+| `EKV_FUTURE_PREFILL_HORIZON_MS` | `2000` | 只考虑该时间窗内将释放的请求 |
+| `EKV_FUTURE_PREFILL_MAX_BYTES` | `256 MiB` | 单次聚合预留上限 |
+| `EKV_FUTURE_PREFILL_ACTIVATION_BYTES_PER_TOKEN` | `0` | 实测校准的 prefill 激活预算 |
+| `EKV_FUTURE_PREFILL_AUTO_RESIDENT_TOKENS` | `128` | `auto` 选择完整驻留的输出阈值 |
+
+`dry_run` 只写 telemetry；`enforce` 把 reservation 作为预填充边界的有效
+headroom，且要求 `EKV_ADAPTIVE_BUDGET_BYTES > 0`。有效 headroom 为
+
+```text
+预测 KV bytes
++ max(固定 prefill headroom, 请求级 activation bytes)
+```
+
+固定值与请求级 activation 近似覆盖同一 scratch 空间，因此不直接相加；预测 KV
+是独立分配，必须完整计入。这里的“预测性扩容”是提前触发既有迁移，为
+即将发生的原生分配腾出空间，并没有在 hint 到来时直接 `cuMemCreate` 整个预测
+块。activation 默认为零，必须在目标模型和 chunk 大小上标定后才能用于容量结论。
+
+每 rank telemetry 新增 `future_prefill_ticks`、`future_prefill_reserve_bytes`、
+`future_prefill_selected`、`future_prefill_effective_headroom_bytes`，以及
+deferred/missing/invalid/unestimated/capped/TP-fallback 和 reservation-pressure
+计数。当前只有 CPU 单元测试与 SGLang 源码接入证据；真实 GPU 上仍须比较 native、
+`dry_run`、`enforce` 三组，并同时观察 TTFT、TPOT、吞吐、OOM/retraction、迁移
+字节和整卡 NVML。
 
 ## 6. 状态机与失败回退
 
@@ -336,9 +400,15 @@ HINTED -> RELEASED -> ADMITTED -> RUNNING -> DONE
 - `deadline_feasible_before/after`、`native_order_changed`；
 - 每请求的 `rid_hash`、`reason`、`predicted_slack_ms`。
 
-当前 hook 可把 tick、重排、队列规模、释放/未释放数量、三类回退和 telemetry
+当前 hook 可把 tick、重排、队列规模、释放/未释放数量、各类回退和 telemetry
 错误写入 `EKV_FUTURE_STATS_PATH`。该文件与 VMM adapter 的 `EKV_STATS_PATH`
 分开，避免两个组件相互覆盖。
+
+可选设置 `EKV_FUTURE_ORDERING_HORIZON_MS` 后，队列中任一请求的
+`release_after_ms` 超出该窗口都会让本轮排序整体回退，并累加
+`fallback_horizon`。带 deadline 但缺少 `expected_output_tokens` 的请求也会
+整体回退；未知工作量不再被当作 1 个输出 token 做乐观估计。该 JSON 是单个
+调度进程的最后 writer 快照；多 TP rank 实验应按 rank 分目录保存后再聚合。
 
 实验至少比较 native、EDF/SPT 排序、排序 + 驻留建议、完整执行四组；报告 TTFT p50/p95、
 端到端延迟、deadline hit rate、吞吐、OOM/retraction 次数、迁移字节和浪费预留。

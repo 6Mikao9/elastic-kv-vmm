@@ -185,6 +185,39 @@ class FuturePlanTest(unittest.TestCase):
                 prefill_tokens_per_ms=math.inf,
             )
 
+    def test_future_policy_accounts_for_same_arrival_competition(self):
+        workload = [
+            RequestProfile(
+                "long", arrival_ms=0, prompt_tokens=1000, output_tokens=7000
+            ),
+            *[
+                RequestProfile(
+                    f"short-{index}",
+                    arrival_ms=0,
+                    prompt_tokens=100,
+                    output_tokens=400,
+                    priority=2,
+                    deadline_ms=500,
+                )
+                for index in range(5)
+            ],
+        ]
+        result = simulate(workload, self.config, "future")
+        self.assertEqual(result.admissions[0].mode, ResidencyMode.HI_SPARSE)
+
+    def test_non_finite_priority_is_rejected(self):
+        for priority in (math.nan, math.inf, -math.inf):
+            with self.subTest(priority=priority), self.assertRaisesRegex(
+                ValueError, "priority must be positive"
+            ):
+                RequestProfile(
+                    "bad-priority",
+                    arrival_ms=0,
+                    prompt_tokens=1,
+                    output_tokens=1,
+                    priority=priority,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -402,7 +402,8 @@ def main():
         sources += ("adaptive_sparse/logical_shadow.py",)
     if adaptive:
         sources += ("adaptive_sparse/scheduler_budget.py", "adaptive_sparse/migration.py",
-                    "adaptive_sparse/adaptive_runtime.py", "adaptive_sparse/policy.py")
+                    "adaptive_sparse/adaptive_runtime.py", "adaptive_sparse/policy.py",
+                    "adaptive_sparse/future_prefill.py")
     with zipfile.ZipFile(output / "source_snapshot.zip", "x", compression=zipfile.ZIP_DEFLATED) as archive:
         for name in dict.fromkeys(sources):
             if Path(name).suffix in (".py", ".cpp", ".sh"):

@@ -64,7 +64,10 @@ class SGLangFutureHookTest(unittest.TestCase):
         self.assertEqual([item.request_id for item in ordered], ["short", "long"])
 
     def test_unreleased_request_stays_behind_ready_work(self):
-        ready = request("ready", 10, 1.0, {"deadline_after_ms": 0})
+        ready = request(
+            "ready", 10, 1.0,
+            {"deadline_after_ms": 0, "expected_output_tokens": 10},
+        )
         future = request("future", 10, 1.0, {"release_after_ms": 2000})
         ordered = order_requests([future, ready], now_s=1.1)
         self.assertEqual([item.request_id for item in ordered], ["ready", "future"])
@@ -108,8 +111,14 @@ class SGLangFutureHookTest(unittest.TestCase):
         self.assertEqual(queue, [hinted, missing])
 
     def test_equal_keys_follow_native_order(self):
-        first = request("first", 10, 1.0, {"deadline_after_ms": 100})
-        second = request("second", 10, 1.0, {"deadline_after_ms": 100})
+        first = request(
+            "first", 10, 1.0,
+            {"deadline_after_ms": 100, "expected_output_tokens": 10},
+        )
+        second = request(
+            "second", 10, 1.0,
+            {"deadline_after_ms": 100, "expected_output_tokens": 10},
+        )
         ordered = order_requests([first, second], now_s=1.0)
         self.assertEqual([item.request_id for item in ordered], ["first", "second"])
 
@@ -161,21 +170,75 @@ class SGLangFutureHookTest(unittest.TestCase):
         self.assertEqual([item.request_id for item in ordered], ["urgent", "resident"])
 
     def test_missing_matched_prefix_count_is_treated_as_zero(self):
-        item = request("fresh", 10, 1.0, {"deadline_after_ms": 100})
+        item = request(
+            "fresh", 10, 1.0,
+            {"deadline_after_ms": 100, "expected_output_tokens": 10},
+        )
         item.num_matched_prefix_tokens = None
         self.assertEqual(order_requests([item], now_s=1.0), [item])
 
+    def test_deadline_without_output_estimate_preserves_native_order(self):
+        first = request(
+            "first", 1, 1.0,
+            {"release_after_ms": 0, "deadline_after_ms": 100},
+        )
+        second = request(
+            "second", 2, 2.0,
+            {
+                "release_after_ms": 0,
+                "deadline_after_ms": 100,
+                "expected_output_tokens": 10,
+            },
+        )
+        queue = [first, second]
+        apply_to_waiting_queue(queue, now_s=1.1)
+        self.assertEqual([item.request_id for item in queue], ["first", "second"])
+
+    def test_horizon_violation_preserves_native_order_without_partial_effect(self):
+        queue = [
+            request("later", 10, 1.0, {"release_after_ms": 5_000}),
+            request("ready", 1, 1.0, {"release_after_ms": 0}),
+        ]
+        apply_to_waiting_queue(queue, now_s=1.1, horizon_ms=2_000)
+        self.assertEqual([item.request_id for item in queue], ["later", "ready"])
+
+    def test_horizon_uses_remaining_release_time(self):
+        ready_soon = request("soon", 10, 0.1, {"release_after_ms": 1_000})
+        ordered = order_requests(
+            [ready_soon], now_s=1.0, horizon_ms=500
+        )
+        self.assertEqual(ordered, [ready_soon])
+
+    def test_missing_prompt_length_preserves_native_order(self):
+        item = request("missing-prompt", 10, 1.0, {"release_after_ms": 0})
+        item.origin_input_ids = None
+        queue = [item]
+        apply_to_waiting_queue(queue, now_s=1.1)
+        self.assertEqual(queue, [item])
+
     def test_deadline_uses_scheduler_receive_age(self):
-        old = request("old", 100, 0.1, {"deadline_after_ms": 1000})
-        new = request("new", 100, 0.9, {"deadline_after_ms": 1200})
+        old = request(
+            "old", 100, 0.1,
+            {"deadline_after_ms": 1000, "expected_output_tokens": 10},
+        )
+        new = request(
+            "new", 100, 0.9,
+            {"deadline_after_ms": 1200, "expected_output_tokens": 10},
+        )
         ordered = order_requests(
             [new, old], now_s=1.0, prefill_tokens_per_s=1000, decode_tokens_per_s=1000
         )
         self.assertEqual([item.request_id for item in ordered], ["old", "new"])
 
     def test_deadline_accepts_compatibility_receive_time(self):
-        first = request("first", 100, 1.0, {"deadline_after_ms": 1000})
-        second = request("second", 100, 1.0, {"deadline_after_ms": 1000})
+        first = request(
+            "first", 100, 1.0,
+            {"deadline_after_ms": 1000, "expected_output_tokens": 10},
+        )
+        second = request(
+            "second", 100, 1.0,
+            {"deadline_after_ms": 1000, "expected_output_tokens": 10},
+        )
         first.time_stats = None
         second.time_stats = None
         first._ekv_scheduler_recv_time = 1.0
@@ -186,8 +249,14 @@ class SGLangFutureHookTest(unittest.TestCase):
         self.assertEqual([item.request_id for item in ordered], ["second", "first"])
 
     def test_native_priority_tier_is_never_crossed(self):
-        high = request("high", 100, 1.0, {"deadline_after_ms": 5000})
-        low = request("low", 10, 1.0, {"deadline_after_ms": 0})
+        high = request(
+            "high", 100, 1.0,
+            {"deadline_after_ms": 5000, "expected_output_tokens": 10},
+        )
+        low = request(
+            "low", 10, 1.0,
+            {"deadline_after_ms": 0, "expected_output_tokens": 10},
+        )
         high.priority = 10
         low.priority = 0
         ordered = order_requests([high, low], now_s=1.1, priority_sign=-1)

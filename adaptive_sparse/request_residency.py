@@ -130,6 +130,7 @@ def install_request_residency():
                                      "future_hint_claim_attempts": 0, "future_hint_declines": 0,
                                      "future_hint_missing": 0, "future_hint_invalid": 0,
                                      "future_decision_reasons": {},
+                                     "broker_dry_run_declines": 0,
                                      "resident_broker_mode": broker_mode}
 
     def publish_broker_stats(self):
@@ -272,26 +273,34 @@ def install_request_residency():
                 req, req.kv.kv_allocated_len, pool, expected
             )
             key = req.kv.req_pool_idx
-            if broker_mode == "enforce":
-                decision = self._ekv_residency_broker.try_admit(
-                    key,
-                    available_bytes=slots.item() * logical_token_bytes,
-                    fixed_reserve_bytes=reserve * logical_token_bytes,
-                    predicted_growth_bytes=predicted_growth,
+            # Assess without mutating local ledger state, then require every TP
+            # rank to agree before any rank commits the reservation and takes
+            # the resident staging path.  Calling try_admit independently made
+            # an otherwise synchronized request vulnerable to path divergence
+            # if one rank's ledger observed a different capacity.
+            decision = self._ekv_residency_broker.assess(
+                key,
+                available_bytes=slots.item() * logical_token_bytes,
+                fixed_reserve_bytes=reserve * logical_token_bytes,
+                predicted_growth_bytes=predicted_growth,
+            )
+            broker_admit = torch.tensor(
+                int(decision.admit), dtype=torch.int64, device="cpu"
+            )
+            if self.tp_world_size > 1:
+                torch.distributed.all_reduce(
+                    broker_admit,
+                    op=torch.distributed.ReduceOp.MIN,
+                    group=self.tp_group,
                 )
-                if not decision.admit:
+            if not broker_admit.item():
+                if broker_mode == "enforce":
                     adopt_native("broker-insufficient-growth-headroom")
                     return
-            else:
-                decision = self._ekv_residency_broker.assess(
-                    key,
-                    available_bytes=slots.item() * logical_token_bytes,
-                    fixed_reserve_bytes=reserve * logical_token_bytes,
-                    predicted_growth_bytes=predicted_growth,
-                )
-                self._ekv_residency_broker.reserve(
-                    key, predicted_growth_bytes=predicted_growth
-                )
+                stats["broker_dry_run_declines"] += 1
+            self._ekv_residency_broker.reserve(
+                key, predicted_growth_bytes=predicted_growth
+            )
             self._ekv_residency_broker.set_last_length(key, req.kv.kv_allocated_len)
         event = torch.cuda.Event()
         event.record()
