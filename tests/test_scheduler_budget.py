@@ -5,15 +5,24 @@ from random import Random
 from types import SimpleNamespace as B
 from unittest.mock import Mock, call, patch
 
-from adaptive_sparse.scheduler_budget import (
-    PhysicalDemandIndex, SchedulerBudget, _bounded_demotion_groups,
-    _chunk_release_counts, _demand_index_demotion_groups,
-    _indexed_demotion_groups, _rank_demotions,
-    _releasable, _releasable_counts, _releasable_group, _releasable_pair,
-    _should_plan_future_waiting,
-)
 from adaptive_sparse.future_prefill import empty_plan
 from adaptive_sparse.runtime_value import RuntimeRequestValue, merge_demotion_values
+from adaptive_sparse.scheduler_budget import (
+    PhysicalDemandIndex,
+    SchedulerBudget,
+    _best_effort_expire_predictive_prewarm,
+    _best_effort_predictive_prewarm,
+    _bounded_demotion_groups,
+    _chunk_release_counts,
+    _demand_index_demotion_groups,
+    _indexed_demotion_groups,
+    _rank_demotions,
+    _releasable,
+    _releasable_counts,
+    _releasable_group,
+    _releasable_pair,
+    _should_plan_future_waiting,
+)
 
 
 class SchedulerBudgetTest(unittest.TestCase):
@@ -50,6 +59,37 @@ class SchedulerBudgetTest(unittest.TestCase):
         self.assertFalse(_should_plan_future_waiting(
             "off", [object()], prefill=True, steps=15, observe=16
         ))
+
+    def test_predictive_prewarm_hook_failure_returns_to_native_path(self):
+        policy = SchedulerBudget(100, 0, 0, 0)
+        invalidate = Mock()
+        tracker = B(
+            predictive_prewarm=Mock(side_effect=RuntimeError("broker failed")),
+            invalidate_predictive_prewarm=invalidate,
+        )
+
+        self.assertEqual(
+            _best_effort_predictive_prewarm(tracker, 4096, policy), 0
+        )
+        self.assertEqual(policy.stats["predictive_prewarm_hook_errors"], 1)
+        invalidate.assert_called_once()
+        self.assertIn("broker failed", invalidate.call_args.args[0])
+
+    def test_predictive_prewarm_expiry_failure_does_not_escape_idle(self):
+        policy = SchedulerBudget(100, 0, 0, 0)
+        tracker = B(
+            expire_predictive_prewarm=Mock(
+                side_effect=RuntimeError("reclaim failed")
+            ),
+            invalidate_predictive_prewarm=Mock(),
+        )
+
+        self.assertEqual(
+            _best_effort_expire_predictive_prewarm(tracker, policy), 0
+        )
+        self.assertEqual(
+            policy.stats["predictive_prewarm_expire_errors"], 1
+        )
 
     def test_future_headroom_can_trigger_prefill_pressure(self):
         policy = SchedulerBudget(100, 10, 0, 0)

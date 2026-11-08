@@ -191,6 +191,7 @@ class Residency:
         self.precommitted = set()
         self._predictive_precommitted = set()
         self._predictive_prewarm_deadlines = {}
+        self._predictive_prewarm_disabled_reason = None
         self.live = np.zeros(pool.size + pool.page_size, dtype=np.bool_)
         self.live[0] = True
         self.counts = np.zeros((len(self.live) * slot_bytes + self.chunk_bytes - 1)
@@ -203,14 +204,21 @@ class Residency:
             hook_ns=0,
             predictive_prewarm_ticks=0,
             predictive_prewarm_demand_bytes=0,
+            predictive_prewarm_requested_bytes=0,
             predictive_prewarm_candidate_chunks=0,
+            predictive_prewarm_candidate_bytes=0,
             predictive_prewarm_mapped_chunks=0,
+            predictive_prewarm_mapped_bytes=0,
             predictive_prewarm_dry_run_chunks=0,
             predictive_prewarm_hit_chunks=0,
             predictive_prewarm_hit_bytes=0,
             predictive_prewarm_expired_chunks=0,
             predictive_prewarm_expired_bytes=0,
             predictive_prewarm_active_chunks=0,
+            predictive_prewarm_broker_denied=0,
+            predictive_prewarm_exception=0,
+            predictive_prewarm_fallback=0,
+            predictive_prewarm_telemetry_errors=0,
         )
         self.counters["overlap_schedule_enabled"] = int(
             OVERLAP_SCHEDULE_ACTIVE
@@ -236,6 +244,84 @@ class Residency:
     def _predictive_prewarm_chunk_bytes(self):
         return self.chunk_bytes * sum(
             getattr(arena, "planes", 1) for arena in self.arenas
+        )
+
+    def _publish_predictive_prewarm(self, *, force=False):
+        """Publish optional telemetry without turning it into admission work."""
+
+        try:
+            self.publish(force=force)
+        except Exception:
+            self.counters["predictive_prewarm_telemetry_errors"] += 1
+
+    def _record_predictive_prewarm_failure(
+        self, stage, exc, *, broker_denied=False, disable=False
+    ):
+        if broker_denied:
+            self.counters["predictive_prewarm_broker_denied"] += 1
+        else:
+            self.counters["predictive_prewarm_exception"] += 1
+        self.counters["predictive_prewarm_fallback"] += 1
+        self.counters["predictive_prewarm_last_error_stage"] = str(stage)
+        self.counters["predictive_prewarm_last_error_type"] = type(exc).__name__
+        message = str(exc).strip().replace("\n", " ")
+        self.counters["predictive_prewarm_last_error"] = message[:240]
+        if disable:
+            self._predictive_prewarm_disabled_reason = (
+                f"{stage}:{type(exc).__name__}:{message[:160]}"
+            )
+        self._publish_predictive_prewarm(force=True)
+
+    def _predictive_prewarm_broker_denials(self):
+        total = 0
+        for arena in self.arenas:
+            try:
+                metrics = getattr(arena, "metrics", {})
+                total += int(metrics.get("global_broker_denials", 0))
+            except Exception:
+                continue
+        return total
+
+    def _discard_partial_predictive_prewarm(self, candidates):
+        """Best-effort cleanup of speculative mappings started by a failed pass."""
+
+        candidates = set(candidates)
+        try:
+            torch.cuda.synchronize(self.pool.device)
+        except Exception:
+            return False
+        complete = True
+        for arena in self.arenas:
+            speculative = set(getattr(arena, "precommitted_chunks", ()))
+            cleanup = speculative & candidates
+            if not cleanup:
+                continue
+            try:
+                arena.reclaim(cleanup, synchronize=False)
+            except Exception:
+                complete = False
+        self.precommitted.difference_update(candidates)
+        self._predictive_precommitted.difference_update(candidates)
+        for chunk in candidates:
+            self._predictive_prewarm_deadlines.pop(chunk, None)
+        self.counters["predictive_prewarm_active_chunks"] = len(
+            self._predictive_precommitted
+        )
+        try:
+            self.backed = sum(arena.backed_bytes for arena in self.arenas)
+        except Exception:
+            complete = False
+        return complete
+
+    def invalidate_predictive_prewarm(self, reason):
+        """Disable the advisory path after an uncertain physical-state failure."""
+
+        exc = RuntimeError(str(reason) or "predictive prewarm invalidated")
+        self._discard_partial_predictive_prewarm(
+            self._predictive_precommitted
+        )
+        self._record_predictive_prewarm_failure(
+            "invalidate", exc, disable=True
         )
 
     def _record_predictive_prewarm_hits(self, consumed):
@@ -273,11 +359,17 @@ class Residency:
         if not expired:
             return 0
         start = time.perf_counter_ns()
-        torch.cuda.synchronize(self.pool.device)
-        for arena in self.arenas:
-            indices = expired & arena.allocated_chunks
-            if indices:
-                arena.reclaim(indices, synchronize=False)
+        try:
+            torch.cuda.synchronize(self.pool.device)
+            for arena in self.arenas:
+                indices = expired & arena.allocated_chunks
+                if indices:
+                    arena.reclaim(indices, synchronize=False)
+        except Exception as exc:
+            self._record_predictive_prewarm_failure(
+                "expire", exc, disable=True
+            )
+            return 0
         self.precommitted.difference_update(expired)
         predictive.difference_update(expired)
         for chunk in expired:
@@ -294,7 +386,7 @@ class Residency:
             predictive
         )
         self.backed = sum(arena.backed_bytes for arena in self.arenas)
-        self.publish(force=True)
+        self._publish_predictive_prewarm(force=True)
         return len(expired)
 
     def predictive_prewarm(self, demand_bytes, *, now_s=None):
@@ -318,10 +410,20 @@ class Residency:
             raise ValueError("predictive prewarm time must be finite")
         self.counters["predictive_prewarm_ticks"] += 1
         self.counters["predictive_prewarm_demand_bytes"] = demand
+        self.counters["predictive_prewarm_requested_bytes"] += demand
         if self.predictive_prewarm_mode == "off" or demand == 0:
             return 0
+        if self._predictive_prewarm_disabled_reason is not None:
+            self.counters["predictive_prewarm_fallback"] += 1
+            return 0
         if self.predictive_prewarm_mode == "enforce":
-            self.expire_predictive_prewarm(now_s=now)
+            try:
+                self.expire_predictive_prewarm(now_s=now)
+            except Exception as exc:
+                self._record_predictive_prewarm_failure(
+                    "pre_expire", exc, disable=True
+                )
+                return 0
 
         # The cap is a global outstanding-lease budget. Repeated plans must not
         # walk past existing speculative mappings and accumulate another full
@@ -337,11 +439,14 @@ class Residency:
             )
             return 0
 
-        max_bytes = candidate_capacity * self.chunk_bytes
-        target_bytes = min(demand, max_bytes)
+        planes = sum(getattr(arena, "planes", 1) for arena in self.arenas)
+        if planes < 1:
+            self.counters["predictive_prewarm_fallback"] += 1
+            return 0
+        logical_slot_bytes = self.slot_bytes * planes
         target_slots = min(
             self.free_slots.count,
-            max(1, (target_bytes + self.slot_bytes - 1) // self.slot_bytes),
+            max(1, (demand + logical_slot_bytes - 1) // logical_slot_bytes),
         )
         ranges = self.free_slots.peek(target_slots)
         if not ranges:
@@ -373,17 +478,37 @@ class Residency:
             if len(candidates) >= candidate_capacity:
                 break
         self.counters["predictive_prewarm_candidate_chunks"] = len(candidates)
+        candidate_bytes = len(candidates) * self._predictive_prewarm_chunk_bytes()
+        self.counters["predictive_prewarm_candidate_bytes"] += candidate_bytes
         if not candidates:
             return 0
         if self.predictive_prewarm_mode == "dry_run":
             self.counters["predictive_prewarm_dry_run_chunks"] += len(candidates)
-            self.publish()
+            self._publish_predictive_prewarm()
             return len(candidates)
 
-        for arena in self.arenas:
-            missing = set(candidates) - arena.allocated_chunks
-            if missing:
-                arena.precommit(missing)
+        broker_denials_before = self._predictive_prewarm_broker_denials()
+        backed_before = None
+        try:
+            backed_before = sum(arena.backed_bytes for arena in self.arenas)
+            for arena in self.arenas:
+                missing = set(candidates) - arena.allocated_chunks
+                if missing:
+                    arena.precommit(missing)
+        except Exception as exc:
+            broker_denied = (
+                self._predictive_prewarm_broker_denials()
+                > broker_denials_before
+                or "global VMM capacity exhausted" in str(exc)
+            )
+            cleaned = self._discard_partial_predictive_prewarm(candidates)
+            self._record_predictive_prewarm_failure(
+                "map",
+                exc,
+                broker_denied=broker_denied,
+                disable=(not broker_denied or not cleaned),
+            )
+            return 0
         self.precommitted.update(candidates)
         self._predictive_precommitted.update(candidates)
         deadline = now + self.predictive_prewarm_ttl_ms / 1000.0
@@ -394,7 +519,11 @@ class Residency:
             self._predictive_precommitted
         )
         self.backed = sum(arena.backed_bytes for arena in self.arenas)
-        self.publish()
+        if backed_before is not None:
+            self.counters["predictive_prewarm_mapped_bytes"] += max(
+                0, self.backed - backed_before
+            )
+        self._publish_predictive_prewarm()
         return len(candidates)
 
     def physical_available_tokens(self, logical_free_tokens, free_ranges):

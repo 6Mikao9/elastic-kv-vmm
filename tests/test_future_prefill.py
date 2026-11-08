@@ -1,6 +1,6 @@
-from types import SimpleNamespace as NS
-from dataclasses import replace
 import unittest
+from dataclasses import replace
+from types import SimpleNamespace as NS
 
 from adaptive_sparse.future_prefill import (
     FuturePrefillConfig,
@@ -19,6 +19,10 @@ def request(
     expected_output_tokens=5,
     residence="resident",
     kind="generic",
+    prefill_tokens_per_s=None,
+    decode_tokens_per_s=None,
+    prefix_group=None,
+    shared_prefix_tokens=0,
 ):
     payload = {
         "release_after_ms": release_after_ms,
@@ -27,9 +31,20 @@ def request(
     }
     if expected_output_tokens is not None:
         payload["expected_output_tokens"] = expected_output_tokens
+    if prefill_tokens_per_s is not None:
+        payload["prefill_tokens_per_s"] = prefill_tokens_per_s
+    if decode_tokens_per_s is not None:
+        payload["decode_tokens_per_s"] = decode_tokens_per_s
+    if prefix_group is not None:
+        payload["prefix_group"] = prefix_group
+        payload["shared_prefix_tokens"] = shared_prefix_tokens
     action = NS(
         action_type="elastic.future",
-        action_version="1",
+        action_version=(
+            "3"
+            if prefill_tokens_per_s is not None or decode_tokens_per_s is not None
+            else "1"
+        ),
         payload=payload,
     )
     return NS(
@@ -133,6 +148,105 @@ class FuturePrefillPlanTest(unittest.TestCase):
             [entry.request_id for entry in plan.entries], ["ready", "waiting"]
         )
         self.assertEqual(plan.deferred_count, 1)
+
+    def test_nonoverlapping_rate_windows_do_not_add_to_peak(self):
+        plan = plan_future_prefill(
+            [
+                request(
+                    "first",
+                    release_after_ms=0,
+                    prefill_tokens_per_s=1_000,
+                    decode_tokens_per_s=1_000,
+                ),
+                request(
+                    "second",
+                    release_after_ms=100,
+                    prefill_tokens_per_s=1_000,
+                    decode_tokens_per_s=1_000,
+                ),
+            ],
+            now_s=1.0,
+            kv_bytes_per_token=10,
+            config=self.config(),
+        )
+
+        self.assertEqual(sum(entry.kv_bytes for entry in plan.entries), 300)
+        self.assertEqual(plan.kv_bytes, 150)
+        self.assertEqual(plan.activation_bytes, 20)
+        self.assertEqual(plan.reserve_bytes, 170)
+        self.assertEqual(
+            plan.overlap_policy, "rate-aware-or-conservative"
+        )
+
+    def test_overlapping_rate_windows_use_concurrent_peak(self):
+        plan = plan_future_prefill(
+            [
+                request(
+                    "first",
+                    release_after_ms=0,
+                    prefill_tokens_per_s=1_000,
+                    decode_tokens_per_s=1_000,
+                ),
+                request(
+                    "second",
+                    release_after_ms=5,
+                    prefill_tokens_per_s=1_000,
+                    decode_tokens_per_s=1_000,
+                ),
+            ],
+            now_s=1.0,
+            kv_bytes_per_token=10,
+            config=self.config(),
+        )
+
+        self.assertEqual(plan.kv_bytes, 300)
+        self.assertEqual(plan.activation_bytes, 40)
+
+    def test_shared_prefix_is_counted_once_while_members_overlap(self):
+        plan = plan_future_prefill(
+            [
+                request(
+                    request_id,
+                    prompt=10,
+                    prefill_tokens_per_s=1_000,
+                    decode_tokens_per_s=1_000,
+                    prefix_group="group",
+                    shared_prefix_tokens=4,
+                )
+                for request_id in ("a", "b", "c")
+            ],
+            now_s=1.0,
+            kv_bytes_per_token=10,
+            config=self.config(),
+        )
+
+        self.assertEqual(sum(entry.kv_bytes for entry in plan.entries), 450)
+        self.assertEqual(plan.kv_bytes, 370)
+        self.assertEqual(
+            [entry.shared_prefix_bytes for entry in plan.entries],
+            [40, 40, 40],
+        )
+
+    def test_shared_prefix_credit_uses_shortest_common_group_prefix(self):
+        plan = plan_future_prefill(
+            [
+                request(
+                    request_id,
+                    prompt=10,
+                    prefill_tokens_per_s=1_000,
+                    decode_tokens_per_s=1_000,
+                    prefix_group="group",
+                    shared_prefix_tokens=shared,
+                )
+                for request_id, shared in (("a", 1), ("b", 2), ("c", 6))
+            ],
+            now_s=1.0,
+            kv_bytes_per_token=10,
+            config=self.config(),
+        )
+
+        self.assertEqual(sum(entry.kv_bytes for entry in plan.entries), 450)
+        self.assertEqual(plan.kv_bytes, 430)
 
     def test_missing_and_invalid_hints_do_not_change_reservation(self):
         no_hint = request("none")

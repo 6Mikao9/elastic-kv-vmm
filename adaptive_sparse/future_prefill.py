@@ -9,12 +9,12 @@ request-slot, grammar and allocator checks remain authoritative.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
-from typing import Any, Iterable
+from collections.abc import Iterable
+from dataclasses import dataclass
+from typing import Any
 
 from .sglang_future_hook import _extract_hint, _prompt_tokens, _request_age_ms
-
 
 PREFILL_RESERVATION_MODES = ("off", "dry_run", "enforce")
 
@@ -78,6 +78,12 @@ class FuturePrefillEntry:
     activation_bytes: int
     release_in_ms: float
     native_order: int
+    start_in_ms: float = 0.0
+    activation_finish_in_ms: float = math.inf
+    kv_finish_in_ms: float = math.inf
+    prefix_group: str | None = None
+    shared_prefix_tokens: int = 0
+    shared_prefix_bytes: int = 0
 
     @property
     def total_bytes(self) -> int:
@@ -96,14 +102,22 @@ class FuturePrefillPlan:
     invalid_hint_count: int = 0
     unestimated_count: int = 0
     capped_count: int = 0
+    overlap_policy: str = "rate-aware-or-conservative"
 
     @property
     def kv_bytes(self) -> int:
-        return sum(entry.kv_bytes for entry in self.entries)
+        return _interval_peak(
+            self.entries,
+            "kv_bytes",
+            "kv_finish_in_ms",
+            shared_prefix=True,
+        )
 
     @property
     def activation_bytes(self) -> int:
-        return sum(entry.activation_bytes for entry in self.entries)
+        return _interval_peak(
+            self.entries, "activation_bytes", "activation_finish_in_ms"
+        )
 
     @property
     def reserve_bytes(self) -> int:
@@ -127,9 +141,15 @@ class FuturePrefillPlan:
                     entry.kv_bytes,
                     entry.activation_bytes,
                     entry.residence,
+                    entry.start_in_ms,
+                    entry.activation_finish_in_ms,
+                    entry.kv_finish_in_ms,
+                    entry.prefix_group,
+                    entry.shared_prefix_tokens,
                 )
                 for entry in self.entries
             ),
+            self.overlap_policy,
         )
 
     @property
@@ -206,6 +226,74 @@ def _activation_bytes_per_token(hint: Any, config: FuturePrefillConfig) -> int:
     return overrides.get(hint.kind, config.activation_bytes_per_token)
 
 
+def _duration_ms(tokens: int, rate: float | None) -> float | None:
+    if rate is None:
+        return None
+    return tokens * 1000.0 / rate
+
+
+def _entry_windows(hint: Any, prompt: int, expected: int, start: float):
+    """Return bounded prefill/request intervals, or infinity when unknown."""
+
+    prefill = _duration_ms(prompt, hint.prefill_tokens_per_s)
+    activation_finish = math.inf if prefill is None else start + prefill
+    decode = _duration_ms(expected, hint.decode_tokens_per_s)
+    kv_finish = (
+        math.inf
+        if prefill is None or decode is None
+        else start + prefill + decode
+    )
+    return activation_finish, kv_finish
+
+
+def _interval_peak(entries, byte_field, finish_field, *, shared_prefix=False):
+    """Return peak concurrent bytes using half-open requested intervals."""
+
+    if not entries:
+        return 0
+    by_id = {entry.request_id: entry for entry in entries}
+    events = {}
+    for entry in entries:
+        start = float(getattr(entry, "start_in_ms", 0.0))
+        finish = float(getattr(entry, finish_field, math.inf))
+        value = int(getattr(entry, byte_field))
+        if finish <= start or value <= 0:
+            continue
+        events.setdefault(start, []).append((1, entry.request_id))
+        events.setdefault(finish, []).append((-1, entry.request_id))
+    active = set()
+    peak = 0
+    for instant in sorted(events):
+        changes = events[instant]
+        # End half-open intervals before starting replacements at the same point.
+        for direction, request_id in changes:
+            if direction < 0:
+                active.discard(request_id)
+        for direction, request_id in changes:
+            if direction > 0:
+                active.add(request_id)
+        if not active:
+            continue
+        total = sum(
+            int(getattr(by_id[request_id], byte_field))
+            for request_id in active
+        )
+        if shared_prefix and byte_field == "kv_bytes":
+            groups = {}
+            for request_id in active:
+                entry = by_id[request_id]
+                if entry.prefix_group and entry.shared_prefix_bytes > 0:
+                    groups.setdefault(entry.prefix_group, []).append(
+                        entry.shared_prefix_bytes
+                    )
+            total -= sum(
+                (len(values) - 1) * min(values)
+                for values in groups.values()
+            )
+        peak = max(peak, total)
+    return peak
+
+
 def plan_future_prefill(
     waiting_queue: Iterable[Any],
     *,
@@ -235,7 +323,6 @@ def plan_future_prefill(
         raise ValueError("now_s must be finite")
 
     selected: list[FuturePrefillEntry] = []
-    reserve = 0
     deferred = missing = invalid = unestimated = capped = 0
     for native_order, request in enumerate(queue):
         try:
@@ -272,24 +359,35 @@ def plan_future_prefill(
         )
         kv_bytes = kv_tokens * kv_bytes_per_token
         activation_bytes = prompt * _activation_bytes_per_token(hint, config)
-        total = kv_bytes + activation_bytes
-        if reserve + total > config.max_reserve_bytes:
+        start_in_ms = max(0.0, float(release_in_ms))
+        activation_finish, kv_finish = _entry_windows(
+            hint, prompt, expected, start_in_ms
+        )
+        shared_prefix_bytes = (
+            min(hint.shared_prefix_tokens, kv_tokens) * kv_bytes_per_token
+        )
+        entry = FuturePrefillEntry(
+            request_id=request_id,
+            kind=hint.kind,
+            residence=residence,
+            prompt_tokens=prompt,
+            expected_output_tokens=expected,
+            kv_bytes=kv_bytes,
+            activation_bytes=activation_bytes,
+            release_in_ms=release_in_ms,
+            native_order=native_order,
+            start_in_ms=start_in_ms,
+            activation_finish_in_ms=activation_finish,
+            kv_finish_in_ms=kv_finish,
+            prefix_group=hint.prefix_group,
+            shared_prefix_tokens=hint.shared_prefix_tokens,
+            shared_prefix_bytes=shared_prefix_bytes,
+        )
+        trial = FuturePrefillPlan(mode=config.mode, entries=(*selected, entry))
+        if trial.reserve_bytes > config.max_reserve_bytes:
             capped += 1
             continue
-        reserve += total
-        selected.append(
-            FuturePrefillEntry(
-                request_id=request_id,
-                kind=hint.kind,
-                residence=residence,
-                prompt_tokens=prompt,
-                expected_output_tokens=expected,
-                kv_bytes=kv_bytes,
-                activation_bytes=activation_bytes,
-                release_in_ms=release_in_ms,
-                native_order=native_order,
-            )
-        )
+        selected.append(entry)
 
     return FuturePrefillPlan(
         mode=config.mode,
@@ -300,4 +398,5 @@ def plan_future_prefill(
         invalid_hint_count=invalid,
         unestimated_count=unestimated,
         capped_count=capped,
+        overlap_policy="rate-aware-or-conservative",
     )

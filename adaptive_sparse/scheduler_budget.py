@@ -60,6 +60,52 @@ def _should_plan_future_waiting(mode, waiting_queue, *, prefill, steps, observe)
     )
 
 
+def _invalidate_predictive_prewarm(tracker, stage, exc):
+    invalidate = getattr(tracker, "invalidate_predictive_prewarm", None)
+    if callable(invalidate):
+        try:
+            invalidate(f"{stage}:{type(exc).__name__}:{str(exc)[:160]}")
+        except Exception:
+            pass
+    else:
+        try:
+            tracker._predictive_prewarm_disabled_reason = str(exc)[:240]
+        except Exception:
+            pass
+
+
+def _best_effort_predictive_prewarm(tracker, demand_bytes, controller=None):
+    """Run the optional VMM hint without replacing native admission."""
+
+    prewarm = getattr(tracker, "predictive_prewarm", None)
+    if not callable(prewarm):
+        return 0
+    try:
+        return prewarm(demand_bytes)
+    except Exception as exc:
+        if controller is not None:
+            controller.stats["predictive_prewarm_hook_errors"] += 1
+        _invalidate_predictive_prewarm(tracker, "scheduler-prewarm", exc)
+        LOG.warning("predictive prewarm fell back to native admission: %s", exc)
+        return 0
+
+
+def _best_effort_expire_predictive_prewarm(tracker, controller=None):
+    """Reclaim expired speculative mappings without breaking an idle tick."""
+
+    expire = getattr(tracker, "expire_predictive_prewarm", None)
+    if not callable(expire):
+        return 0
+    try:
+        return expire()
+    except Exception as exc:
+        if controller is not None:
+            controller.stats["predictive_prewarm_expire_errors"] += 1
+        _invalidate_predictive_prewarm(tracker, "scheduler-expire", exc)
+        LOG.warning("predictive prewarm expiry failed closed: %s", exc)
+        return 0
+
+
 def _broker_snapshot(tracker):
     """Return a validated aggregate VMM snapshot, or None when disabled."""
 
@@ -466,6 +512,8 @@ class SchedulerBudget:
                       "future_prefill_tp_fallbacks": 0,
                       "future_prefill_pressure_observations": 0,
                       "future_decode_pressure_observations": 0,
+                      "predictive_prewarm_hook_errors": 0,
+                      "predictive_prewarm_expire_errors": 0,
                       "last_future_plan_boundary": None,
                       "runtime_value_hints": 0,
                       "runtime_value_invalid": 0,
@@ -1235,9 +1283,7 @@ def install_scheduler_budget():
             if coordinator is None
             else getattr(coordinator.mem_pool_device, "adaptive_vmm", None)
         )
-        expire_prewarm = getattr(tracker, "expire_predictive_prewarm", None)
-        if callable(expire_prewarm):
-            expire_prewarm()
+        _best_effort_expire_predictive_prewarm(tracker)
         if not hasattr(self, "_ekv_adaptive_budget"):
             if (coordinator is None or not coordinator.is_m3_hisparse
                     or not hasattr(coordinator, "_ekv_resident")
@@ -1290,9 +1336,6 @@ def install_scheduler_budget():
             if coordinator.tp_world_size > 1:
                 signatures = exchange(reservation.signature)
                 reservation, tp_fallback = reconcile_tp_plan(reservation, signatures)
-            prewarm = getattr(tracker, "predictive_prewarm", None)
-            if callable(prewarm) and not tp_fallback:
-                prewarm(reservation.kv_bytes)
         future_headroom = effective_prefill_headroom(
             reservation, headroom, future_mode
         )
@@ -1315,6 +1358,10 @@ def install_scheduler_budget():
             prefill=prefill, now=now, future_headroom=future_headroom,
             future_prefix_demand=future_prefix_demand,
         )
+        if should_plan_future and not tp_fallback:
+            _best_effort_predictive_prewarm(
+                tracker, reservation.kv_bytes, controller
+            )
 
     prefill = cls.get_new_batch_prefill
     decode = cls.update_running_batch
@@ -1336,12 +1383,21 @@ def install_scheduler_budget():
     @wraps(idle)
     def on_idle(self):
         controller = getattr(self, "_ekv_adaptive_budget", None)
-        if controller is not None and self.is_fully_idle():
-            signature = tuple(value for value in controller.stats.values() if not isinstance(value, dict))
-            if getattr(controller, "_published", None) != signature:
-                controller.publish()
-                controller._published = signature
-        return idle(self)
+        coordinator = getattr(self, "hisparse_coordinator", None)
+        tracker = (
+            None
+            if coordinator is None
+            else getattr(coordinator.mem_pool_device, "adaptive_vmm", None)
+        )
+        result = idle(self)
+        if self.is_fully_idle():
+            _best_effort_expire_predictive_prewarm(tracker, controller)
+            if controller is not None:
+                signature = tuple(value for value in controller.stats.values() if not isinstance(value, dict))
+                if getattr(controller, "_published", None) != signature:
+                    controller.publish()
+                    controller._published = signature
+        return result
 
     cls.on_idle = on_idle
     cls.get_new_batch_prefill = before_prefill

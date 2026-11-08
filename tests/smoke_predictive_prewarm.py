@@ -15,7 +15,6 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-
 CHUNK = 2 << 20
 SLOT = CHUNK
 POOL_SIZE = 5
@@ -67,7 +66,8 @@ def main():
         free_before = ctrl.free_slots.count
         initial_backed = projection.backed_bytes
 
-        selected = ctrl.predictive_prewarm(2 * SLOT)
+        demand = 4 * SLOT
+        selected = ctrl.predictive_prewarm(demand)
         mapped_backed = projection.backed_bytes
         assert selected == 2, selected
         assert ctrl.free_slots.count == free_before
@@ -79,6 +79,7 @@ def main():
         ctrl.admit_ranges(ranges)
         assert ctrl.live_count == 2
         assert ctrl.counters["predictive_prewarm_hit_chunks"] == 2
+        assert ctrl.counters["predictive_prewarm_hit_bytes"] == 2 * CHUNK * projection.planes
         assert ctrl._predictive_precommitted == set()
 
         views = projection.views(torch.float64, (slots, 1, head_dim))
@@ -95,7 +96,7 @@ def main():
         assert ctrl.live_count == 0
         assert projection.backed_bytes == initial_backed
 
-        second = ctrl.predictive_prewarm(2 * SLOT)
+        second = ctrl.predictive_prewarm(demand)
         assert second == 2, second
         expired = ctrl.expire_predictive_prewarm(
             now_s=time.monotonic() + 0.2
@@ -103,12 +104,17 @@ def main():
         assert expired == 2, expired
         assert ctrl.precommitted == set()
         assert projection.backed_bytes == initial_backed
+        assert ctrl.counters["predictive_prewarm_candidate_bytes"] == 4 * CHUNK * projection.planes
+        assert ctrl.counters["predictive_prewarm_mapped_bytes"] == 2 * CHUNK * projection.planes
+        assert ctrl.counters["predictive_prewarm_hit_bytes"] == 2 * CHUNK * projection.planes
+        assert ctrl.counters["predictive_prewarm_expired_bytes"] == 2 * CHUNK * projection.planes
 
         result = {
             "status": "passed",
             "device": torch.cuda.get_device_name(0),
             "capability": torch.cuda.get_device_capability(0),
             "selected_chunks": selected,
+            "requested_demand_bytes": demand,
             "free_slots_before_after_prewarm": [free_before, free_before],
             "initial_backed_bytes": initial_backed,
             "prewarmed_backed_bytes": mapped_backed,

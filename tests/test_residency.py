@@ -16,14 +16,19 @@ SLOT = 3 * CHUNK // 4
 
 
 class FakeArena:
-    def __init__(self):
+    def __init__(self, planes=1):
+        self.planes = planes
         self.mapped_chunks = {0}
         self.precommitted_chunks = set()
         self.reclaimed = []
 
     @property
     def backed_bytes(self):
-        return len(self.mapped_chunks | self.precommitted_chunks) * CHUNK
+        return (
+            len(self.mapped_chunks | self.precommitted_chunks)
+            * CHUNK
+            * self.planes
+        )
 
     @property
     def allocated_chunks(self):
@@ -45,6 +50,10 @@ class FakeArena:
         self.reclaimed.append(set(indices))
         self.mapped_chunks.difference_update(indices)
         self.precommitted_chunks.difference_update(indices)
+
+    @property
+    def metrics(self):
+        return {"global_broker_denials": 0}
 
 
 class ResidencyTest(unittest.TestCase):
@@ -270,6 +279,110 @@ class ResidencyTest(unittest.TestCase):
             self.ctrl.counters["predictive_prewarm_expired_chunks"], selected
         )
 
+    def test_predictive_prewarm_divides_total_demand_across_planes(self):
+        arena = FakeArena(planes=2)
+        with (
+            patch.object(adapter, "MODE", "v5"),
+            patch.dict(
+                os.environ,
+                {
+                    "EKV_PREDICTIVE_PREWARM_MODE": "enforce",
+                    "EKV_PREDICTIVE_PREWARM_TTL_MS": "1000",
+                    "EKV_PREDICTIVE_PREWARM_MAX_CHUNKS": "2",
+                },
+            ),
+        ):
+            ctrl = adapter.Residency(
+                self.ctrl.pool, [arena], CHUNK, "test"
+            )
+        ctrl.free_slots = adapter.FreeSlots(ctrl.pool.size)
+        initial_backed = arena.backed_bytes
+
+        selected = ctrl.predictive_prewarm(2 * CHUNK, now_s=time.monotonic())
+
+        self.assertEqual(selected, 1)
+        self.assertEqual(arena.backed_bytes - initial_backed, 2 * CHUNK)
+        self.assertEqual(
+            ctrl.counters["predictive_prewarm_candidate_bytes"], 2 * CHUNK
+        )
+        self.assertEqual(
+            ctrl.counters["predictive_prewarm_mapped_bytes"], 2 * CHUNK
+        )
+
+    def test_predictive_prewarm_isolates_broker_denial(self):
+        class BrokerDeniedArena(FakeArena):
+            def __init__(self):
+                super().__init__()
+                self.denials = 0
+
+            @property
+            def metrics(self):
+                return {"global_broker_denials": self.denials}
+
+            def precommit(self, indices):
+                self.denials += 1
+                raise RuntimeError(
+                    "global VMM capacity exhausted or fair-share yield"
+                )
+
+        arena = BrokerDeniedArena()
+        with (
+            patch.object(adapter, "MODE", "v5"),
+            patch.dict(
+                os.environ,
+                {
+                    "EKV_PREDICTIVE_PREWARM_MODE": "enforce",
+                    "EKV_PREDICTIVE_PREWARM_TTL_MS": "1000",
+                    "EKV_PREDICTIVE_PREWARM_MAX_CHUNKS": "2",
+                },
+            ),
+        ):
+            ctrl = adapter.Residency(
+                self.ctrl.pool, [arena], CHUNK, "test"
+            )
+        ctrl.free_slots = adapter.FreeSlots(ctrl.pool.size)
+
+        selected = ctrl.predictive_prewarm(CHUNK, now_s=time.monotonic())
+
+        self.assertEqual(selected, 0)
+        self.assertEqual(ctrl._predictive_precommitted, set())
+        self.assertIsNone(ctrl._predictive_prewarm_disabled_reason)
+        self.assertEqual(ctrl.counters["predictive_prewarm_broker_denied"], 1)
+        self.assertEqual(ctrl.counters["predictive_prewarm_exception"], 0)
+        self.assertEqual(ctrl.counters["predictive_prewarm_fallback"], 1)
+
+    def test_predictive_prewarm_native_failure_cleans_partial_lease(self):
+        class NativeFailureArena(FakeArena):
+            def precommit(self, indices):
+                raise RuntimeError("native VMM commit failed")
+
+        first = FakeArena()
+        second = NativeFailureArena()
+        with (
+            patch.object(adapter, "MODE", "v5"),
+            patch.dict(
+                os.environ,
+                {
+                    "EKV_PREDICTIVE_PREWARM_MODE": "enforce",
+                    "EKV_PREDICTIVE_PREWARM_TTL_MS": "1000",
+                    "EKV_PREDICTIVE_PREWARM_MAX_CHUNKS": "2",
+                },
+            ),
+        ):
+            ctrl = adapter.Residency(
+                self.ctrl.pool, [first, second], CHUNK, "test"
+            )
+        ctrl.free_slots = adapter.FreeSlots(ctrl.pool.size)
+
+        selected = ctrl.predictive_prewarm(CHUNK, now_s=time.monotonic())
+
+        self.assertEqual(selected, 0)
+        self.assertEqual(first.precommitted_chunks, set())
+        self.assertEqual(ctrl._predictive_precommitted, set())
+        self.assertIsNotNone(ctrl._predictive_prewarm_disabled_reason)
+        self.assertEqual(ctrl.counters["predictive_prewarm_exception"], 1)
+        self.assertEqual(ctrl.counters["predictive_prewarm_fallback"], 1)
+
     def test_repeated_predictive_plan_does_not_extend_existing_lease(self):
         with (
             patch.object(adapter, "MODE", "v5"),
@@ -292,6 +405,7 @@ class ResidencyTest(unittest.TestCase):
             chunk: self.ctrl._predictive_prewarm_deadlines[chunk]
             for chunk in self.ctrl._predictive_precommitted
         }
+        self.assertGreater(len(original), 0)
 
         self.ctrl.predictive_prewarm(SLOT * 8, now_s=now + 0.05)
 
@@ -299,14 +413,14 @@ class ResidencyTest(unittest.TestCase):
             self.assertEqual(
                 self.ctrl._predictive_prewarm_deadlines[chunk], deadline
             )
-        self.assertEqual(len(self.ctrl._predictive_precommitted), 4)
+        self.assertEqual(len(self.ctrl._predictive_precommitted), len(original))
 
         # A repeated plan consumes no additional speculative budget once the
         # outstanding lease set reaches its configured cap.
         self.assertEqual(
             self.ctrl.predictive_prewarm(SLOT * 8, now_s=now + 0.075), 0
         )
-        self.assertEqual(len(self.ctrl._predictive_precommitted), 4)
+        self.assertEqual(len(self.ctrl._predictive_precommitted), len(original))
 
     def test_crossing_slots_retain_shared_chunks(self):
         # Slot 1 touches chunks 0,1. Slot 2 touches chunks 1,2.

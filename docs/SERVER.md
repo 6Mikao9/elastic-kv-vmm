@@ -65,7 +65,7 @@ SGLang or touch CUDA.
 | `--elastic-precommit-max-chunks` | `1` | must cover the lookahead |
 | `--elastic-predictive-prewarm-mode` | `off` | `off`, `dry_run`, or V5-only `enforce` from bounded future demand |
 | `--elastic-predictive-prewarm-ttl-ms` | `2000` | positive lifetime for each unconsumed speculative mapping |
-| `--elastic-predictive-prewarm-max-chunks` | `8` | global outstanding logical-chunk lease cap from 1 to 64 |
+| `--elastic-predictive-prewarm-max-chunks` | `8` | global outstanding logical-chunk lease cap from 1 to 64; requested demand is total K/V bytes across all planes |
 | `--elastic-future-policy` | `off` | `deadline`; native `kv_hints` or the built-in 0.5.2 compatibility path |
 | `--elastic-future-ordering-horizon-ms` | `0` | nonnegative; zero keeps native horizon behavior |
 | `--elastic-stats-path` | unset | atomic JSON telemetry destination |
