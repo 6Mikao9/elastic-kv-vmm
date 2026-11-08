@@ -108,6 +108,15 @@ actually needs unmapped backing. The gate remains inside one process; it is not
 yet a cross-instance reservation or a guarantee against concurrent allocator
 races.
 
+`EKV_PREFILL_HEADROOM_SCOPED=1` (or `--elastic-prefill-headroom-scoped`) makes
+the static fallback apply only while native prefill admission is active.
+`EKV_PREFILL_WORKSPACE_BYTES_PER_TOKEN` adds a bounded, model-calibrated estimate
+from the waiting queue's remaining prompt tokens; `EKV_PREFILL_WORKSPACE_MAX_MIB`
+caps it. The larger of this estimate and the static fallback enters the same VMM
+gate. The estimate is a phase-scoped lease around scheduler admission, not a
+separate activation allocator; GPU measurements must calibrate the rate and
+validate OOM behavior.
+
 For an existing isolated environment, the primary entry point is `python3 -m elastic_kv` (or `elastic-sglang` after installing `pyproject.toml`). It validates elastic settings before importing SGLang, installs the adapter, and forwards the remaining arguments to SGLang. The launcher now owns precommit lookahead, future-ordering horizon and both telemetry destinations as well as their `EKV_*` environment equivalents, so spawned SGLang workers receive one validated manifest. `python3 -m elastic_kv.launch` remains compatible with the experiment scripts. The module entry point is required so the adapter is installed in the spawned scheduler process as well as the launcher. See [server usage](docs/SERVER.md); `EKV_STATS_PATH` optionally records residency telemetry.
 
 For the separate future-ordering path, set `EKV_FUTURE_POLICY=deadline` and

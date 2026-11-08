@@ -24,6 +24,9 @@ class ElasticConfigTest(unittest.TestCase):
                 "EKV_ACTIVATION_POLICY": "both",
                 "EKV_ADMISSION_POLICY": "physical",
                 "EKV_PREFILL_HEADROOM_MIB": "512",
+                "EKV_PREFILL_HEADROOM_SCOPED": "1",
+                "EKV_PREFILL_WORKSPACE_BYTES_PER_TOKEN": "1536",
+                "EKV_PREFILL_WORKSPACE_MAX_MIB": "768",
                 "EKV_PRECOMMIT_CHUNKS": "2",
                 "EKV_PRECOMMIT_MAX_CHUNKS": "3",
                 "EKV_FUTURE_POLICY": "deadline",
@@ -36,6 +39,9 @@ class ElasticConfigTest(unittest.TestCase):
         self.assertEqual(config.activation_policy, "both")
         self.assertEqual(config.admission_policy, "physical")
         self.assertEqual(config.prefill_headroom_mib, 512)
+        self.assertTrue(config.prefill_headroom_scoped)
+        self.assertEqual(config.prefill_workspace_bytes_per_token, 1536)
+        self.assertEqual(config.prefill_workspace_max_mib, 768)
         self.assertEqual(config.precommit_chunks, 2)
         self.assertEqual(config.precommit_max_chunks, 3)
         self.assertEqual(config.future_policy, "deadline")
@@ -62,6 +68,18 @@ class ElasticConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must cover"):
             ElasticConfig(precommit_chunks=2, precommit_max_chunks=1)
 
+    def test_dynamic_prefill_workspace_requires_v5_physical_admission(self):
+        with self.assertRaisesRegex(ValueError, "dynamic prefill workspace requires"):
+            ElasticConfig(
+                mode="v4",
+                prefill_headroom_scoped=True,
+            )
+        with self.assertRaisesRegex(ValueError, "requires physical admission"):
+            ElasticConfig(
+                mode="v5",
+                prefill_workspace_bytes_per_token=1,
+            )
+
     def test_cli_overrides_leave_sglang_arguments_untouched(self):
         config, upstream, dry_run = resolve_config(
             [
@@ -71,6 +89,11 @@ class ElasticConfigTest(unittest.TestCase):
                 "8",
                 "--elastic-admission-policy",
                 "physical",
+                "--elastic-prefill-headroom-scoped",
+                "--elastic-prefill-workspace-bytes-per-token",
+                "1536",
+                "--elastic-prefill-workspace-max-mib",
+                "768",
                 "--elastic-future-policy",
                 "deadline",
                 "--elastic-precommit-chunks",
@@ -97,8 +120,23 @@ class ElasticConfigTest(unittest.TestCase):
                 config.precommit_max_chunks,
                 config.future_ordering_horizon_ms,
                 config.future_stats_path,
+                config.prefill_headroom_scoped,
+                config.prefill_workspace_bytes_per_token,
+                config.prefill_workspace_max_mib,
             ),
-            ("v5", 8, "physical", "deadline", 2, 4, 1500, "/tmp/future.json"),
+            (
+                "v5",
+                8,
+                "physical",
+                "deadline",
+                2,
+                4,
+                1500,
+                "/tmp/future.json",
+                True,
+                1536,
+                768,
+            ),
         )
         self.assertEqual(upstream, ["--model-path", "/models/qwen", "--port", "30000"])
         self.assertFalse(dry_run)

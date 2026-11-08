@@ -71,6 +71,17 @@ chunks-to-tokens calculation. The prefill headroom remains an estimate, and
 transactional allocation failure, exact activation ownership and cross-process
 memory grants remain separate work.
 
+`EKV_PREFILL_HEADROOM_SCOPED=1` makes the fallback headroom prefill-only;
+decode admission no longer pays for scratch that is not live. A positive
+`EKV_PREFILL_WORKSPACE_BYTES_PER_TOKEN` additionally wraps
+`Scheduler.get_new_batch_prefill`, estimates remaining prompt tokens from the
+actual waiting queue plus `chunked_req`, caps the result, and exposes the larger
+of that estimate and the static fallback through the same VMM byte gate. The
+phase scope is removed when native scheduler admission returns. Telemetry
+records the scoped bytes, prompt-token estimate, request count and unknown
+requests. This is a calibrated finite lease around scheduler admission, not an
+allocation of PyTorch activation tensors.
+
 ## vLLM
 
 The vLLM 0.29.0 adapter selects the legacy GPU model runner in the V1 engine.

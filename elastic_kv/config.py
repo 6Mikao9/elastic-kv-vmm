@@ -23,6 +23,7 @@ DEFAULT_RETAIN_CHUNKS = 1
 DEFAULT_ACTIVATION_POLICY = "off"
 DEFAULT_ADMISSION_POLICY = "logical"
 DEFAULT_PREFILL_HEADROOM_MIB = 0
+DEFAULT_PREFILL_WORKSPACE_MAX_MIB = 256
 DEFAULT_FUTURE_POLICY = "off"
 DEFAULT_PRECOMMIT_CHUNKS = 0
 DEFAULT_FUTURE_ORDERING_HORIZON_MS = 0
@@ -36,6 +37,17 @@ def _integer(name: str, value: object, *, minimum: int) -> int:
     if parsed < minimum:
         raise ValueError(f"{name} must be at least {minimum}")
     return parsed
+
+
+def _boolean(name: str, value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in ("1", "true", "yes", "on"):
+        return True
+    if normalized in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"{name} must be a boolean")
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +66,9 @@ class ElasticConfig:
     future_ordering_horizon_ms: int = DEFAULT_FUTURE_ORDERING_HORIZON_MS
     stats_path: str | None = None
     future_stats_path: str | None = None
+    prefill_headroom_scoped: bool = False
+    prefill_workspace_bytes_per_token: int = 0
+    prefill_workspace_max_mib: int = DEFAULT_PREFILL_WORKSPACE_MAX_MIB
 
     def __post_init__(self) -> None:
         if self.mode not in MODES:
@@ -82,10 +97,24 @@ class ElasticConfig:
             raise ValueError(f"unknown future policy: {self.future_policy!r}")
         if self.future_ordering_horizon_ms < 0:
             raise ValueError("future_ordering_horizon_ms must be nonnegative")
+        if self.prefill_workspace_bytes_per_token < 0:
+            raise ValueError("prefill_workspace_bytes_per_token must be nonnegative")
+        if self.prefill_workspace_max_mib < 1:
+            raise ValueError("prefill_workspace_max_mib must be positive")
         if self.activation_policy != "off" and self.mode != "v5":
             raise ValueError("activation policies require elastic mode v5")
         if self.admission_policy != "logical" and self.mode != "v5":
             raise ValueError("physical admission requires elastic mode v5")
+        if (
+            self.prefill_headroom_scoped
+            or self.prefill_workspace_bytes_per_token > 0
+        ):
+            if self.mode != "v5":
+                raise ValueError("dynamic prefill workspace requires elastic mode v5")
+            if self.admission_policy != "physical":
+                raise ValueError(
+                    "dynamic prefill workspace requires physical admission"
+                )
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> "ElasticConfig":
@@ -139,6 +168,23 @@ class ElasticConfig:
             ),
             stats_path=env.get("EKV_STATS_PATH") or None,
             future_stats_path=env.get("EKV_FUTURE_STATS_PATH") or None,
+            prefill_headroom_scoped=_boolean(
+                "EKV_PREFILL_HEADROOM_SCOPED",
+                env.get("EKV_PREFILL_HEADROOM_SCOPED", "0"),
+            ),
+            prefill_workspace_bytes_per_token=_integer(
+                "EKV_PREFILL_WORKSPACE_BYTES_PER_TOKEN",
+                env.get("EKV_PREFILL_WORKSPACE_BYTES_PER_TOKEN", "0"),
+                minimum=0,
+            ),
+            prefill_workspace_max_mib=_integer(
+                "EKV_PREFILL_WORKSPACE_MAX_MIB",
+                env.get(
+                    "EKV_PREFILL_WORKSPACE_MAX_MIB",
+                    DEFAULT_PREFILL_WORKSPACE_MAX_MIB,
+                ),
+                minimum=1,
+            ),
         )
 
     def with_overrides(
@@ -156,6 +202,9 @@ class ElasticConfig:
         future_ordering_horizon_ms: int | None = None,
         stats_path: str | None = None,
         future_stats_path: str | None = None,
+        prefill_headroom_scoped: bool | None = None,
+        prefill_workspace_bytes_per_token: int | None = None,
+        prefill_workspace_max_mib: int | None = None,
     ) -> "ElasticConfig":
         changes = {
             key: value
@@ -172,6 +221,12 @@ class ElasticConfig:
                 ("future_ordering_horizon_ms", future_ordering_horizon_ms),
                 ("stats_path", stats_path),
                 ("future_stats_path", future_stats_path),
+                ("prefill_headroom_scoped", prefill_headroom_scoped),
+                (
+                    "prefill_workspace_bytes_per_token",
+                    prefill_workspace_bytes_per_token,
+                ),
+                ("prefill_workspace_max_mib", prefill_workspace_max_mib),
             )
             if value is not None
         }
@@ -190,6 +245,15 @@ class ElasticConfig:
             "EKV_FUTURE_POLICY": self.future_policy,
             "EKV_FUTURE_ORDERING_HORIZON_MS": str(
                 self.future_ordering_horizon_ms
+            ),
+            "EKV_PREFILL_HEADROOM_SCOPED": (
+                "1" if self.prefill_headroom_scoped else "0"
+            ),
+            "EKV_PREFILL_WORKSPACE_BYTES_PER_TOKEN": str(
+                self.prefill_workspace_bytes_per_token
+            ),
+            "EKV_PREFILL_WORKSPACE_MAX_MIB": str(
+                self.prefill_workspace_max_mib
             ),
         }
         if self.stats_path is not None:
@@ -221,6 +285,11 @@ class ElasticConfig:
             "future_ordering_horizon_ms": self.future_ordering_horizon_ms,
             "stats_path": self.stats_path,
             "future_stats_path": self.future_stats_path,
+            "prefill_headroom_scoped": self.prefill_headroom_scoped,
+            "prefill_workspace_bytes_per_token": (
+                self.prefill_workspace_bytes_per_token
+            ),
+            "prefill_workspace_max_mib": self.prefill_workspace_max_mib,
         }
 
     def to_json(self) -> str:

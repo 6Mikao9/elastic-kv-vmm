@@ -60,6 +60,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--elastic-activation-policy", choices=ACTIVATION_POLICIES)
     parser.add_argument("--elastic-admission-policy", choices=ADMISSION_POLICIES)
     parser.add_argument("--elastic-prefill-headroom-mib", type=int)
+    parser.add_argument(
+        "--elastic-prefill-headroom-scoped", action="store_true", default=None
+    )
+    parser.add_argument(
+        "--elastic-prefill-workspace-bytes-per-token", type=int
+    )
+    parser.add_argument("--elastic-prefill-workspace-max-mib", type=int)
     parser.add_argument("--elastic-precommit-chunks", type=int, choices=range(5))
     parser.add_argument("--elastic-precommit-max-chunks", type=int)
     parser.add_argument("--elastic-future-policy", choices=FUTURE_POLICIES)
@@ -90,6 +97,11 @@ def resolve_config(argv: Sequence[str]) -> tuple[ElasticConfig, list[str], bool]
         future_ordering_horizon_ms=args.elastic_future_ordering_horizon_ms,
         stats_path=args.elastic_stats_path,
         future_stats_path=args.elastic_future_stats_path,
+        prefill_headroom_scoped=args.elastic_prefill_headroom_scoped,
+        prefill_workspace_bytes_per_token=(
+            args.elastic_prefill_workspace_bytes_per_token
+        ),
+        prefill_workspace_max_mib=args.elastic_prefill_workspace_max_mib,
     )
     return config, sglang_argv, args.elastic_dry_run
 

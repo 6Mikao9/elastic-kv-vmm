@@ -19,6 +19,9 @@ python -m elastic_kv \
   --elastic-retain-chunks 8 \
   --elastic-admission-policy physical \
   --elastic-prefill-headroom-mib 1024 \
+  --elastic-prefill-headroom-scoped \
+  --elastic-prefill-workspace-bytes-per-token 1536 \
+  --elastic-prefill-workspace-max-mib 1024 \
   --model-path /models/Qwen3-0.6B-Base \
   --attention-backend triton \
   --page-size 1 \
@@ -43,6 +46,9 @@ SGLang or touch CUDA.
 | `--elastic-activation-policy` | `off` | requires `v5` unless `off` |
 | `--elastic-admission-policy` | `logical` | `physical` requires `v5` |
 | `--elastic-prefill-headroom-mib` | `0` | nonnegative integer |
+| `--elastic-prefill-headroom-scoped` | `false` | apply fallback headroom only during prefill scheduling |
+| `--elastic-prefill-workspace-bytes-per-token` | `0` | requires V5 physical admission |
+| `--elastic-prefill-workspace-max-mib` | `256` | positive bound on the waiting-prompt estimate |
 | `--elastic-precommit-chunks` | `0` | bounded chunk lookahead from 0 to 4 |
 | `--elastic-precommit-max-chunks` | `1` | must cover the lookahead |
 | `--elastic-future-policy` | `off` | `deadline`; native `kv_hints` or the built-in 0.5.2 compatibility path |
@@ -64,6 +70,16 @@ remain schedulable even when free device memory is tight. Use
 PyTorch cache under the same pressure gate. This reduces admission before VMM
 commit; it is not yet a cross-process reservation or a guarantee against a
 concurrent CUDA allocator race.
+
+The dynamic path is opt-in. At `Scheduler.get_new_batch_prefill`, the adapter
+sums remaining prompt tokens in the waiting queue and the chunked request,
+multiplies them by `--elastic-prefill-workspace-bytes-per-token`, and caps the
+result with `--elastic-prefill-workspace-max-mib`. That estimate and the static
+fallback are combined with `max`, because both model the same transient
+workspace. `--elastic-prefill-headroom-scoped` removes the fallback from decode
+admission and applies it only while native prefill admission is running. The
+rate is still a calibrated model-specific estimate; it does not own or resize
+PyTorch's internal activation allocations.
 
 Set `--elastic-future-stats-path` (or `EKV_FUTURE_STATS_PATH`) to atomically
 export scheduler hook counters from `adaptive_sparse.sglang_future_hook`; these

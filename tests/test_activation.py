@@ -15,6 +15,10 @@ class ActivationTest(unittest.TestCase):
         activation._POLICY = "off"
         activation._HEADROOM = 0
         activation._CUDA = None
+        activation._PREFILL_WORKSPACE_RATE = 0
+        activation._PREFILL_WORKSPACE_CAP = 0
+        activation._PREFILL_HEADROOM_SCOPED = False
+        activation._CONTEXT = activation.local()
 
     def test_installs_on_newer_forward_method(self):
         cuda = Mock()
@@ -54,6 +58,102 @@ class ActivationTest(unittest.TestCase):
         self.assertIs(ModelRunner.forward.__wrapped__, original_forward)
         self.assertFalse(hasattr(ModelRunner, "forward_extend"))
         self.assertTrue(ModelRunner._ekv_activation_hooks)
+
+    def test_estimates_remaining_prompt_tokens_and_caps_workspace(self):
+        requests = [
+            SimpleNamespace(origin_input_ids=range(20), num_matched_prefix_tokens=5),
+            SimpleNamespace(origin_input_ids=range(10)),
+            SimpleNamespace(origin_input_ids=[]),
+        ]
+
+        estimate = activation.estimate_prefill_workspace(
+            requests, bytes_per_token=8, max_bytes=100
+        )
+
+        self.assertEqual(estimate.prompt_tokens, 25)
+        self.assertEqual(estimate.bytes, 100)
+        self.assertEqual(estimate.requests, 2)
+        self.assertEqual(estimate.unestimated, 1)
+
+    def test_scoped_headroom_is_visible_only_inside_prefill_admission(self):
+        with patch.multiple(
+            activation,
+            _PREFILL_HEADROOM_SCOPED=True,
+            _CONTEXT=activation.local(),
+        ):
+            self.assertEqual(activation.current_prefill_headroom(20), 0)
+            with activation.prefill_admission_scope(80):
+                self.assertEqual(activation.current_prefill_headroom(20), 80)
+            self.assertEqual(activation.current_prefill_headroom(20), 0)
+
+    def test_scheduler_hook_scopes_estimated_workspace(self):
+        cuda = Mock()
+        torch = ModuleType("torch")
+        torch.cuda = cuda
+
+        class ScheduleBatch:
+            def prepare_for_extend(self):
+                return None
+
+        class ModelRunner:
+            def forward(self, *args, **kwargs):
+                return None
+
+        class Scheduler:
+            def __init__(self):
+                self.waiting_queue = [
+                    SimpleNamespace(origin_input_ids=range(10)),
+                    SimpleNamespace(
+                        origin_input_ids=range(8), num_matched_prefix_tokens=3
+                    ),
+                ]
+                self.chunked_req = None
+                self.controller = SimpleNamespace(ctrl=SimpleNamespace(counters={}))
+                self.token_to_kv_pool_allocator = self.controller
+
+            def get_new_batch_prefill(self, running_batch):
+                return activation.current_prefill_headroom(5)
+
+        modules = {
+            "torch": torch,
+            "sglang": ModuleType("sglang"),
+            "sglang.srt": ModuleType("sglang.srt"),
+            "sglang.srt.managers": ModuleType("sglang.srt.managers"),
+            "sglang.srt.managers.schedule_batch": SimpleNamespace(
+                ScheduleBatch=ScheduleBatch
+            ),
+            "sglang.srt.managers.scheduler": SimpleNamespace(Scheduler=Scheduler),
+            "sglang.srt.model_executor": ModuleType(
+                "sglang.srt.model_executor"
+            ),
+            "sglang.srt.model_executor.model_runner": SimpleNamespace(
+                ModelRunner=ModelRunner
+            ),
+        }
+        with patch.dict(sys.modules, modules), patch.dict(
+            "os.environ",
+            {
+                "EKV_ACTIVATION_POLICY": "off",
+                "EKV_PREFILL_HEADROOM_SCOPED": "1",
+                "EKV_PREFILL_WORKSPACE_BYTES_PER_TOKEN": "2",
+                "EKV_PREFILL_WORKSPACE_MAX_MIB": "1",
+            },
+        ):
+            activation.install_activation_hooks()
+            scheduler = Scheduler()
+
+        self.assertEqual(scheduler.get_new_batch_prefill(None), 30)
+        self.assertEqual(
+            scheduler.controller.ctrl.counters[
+                "activation_dynamic_prefill_prompt_tokens"
+            ],
+            15,
+        )
+        self.assertEqual(
+            activation.current_prefill_headroom(5),
+            0,
+        )
+        self.assertFalse(getattr(ModelRunner, "_ekv_activation_hooks", False))
 
     def test_prefill_protects_live_and_prospective_chunks_and_resamples(self):
         class Arena:

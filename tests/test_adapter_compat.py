@@ -4,7 +4,7 @@ from contextlib import nullcontext
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
-from elastic_kv import adapter
+from elastic_kv import activation, adapter
 
 
 def _module(name, **attributes):
@@ -463,6 +463,36 @@ class AdapterCompatibilityTest(unittest.TestCase):
 
         self.assertEqual(admitted, 10)
         self.assertNotIn("physical_limited_calls", ctrl.counters)
+
+    def test_phase_scoped_workspace_replaces_static_decode_headroom(self):
+        ctrl = object.__new__(adapter.Residency)
+        ctrl.admission_policy = "physical"
+        ctrl.pool = SimpleNamespace(device="cuda:0")
+        ctrl.arenas = [SimpleNamespace(planes=1, mapped_chunks={0, 1, 2})]
+        ctrl.chunk_bytes = 1_000
+        ctrl.slot_bytes = 100
+        ctrl.prefill_headroom_bytes = 500
+        ctrl.counters = {}
+        ctrl.precommitted = set()
+
+        with patch.multiple(
+            activation,
+            _PREFILL_HEADROOM_SCOPED=True,
+            _CONTEXT=activation.local(),
+        ), patch.object(
+            adapter.torch.cuda, "mem_get_info", return_value=(5_500, 10_000)
+        ):
+            decode_tokens = ctrl.physical_available_tokens(100, [(3, 103)])
+            decode_headroom = ctrl.counters["physical_headroom_bytes"]
+            with activation.prefill_admission_scope(750):
+                prefill_tokens = ctrl.physical_available_tokens(
+                    100, [(3, 103)]
+                )
+            prefill_headroom = ctrl.counters["physical_headroom_bytes"]
+
+        self.assertGreater(decode_tokens, prefill_tokens)
+        self.assertEqual(decode_headroom, 0)
+        self.assertEqual(prefill_headroom, 750)
 
 
 if __name__ == "__main__":

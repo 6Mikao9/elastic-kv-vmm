@@ -200,7 +200,10 @@ class Residency:
         )
         start = time.perf_counter_ns()
         free, _ = torch.cuda.mem_get_info(self.pool.device)
-        required_before_commit = self.prefill_headroom_bytes + chunk_cost
+        prefill_headroom = activation.current_prefill_headroom(
+            self.prefill_headroom_bytes
+        )
+        required_before_commit = prefill_headroom + chunk_cost
         if free < required_before_commit:
             start = time.perf_counter_ns()
             with torch.cuda.device(self.pool.device):
@@ -220,7 +223,7 @@ class Residency:
             )
             free = after
 
-        usable = max(0, free - self.prefill_headroom_bytes)
+        usable = max(0, free - prefill_headroom)
         chunk_budget = usable // chunk_cost
         backed_chunks = set(self.precommitted)
         if self.arenas:
@@ -257,7 +260,10 @@ class Residency:
                 position = segment_end
             if position < stop:
                 break
-        self.counters["physical_headroom_bytes"] = self.prefill_headroom_bytes
+        self.counters["physical_configured_headroom_bytes"] = (
+            self.prefill_headroom_bytes
+        )
+        self.counters["physical_headroom_bytes"] = prefill_headroom
         self.counters["physical_chunk_cost_bytes"] = chunk_cost
         self.counters["physical_available_tokens_min"] = min(
             self.counters.get("physical_available_tokens_min", admitted), admitted
