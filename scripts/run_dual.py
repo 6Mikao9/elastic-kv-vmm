@@ -169,6 +169,38 @@ def _package_version(name):
         return None
 
 
+def model_kv_geometry(path):
+    """Return dense KV bytes per token for TP1 from a local config snapshot."""
+    config_path = Path(path) / "config.json"
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        layers = int(config["num_hidden_layers"])
+        hidden_size = int(config["hidden_size"])
+        attention_heads = int(config["num_attention_heads"])
+        kv_heads = int(config.get("num_key_value_heads", attention_heads))
+        head_dim = int(config.get("head_dim", hidden_size // attention_heads))
+        dtype_name = str(
+            config.get("torch_dtype", config.get("dtype", "bfloat16"))
+        ).lower()
+        dtype_bytes = {
+            "float16": 2, "bfloat16": 2, "float32": 4,
+        }.get(dtype_name)
+        if dtype_bytes is None:
+            raise ValueError(f"unsupported cache dtype: {dtype_name}")
+    except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        return {"error_type": type(exc).__name__}
+    return {
+        "bytes_per_token": 2 * layers * kv_heads * head_dim * dtype_bytes,
+        "layers": layers,
+        "kv_heads": kv_heads,
+        "head_dim": head_dim,
+        "dtype": dtype_name,
+        "dtype_bytes": dtype_bytes,
+        "tensor_parallel_size": 1,
+        "formula": "2 * layers * kv_heads * head_dim * dtype_bytes / TP",
+    }
+
+
 def _torch_runtime():
     try:
         torch = importlib.import_module("torch")
@@ -206,6 +238,7 @@ def model_identity(path):
         "revision": revision,
         "files": files,
         "config_sha256": config_hashes,
+        "kv_geometry": model_kv_geometry(resolved),
     }
 
 
@@ -620,6 +653,39 @@ def phase_stem(scenario, repeat, warmup=False):
     return f"{prefix}-{scenario}"
 
 
+def build_phase_jobs(scenario, repeat, workload, warmup=False):
+    request_count = min(2, workload["requests_per_instance"]) if warmup else (
+        workload["requests_per_instance"]
+    )
+    return [
+        (instance, {
+            "request_id": (
+                f"{'warmup' if warmup else 'measured'}/{scenario}/{repeat}/"
+                f"{instance}/{index}"
+            ),
+            "instance": instance,
+            "input_tokens": workload["input_tokens"],
+            "requested_output_tokens": workload["output_tokens"],
+        })
+        for instance in SCENARIOS[scenario]
+        for index in range(request_count)
+    ]
+
+
+def estimate_phase_kv_bytes(scenario, workload, geometry):
+    instances = {}
+    for instance in SCENARIOS[scenario]:
+        value = geometry[instance].get("bytes_per_token")
+        if value is None:
+            raise ValueError(f"model {instance} has no dense KV geometry")
+        instances[instance] = (
+            workload["requests_per_instance"]
+            * (workload["input_tokens"] + workload["output_tokens"])
+            * value
+        )
+    return instances
+
+
 def wait_for_drain(stats_paths, timeout=30):
     """Wait for KV lifecycle completion instead of treating sleep as a drain."""
     started = time.perf_counter()
@@ -657,7 +723,7 @@ def wait_for_broker_owners(path, required_tenants=(), timeout=30):
     raise RuntimeError("broker has no complete set of live tenant owners after warmup")
 
 
-def run_synchronized(jobs, worker, timeout=30):
+def run_synchronized(jobs, worker, timeout=30, delay_ms=None):
     """Release every request dispatch point only after all workers are ready."""
     barrier = threading.Barrier(len(jobs))
     starts = []
@@ -665,6 +731,9 @@ def run_synchronized(jobs, worker, timeout=30):
 
     def dispatch(job):
         barrier.wait(timeout=timeout)
+        delay = 0 if delay_ms is None else delay_ms(job)
+        if delay:
+            time.sleep(delay / 1000.0)
         with starts_lock:
             starts.append(time.perf_counter())
         return worker(job)
@@ -675,14 +744,17 @@ def run_synchronized(jobs, worker, timeout=30):
     return records, starts
 
 
-def phase(scenario, repeat, stats_paths, warmup=False, broker_path=None):
-    jobs = [
-        (instance, {
-            "request_id": f"{'warmup' if warmup else 'measured'}/{scenario}/{repeat}/{instance}/{index}",
-            "instance": instance, "input_tokens": 1024, "requested_output_tokens": 128,
-        })
-        for instance in SCENARIOS[scenario] for index in range(4)
-    ]
+def phase(
+    scenario,
+    repeat,
+    stats_paths,
+    workload,
+    kv_geometry,
+    warmup=False,
+    broker_path=None,
+    broker_capacity_bytes=None,
+):
+    jobs = build_phase_jobs(scenario, repeat, workload, warmup=warmup)
     sampler = DualSampler(stats_paths, broker_path)
     with sampler:
         requests, starts = run_synchronized(
@@ -690,6 +762,7 @@ def phase(scenario, repeat, stats_paths, warmup=False, broker_path=None):
             lambda job: generate(
                 f"http://127.0.0.1:{PORTS[job[0]]}/generate", job[1], 120
             ),
+            delay_ms=lambda job: workload["arrival_delay_ms"].get(job[0], 0),
         )
         finished = time.perf_counter()
         started = min(starts)
@@ -732,12 +805,21 @@ def phase(scenario, repeat, stats_paths, warmup=False, broker_path=None):
         request.pop("_started_perf_s")
         request.pop("output_ids", None)
     output_tokens = sum(request["output_tokens"] for request in requests)
+    estimated_kv_bytes = estimate_phase_kv_bytes(scenario, workload, kv_geometry)
+    estimated_kv_bytes_total = sum(estimated_kv_bytes.values())
     return {
         "status": "ok", "scenario": scenario, "repeat": repeat,
         "warmup": warmup, "elapsed_s": elapsed, "drain_s": drain_s,
         "dispatch_skew_s": dispatch_skew_s,
         "input_tokens": sum(request["input_tokens"] for request in requests),
         "output_tokens": output_tokens, "output_tokens_per_s": output_tokens / elapsed,
+        "estimated_kv_bytes": estimated_kv_bytes,
+        "estimated_kv_bytes_total": estimated_kv_bytes_total,
+        "estimated_broker_capacity_bytes": broker_capacity_bytes,
+        "estimated_phase_to_broker_capacity_ratio": (
+            estimated_kv_bytes_total / broker_capacity_bytes
+            if broker_capacity_bytes else None
+        ),
         "requests": requests, "samples": sampler.samples,
         "active_window_s": [active_start, active_end],
         "active_sample_count": len(active_samples),
@@ -784,6 +866,12 @@ def summarize_phase(result):
             "input_tokens": result["input_tokens"],
             "output_tokens": result["output_tokens"],
             "output_tokens_per_s": result["output_tokens_per_s"],
+            "estimated_kv_bytes": result["estimated_kv_bytes"],
+            "estimated_kv_bytes_total": result["estimated_kv_bytes_total"],
+            "estimated_broker_capacity_bytes": result["estimated_broker_capacity_bytes"],
+            "estimated_phase_to_broker_capacity_ratio": (
+                result["estimated_phase_to_broker_capacity_ratio"]
+            ),
             "ttft_s": distribution([item["ttft_s"] for item in requests]),
             "tpot_s": distribution([item["tpot_s"] for item in requests]),
             "end_to_end_s": distribution([item["end_to_end_s"] for item in requests]),
@@ -871,6 +959,11 @@ def main():
     parser.add_argument("--broker-stale-seconds", type=int, default=120)
     parser.add_argument("--broker-demand-ttl-seconds", type=float, default=10.0)
     parser.add_argument("--broker-wait-ms", type=int, default=0)
+    parser.add_argument("--requests-per-instance", type=int, default=4)
+    parser.add_argument("--input-tokens", type=int, default=1024)
+    parser.add_argument("--output-tokens", type=int, default=128)
+    parser.add_argument("--arrival-delay-a-ms", type=int, default=0)
+    parser.add_argument("--arrival-delay-b-ms", type=int, default=0)
     parser.add_argument(
         "--skip-correctness-probe",
         action="store_true",
@@ -892,6 +985,22 @@ def main():
     models = {"a": args.model_a, "b": args.model_b}
     if not all(model.is_dir() for model in models.values()):
         parser.error("both model snapshots must exist locally")
+    if not 1 <= args.requests_per_instance <= 32:
+        parser.error("--requests-per-instance must be in [1, 32]")
+    if not 1 <= args.input_tokens <= 8192:
+        parser.error("--input-tokens must be in [1, 8192]")
+    if not 1 <= args.output_tokens <= 8191:
+        parser.error("--output-tokens must be in [1, 8191]")
+    if args.input_tokens + args.output_tokens > 8192:
+        parser.error("input plus output tokens must fit the 8192-token context")
+    if args.requests_per_instance * (
+        args.input_tokens + args.output_tokens
+    ) > 32768:
+        parser.error("configured requests exceed --max-total-tokens=32768")
+    if not 0 <= args.arrival_delay_a_ms <= 60000:
+        parser.error("--arrival-delay-a-ms must be in [0, 60000]")
+    if not 0 <= args.arrival_delay_b_ms <= 60000:
+        parser.error("--arrival-delay-b-ms must be in [0, 60000]")
     output = args.output_dir.resolve()
     broker_path = None if args.broker_path is None else args.broker_path.resolve()
     if broker_path is not None and broker_path.exists():
@@ -901,6 +1010,31 @@ def main():
     if not manifest["available"]:
         parser.error("Git source identity is required for a reproducible dual run")
     runtime = runtime_provenance(models)
+    kv_geometry = {
+        instance: metadata["kv_geometry"]
+        for instance, metadata in runtime["models"].items()
+    }
+    invalid_geometry = sorted(
+        instance for instance, value in kv_geometry.items()
+        if value.get("bytes_per_token") is None
+    )
+    if invalid_geometry:
+        parser.error(
+            "dense KV geometry is unavailable for model(s): "
+            + ", ".join(invalid_geometry)
+        )
+    workload = {
+        "requests_per_instance": args.requests_per_instance,
+        "input_tokens": args.input_tokens,
+        "output_tokens": args.output_tokens,
+        "arrival_delay_ms": {
+            "a": args.arrival_delay_a_ms,
+            "b": args.arrival_delay_b_ms,
+        },
+    }
+    broker_capacity_bytes = (
+        args.broker_mib * 1024 * 1024 if broker_path is not None else None
+    )
     output.mkdir(parents=True, exist_ok=False)
     stats_paths = {instance: output / f"{instance}.stats.json" for instance in PORTS}
     sampled_stats = stats_paths if args.mode == "v2" else {}
@@ -931,6 +1065,8 @@ def main():
             "mode": args.mode,
             "server_ports": dict(PORTS),
             "max_total_tokens_per_instance": 32768,
+            "workload": workload,
+            "kv_geometry": kv_geometry,
             "adapter_stats_available": bool(sampled_stats),
             "scope": (
                 "Two SGLang servers share one GPU with an optional cooperative "
@@ -965,6 +1101,7 @@ def main():
         "server_ports": dict(PORTS),
         "server_pids": {},
         "max_total_tokens_per_instance": 32768,
+        "workload": workload,
         "adapter_stats_available": bool(sampled_stats),
         "source_sha256": manifest["tree_sha256"],
         "broker": {
@@ -987,7 +1124,14 @@ def main():
             write_json(result_path, results)
         for scenario in SCENARIOS:
             warmup = phase(
-                scenario, 0, sampled_stats, warmup=True, broker_path=broker_path
+                scenario,
+                0,
+                sampled_stats,
+                workload,
+                kv_geometry,
+                warmup=True,
+                broker_path=broker_path,
+                broker_capacity_bytes=broker_capacity_bytes,
             )
             results["warmups"].append(write_phase_artifacts(output, warmup))
             write_json(result_path, results)
@@ -1003,7 +1147,13 @@ def main():
         for repeat in range(1, 4):
             for scenario in scenario_order(repeat):
                 measured = phase(
-                    scenario, repeat, sampled_stats, broker_path=broker_path
+                    scenario,
+                    repeat,
+                    sampled_stats,
+                    workload,
+                    kv_geometry,
+                    broker_path=broker_path,
+                    broker_capacity_bytes=broker_capacity_bytes,
                 )
                 results["phases"].append(write_phase_artifacts(output, measured))
                 write_json(result_path, results)

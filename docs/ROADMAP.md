@@ -36,7 +36,8 @@ with the original process: a lease is transferred only after successful
 executes `a-hot`, `b-hot` and `both-active` phases, synchronizes dispatch, and
 reverses hot-instance order across repeats. It writes raw request/sample files
 plus a runtime/source-bound summary and an untimed non-streaming correctness
-matrix. The next evidence is a
+matrix. Request count and prompt/output lengths are explicit, and results record
+the model-derived logical KV demand against broker capacity. The next evidence is a
 paired GPU run, including an unfair long-lived burst; MiniMax still needs its
 request-level pair driver. Until that run, the implemented weighted targets,
 anti-starvation, request-admission fallback and bounded retry are CPU and

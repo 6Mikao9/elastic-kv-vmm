@@ -11,6 +11,9 @@ from unittest.mock import patch
 from scripts.run_dual import (
     adapter_stats,
     broker_environment,
+    build_phase_jobs,
+    estimate_phase_kv_bytes,
+    model_kv_geometry,
     phase_stem,
     read_broker_snapshot,
     run_correctness_probes,
@@ -256,6 +259,10 @@ class DualBrokerRunnerTest(unittest.TestCase):
             "dispatch_skew_s": 0.001,
             "input_tokens": 1024,
             "output_tokens": 128,
+            "estimated_kv_bytes": {"a": 1024},
+            "estimated_kv_bytes_total": 1024,
+            "estimated_broker_capacity_bytes": 2048,
+            "estimated_phase_to_broker_capacity_ratio": 0.5,
             "output_tokens_per_s": 256,
             "requests": [request],
             "samples": [{
@@ -282,6 +289,10 @@ class DualBrokerRunnerTest(unittest.TestCase):
             "warmup": False, "elapsed_s": 0.5, "drain_s": 0.1,
             "dispatch_skew_s": 0.001,
             "input_tokens": 1024, "output_tokens": 128,
+            "estimated_kv_bytes": {"a": 1024},
+            "estimated_kv_bytes_total": 1024,
+            "estimated_broker_capacity_bytes": 2048,
+            "estimated_phase_to_broker_capacity_ratio": 0.5,
             "output_tokens_per_s": 256, "requests": [{
                 "request_id": "r", "ttft_s": 0.01,
                 "tpot_s": 0.02, "end_to_end_s": 0.5,
@@ -340,6 +351,29 @@ class DualBrokerRunnerTest(unittest.TestCase):
                 Path("broker.sqlite"), ("tenant-a", "tenant-b"), timeout=1
             )
         self.assertEqual(set(snapshot["owners"]), {"a", "b"})
+
+    def test_dense_kv_geometry_uses_gqa_head_count(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory)
+            Path(model / "config.json").write_text(
+                '{"num_hidden_layers":2,"hidden_size":128,'
+                '"num_attention_heads":4,"num_key_value_heads":2,'
+                '"head_dim":32,"torch_dtype":"bfloat16"}',
+                encoding="utf-8",
+            )
+            geometry = model_kv_geometry(model)
+        self.assertEqual(geometry["bytes_per_token"], 512)
+        self.assertEqual(geometry["kv_heads"], 2)
+
+    def test_configurable_workload_estimates_logical_kv_demand(self):
+        workload = {"requests_per_instance": 3, "input_tokens": 100, "output_tokens": 20}
+        jobs = build_phase_jobs("both-active", 1, workload)
+        self.assertEqual(len(jobs), 6)
+        estimate = estimate_phase_kv_bytes(
+            "both-active", workload,
+            {"a": {"bytes_per_token": 4}, "b": {"bytes_per_token": 8}},
+        )
+        self.assertEqual(estimate, {"a": 1440, "b": 2880})
 
 
 if __name__ == "__main__":

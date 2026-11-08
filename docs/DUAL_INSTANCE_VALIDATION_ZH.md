@@ -72,6 +72,12 @@ bash scripts/container_dual.sh 0 /path/to/huggingface/hub v2 \
 
 `observe` 跑通后仅改变为 `enforce`，其余参数、模型、工作负载和输出目录规则保持一致。
 每次运行必须使用全新的输出目录和 broker 文件。
+工作负载可用 `--requests-per-instance`、`--input-tokens` 和
+`--output-tokens` 显式配置。结果按模型 config 计算 TP1 dense KV bytes/token，
+并记录逻辑相位需求与 broker capacity 的比值；该比值是容量压力上界，
+不能替代对齐后的实际 lease 峰值和超卖采样。
+`--arrival-delay-a-ms` 和 `--arrival-delay-b-ms` 在统一 barrier 放行后施加
+显式到达偏移，用于先占/后发的不公平突发；实际 dispatch skew 写入相位结果。
 
 最小结果结构如下，原始 samples 和 requests 单独保存，汇总只从原始产物生成：
 
@@ -210,7 +216,7 @@ non_vmm_reserved
 
 ## 9. 实施顺序
 
-1. `run_dual.py` 已接入 broker 配置、只读 snapshot、两租户 owner 校验、同步 dispatch barrier、非流式正确性探针、镜像/源码/模型/GPU/native 运行时溯源、完整 adapter 计数、显式 drain 等待、失败快照和逐相位 raw 文件。三轮测量按 `a-hot, b-hot, both-active` 与 `b-hot, a-hot, both-active` 交替；分阶段 transition、显式过量 burst 和真实 broker runner 集成测试仍待加入。
+1. `run_dual.py` 已接入 broker 配置、只读 snapshot、两租户 owner 校验、同步 dispatch barrier、非流式正确性探针、可配置负载/到达偏移与逻辑 KV 压力估算、镜像/源码/模型/GPU/native 运行时溯源、完整 adapter 计数、显式 drain 等待、失败快照和逐相位 raw 文件。三轮测量按 `a-hot, b-hot, both-active` 与 `b-hot, a-hot, both-active` 交替；分阶段 transition 和真实 broker runner 集成测试仍待加入。
 2. 先跑 `isolated`、`shared-off` 和 `fair-observe` 的 CPU/单实例兼容检查，确认输出 JSON、租约不超卖和失败路径。
 3. 在空闲 A100 上跑 dense 三种 arm 的双实例配对，验证负载反转、同时突发和 drain。
 4. 启用 `fair-enforce`，检查公平拒绝和空闲回收；不要在此阶段声称 active KV 抢占。

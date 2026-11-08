@@ -149,6 +149,11 @@ at the share boundary while preserving atomic mapping failure semantics.
   full output IDs in `correctness.json`; paired baseline/VMM runs can compare
   the same prompt and output hashes. Broker warmup now requires every configured
   tenant owner, not merely one owner, before measured phases begin.
-- Still open before a GPU acceptance claim: staged transition/burst arrival
-  schedules, a real-broker runner integration test, cleanup-failure persistence,
+- Request count, prompt length and output length are explicit CLI parameters.
+  The runner derives dense TP1 KV bytes/token from each model config and records
+  the logical phase-demand/broker-capacity ratio; chunk alignment and observed
+  lease peaks remain authoritative. Per-instance arrival delays are applied
+  after the common barrier and the measured dispatch skew is retained.
+- Still open before a GPU acceptance claim: multi-stage transition schedules, a
+  real-broker runner integration test, cleanup-failure persistence,
   and the paired isolated/shared/observe/enforce GPU matrix itself.

@@ -25,6 +25,10 @@ def summarize(data, mode, directory):
     require(data.get("status") == "complete" and data.get("arm") == mode
             and data["mode"] == mode and data["models"] == {"a": "0.6B", "b": "4B"},
             "Unexpected mode or model assignment")
+    workload = data["workload"]
+    request_count = workload["requests_per_instance"]
+    input_tokens = workload["input_tokens"]
+    requested_output_tokens = workload["output_tokens"]
     phases = {(p["scenario"], p["repeat"]): p for p in data["phases"]}
     require(len(data["phases"]) == 9
             and phases.keys() == {(s, r) for s in SCENARIOS for r in range(1, 4)},
@@ -36,16 +40,16 @@ def summarize(data, mode, directory):
             records, samples = load_phase(directory, phase)
             details = phase["summary"]
             expected = {f"measured/{scenario}/{repeat}/{i}/{n}"
-                        for i in instances for n in range(4)}
+                        for i in instances for n in range(request_count)}
             require(len(records) == len(expected)
                     and {r["request_id"] for r in records} == expected,
                     "Missing or duplicate measured requests")
-            require(all(r["output_tokens"] == r["requested_output_tokens"] == 128
-                        and r["input_tokens"] == 1024 and r["output_ids_complete"]
+            require(all(r["output_tokens"] == r["requested_output_tokens"] == requested_output_tokens
+                        and r["input_tokens"] == input_tokens and r["output_ids_complete"]
                         and r["output_ids_sha256"] and r["ttft_s"] > 0 and r["tpot_s"] > 0
                         for r in records), "Incomplete measured response")
-            output_tokens = sum(r["output_tokens"] for r in records)
-            require(output_tokens == details["output_tokens"] and details["elapsed_s"] > 0,
+            phase_output_tokens = sum(r["output_tokens"] for r in records)
+            require(phase_output_tokens == details["output_tokens"] and details["elapsed_s"] > 0,
                     "Invalid phase timing or token count")
             count = details["active_sample_count"]
             require(0 < count < len(samples)
@@ -65,7 +69,7 @@ def summarize(data, mode, directory):
                 active_samples = samples[:count]
             active.extend(s["device_used_bytes"] for s in active_samples)
             idle.append(phase["idle"]["device_used_bytes"])
-            rates.append(output_tokens / details["elapsed_s"])
+            rates.append(phase_output_tokens / details["elapsed_s"])
             requests.extend(records)
         yield {
             "mode": mode, "scenario": scenario, "repeats": 3, "requests": len(requests),
@@ -83,11 +87,18 @@ def main():
     args = parser.parse_args()
     rows = []
     prompts = {}
+    workloads = {}
+    correctness = {}
     try:
         for mode in ("baseline", "v2"):
             directory = args.directory / mode
             data = json.loads((directory / "results.json").read_text(encoding="utf-8"))
             rows.extend(summarize(data, mode, directory))
+            workloads[mode] = data["workload"]
+            correctness[mode] = {
+                instance: values["output_ids_sha256"]
+                for instance, values in data["correctness"]["instances"].items()
+            }
             prompts[mode] = {
                 (phase["scenario"], phase["repeat"], record["request_id"]):
                 record["prompt_sha256"]
@@ -96,6 +107,10 @@ def main():
             }
         require(all(prompts["baseline"].values()) and prompts["baseline"] == prompts["v2"],
                 "Measured request IDs or prompt hashes differ between modes")
+        require(workloads["baseline"] == workloads["v2"],
+                "Measured workloads differ between modes")
+        require(correctness["baseline"] == correctness["v2"],
+                "Non-streaming correctness hashes differ between modes")
         (args.directory / "summary.json").write_text(
             json.dumps({"scenarios": rows}, indent=2, allow_nan=False) + "\n", encoding="utf-8")
         with (args.directory / "summary.csv").open("w", encoding="utf-8", newline="") as stream:
