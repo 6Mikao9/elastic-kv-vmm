@@ -5,6 +5,8 @@ from pathlib import Path
 
 import torch
 
+from .future_residency import decide_resident_claim
+
 
 def install_request_residency():
     limit = int(os.environ.get("EKV_RESIDENT_LIMIT", "0"))
@@ -22,6 +24,16 @@ def install_request_residency():
     reserve = int(os.environ.get("EKV_RESIDENT_FREE_RESERVE", "0"))
     if limit < 0 or reserve <= 0:
         raise ValueError("Static residency requires a positive physical slot reserve")
+    hint_policy = os.environ.get("EKV_RESIDENT_HINT_POLICY", "off")
+    if hint_policy not in ("off", "adaptive"):
+        raise ValueError("EKV_RESIDENT_HINT_POLICY must be off or adaptive")
+    if hint_policy == "adaptive" and os.environ.get("EKV_FUTURE_POLICY", "off") == "off":
+        raise ValueError("adaptive resident hints require the future scheduler hook")
+    minimum_hint_tokens = int(
+        os.environ.get("EKV_RESIDENT_MIN_HINT_OUTPUT_TOKENS", "256")
+    )
+    if minimum_hint_tokens < 1:
+        raise ValueError("resident hint output threshold must be positive")
 
     from sglang.srt.layers.attention import minimax_sparse_backend as backend
     from sglang.srt.managers import hisparse_coordinator as coordinator
@@ -56,6 +68,8 @@ def install_request_residency():
     original_abort = cls.abort_staging_request
     attn = backend.MiniMaxSparseAttnBackend
     original_swap = attn._hisparse_swap_in_blocks
+    if hint_policy == "adaptive":
+        from .sglang_future_hook import _extract_hint
 
     def initialize(self, *args, **kwargs):
         if (not cuda_graph_fully_disabled() or not get_schedule().disable_overlap_schedule
@@ -69,28 +83,82 @@ def install_request_residency():
         self._ekv_decode_rows = None
         self._ekv_residency_stats = {"resident_admissions": 0, "native_admissions": 0,
                                      "resident_decode_rows": 0, "native_decode_rows": 0,
-                                     "mixed_decode_batches": 0, "resident_layer_rows": 0}
+                                     "mixed_decode_batches": 0, "resident_layer_rows": 0,
+                                     "future_hint_claim_attempts": 0, "future_hint_declines": 0,
+                                     "future_hint_missing": 0, "future_hint_invalid": 0,
+                                     "future_decision_reasons": {}}
 
     def stage(self, req):
-        if (len(self._ekv_resident) < limit
-                and req.kv.kv_allocated_len > self.device_buffer_size):
-            available = self.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size()
-            # Match the decision on every TP worker before changing staging order.
-            slots = torch.tensor(available, dtype=torch.int64, device="cpu")
-            if self.tp_world_size > 1:
-                torch.distributed.all_reduce(slots, op=torch.distributed.ReduceOp.MIN,
-                                             group=self.tp_group)
-            if slots.item() >= reserve:
-                event = torch.cuda.Event()
-                event.record()
-                self._ekv_resident.add(req.kv.req_pool_idx)
-                self._ekv_residency_stats["resident_admissions"] += 1
-                req.hisparse_staging = True
-                # Preserve native queue order, TP readiness and scheduler admission.
-                self.ack_staging_queue.append(coordinator.HiSparseAct(event, event, req))
-                return
-        self._ekv_residency_stats["native_admissions"] += 1
-        original_stage(self, req)
+        stats = self._ekv_residency_stats
+
+        def adopt_native(reason=None):
+            stats["native_admissions"] += 1
+            if reason is not None:
+                reasons = stats["future_decision_reasons"]
+                reasons[reason] = reasons.get(reason, 0) + 1
+            original_stage(self, req)
+
+        slots_available = len(self._ekv_resident) < limit
+        claim = True
+        decline_reason = None
+        if hint_policy == "adaptive":
+            try:
+                hint = _extract_hint(req)
+            except (AttributeError, TypeError, ValueError):
+                hint = None
+                stats["future_hint_invalid"] += 1
+            if hint is None:
+                stats["future_hint_missing"] += 1
+                residence = expected = None
+            else:
+                residence = hint.residence
+                expected = hint.expected_output_tokens
+            decision = decide_resident_claim(
+                sequence_tokens=req.kv.kv_allocated_len,
+                native_buffer_tokens=self.device_buffer_size,
+                slots_available=slots_available,
+                hint_residence=residence,
+                expected_output_tokens=expected,
+                minimum_hint_output_tokens=minimum_hint_tokens,
+            )
+            claim = decision.claim
+            if not claim:
+                decline_reason = decision.reason
+        elif not slots_available or req.kv.kv_allocated_len <= self.device_buffer_size:
+            claim = False
+
+        # Every TP worker must take the collective path before any rank can
+        # switch to the native staging queue. A local disagreement therefore
+        # becomes a common conservative fallback instead of a collective hang.
+        intent = torch.tensor(int(claim), dtype=torch.int64, device="cpu")
+        if self.tp_world_size > 1:
+            torch.distributed.all_reduce(intent, op=torch.distributed.ReduceOp.MIN,
+                                         group=self.tp_group)
+        if not intent.item():
+            if hint_policy == "adaptive":
+                stats["future_hint_declines"] += 1
+                decline_reason = decline_reason or "peer-declined"
+            adopt_native(decline_reason)
+            return
+        if hint_policy == "adaptive":
+            stats["future_hint_claim_attempts"] += 1
+
+        available = self.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size()
+        # Match the decision on every TP worker before changing staging order.
+        slots = torch.tensor(available, dtype=torch.int64, device="cpu")
+        if self.tp_world_size > 1:
+            torch.distributed.all_reduce(slots, op=torch.distributed.ReduceOp.MIN,
+                                         group=self.tp_group)
+        if slots.item() < reserve:
+            adopt_native("insufficient-physical-reserve")
+            return
+        event = torch.cuda.Event()
+        event.record()
+        self._ekv_resident.add(req.kv.req_pool_idx)
+        stats["resident_admissions"] += 1
+        req.hisparse_staging = True
+        # Preserve native queue order, TP readiness and scheduler admission.
+        self.ack_staging_queue.append(coordinator.HiSparseAct(event, event, req))
 
     def allocate_buffer(self, req):
         if req.kv.req_pool_idx not in self._ekv_resident:

@@ -43,9 +43,10 @@ _stats = {
 class FutureHint:
     release_after_ms: int = 0
     deadline_after_ms: int | None = None
-    expected_output_tokens: int = 1
+    expected_output_tokens: int | None = None
     weight: float = 1.0
     kind: str = "generic"
+    residence: str | None = None
 
     @classmethod
     def from_payload(cls, payload: Any) -> "FutureHint":
@@ -67,8 +68,11 @@ class FutureHint:
         deadline = None if deadline_raw is None else _bounded_int(deadline_raw, "deadline_after_ms")
         if deadline is not None and deadline < release:
             raise ValueError("deadline_after_ms precedes release_after_ms")
-        expected = _bounded_int(
-            payload.get("expected_output_tokens", 1), "expected_output_tokens", minimum=1
+        expected_raw = payload.get("expected_output_tokens")
+        expected = (
+            None
+            if expected_raw is None
+            else _bounded_int(expected_raw, "expected_output_tokens", minimum=1)
         )
         weight = payload.get("weight", 1.0)
         if isinstance(weight, bool) or not isinstance(weight, (int, float)):
@@ -79,10 +83,10 @@ class FutureHint:
         kind = payload.get("kind", "generic")
         if not isinstance(kind, str) or not kind or len(kind) > 64:
             raise ValueError("kind must be a short non-empty string")
-        residence = payload.get("residence", "auto")
-        if residence not in ("auto", "resident", "host_backed"):
+        residence = payload.get("residence")
+        if residence is not None and residence not in ("auto", "resident", "host_backed"):
             raise ValueError("invalid residence hint")
-        return cls(release, deadline, expected, weight, kind)
+        return cls(release, deadline, expected, weight, kind, residence)
 
 
 def _bounded_int(value: Any, name: str, *, minimum: int = 0) -> int:
@@ -165,19 +169,26 @@ def order_requests(
         age_ms = _request_age_ms(request, now_s)
         released = age_ms >= hint.release_after_ms
         prefill_ms = 1000.0 * _prompt_tokens(request) / prefill_tokens_per_s
-        decode_ms = 1000.0 * hint.expected_output_tokens / decode_tokens_per_s
+        decode_ms = 1000.0 * (hint.expected_output_tokens or 1) / decode_tokens_per_s
         estimated_request_ms = prefill_ms + decode_ms
         latest_start = (
             float("inf")
             if hint.deadline_after_ms is None
             else hint.deadline_after_ms - age_ms - estimated_request_ms
         )
+        residency_rank = {
+            "resident": 0,
+            None: 1,
+            "auto": 1,
+            "host_backed": 2,
+        }[hint.residence]
         decorated.append(
             (
                 0 if released else 1,
                 0 if hint.deadline_after_ms is not None else 1,
                 latest_start,
                 -hint.weight,
+                residency_rank,
                 estimated_request_ms,
                 hint.release_after_ms,
                 native_order,

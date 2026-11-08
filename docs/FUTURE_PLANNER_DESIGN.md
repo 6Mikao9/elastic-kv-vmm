@@ -14,6 +14,13 @@ GPU 结果出来前，不把规划收益写成已证实的性能收益。
 和 CUDA Graph 服务中通过 VMM+future 集成 smoke。当前证据只证明链路和回退行为，
 尚不能当成服务端吞吐或延迟收益。
 
+在驻留准入侧，`adaptive_sparse/future_residency.py` 已把同一份 hint 中的
+`residence` 与预计输出长度变成一个确定性的“是否占用完整 GPU KV 槽”决策，
+并由 `adaptive_sparse/request_residency.py` 仅在
+`EKV_RESIDENT_HINT_POLICY=adaptive` 时启用。默认 `off` 保持此前的长请求默认
+策略，避免改变已有实验。当前消费点只覆盖请求进入 HiSparse staging 时的选择，
+尚未把未来的 prefill 激活硬预算或运行中抢占纳入同一次决策。
+
 ## 1. 要解决的问题
 
 输入不是传统的未知到达流量，而是一段可提前看到的请求集合。每个请求至少可提供：
@@ -89,8 +96,10 @@ Mamba 和 paged allocator 约束仍由原生 `PrefillAdder` 决定。规划器�
 
 ## 3. 模块边界
 
-建议新增 `adaptive_sparse/future_plan.py`，只包含纯 Python 决策；GPU 与 SGLang
-适配放在独立的 `install_future_planner()` 中。
+`adaptive_sparse/future_plan.py` 只包含纯 Python 决策；GPU 与 SGLang
+适配放在独立的 hook 中。当前离线 profile 已支持 `auto`、`resident` 和
+`host_backed` 三种驻留偏好，并用其约束模拟器可选的 residency mode；
+`auto_resident_output_threshold` 可让离线回放使用与在线相同的短输出阈值。
 
 ```text
 KvHintsEnvelope
@@ -205,6 +214,36 @@ MVP 动作优先级：
 
 第一阶段只输出建议并记录“若执行”的结果。只有在离线回放和 GPU smoke 证明
 决策正确后，才让建议触发真实迁移。
+
+### 5.1 已实现的请求级驻留准入切片
+
+当前先实现最容易独立验证的一步：请求已完成 prefill、准备进入 HiSparse
+staging 时，决定它使用原生有界热池，还是占用一个完整 GPU KV 驻留槽。策略是纯
+CPU、确定性的，并且每个 TP rank 使用相同的 hint；真正的 admission 仍受
+`EKV_RESIDENT_FREE_RESERVE` 和所有 rank 的最小可用物理容量约束。
+
+| `residence` | 当前行为 |
+|---|---|
+| `host_backed` | 放弃完整驻留槽，使用原生 HiSparse 热池 |
+| `resident` | 有槽和物理 reserve 时请求完整驻留 |
+| `auto` | 预计输出不少于阈值时驻留，否则使用原生热池 |
+| 缺失 hint | 保持旧行为：超过原生热池容量的长请求可驻留 |
+
+`resident` 是带容量的软偏好：槽不足、物理 reserve 不足，或请求本身已能完整
+放入原生热池时，在线路径会回退；离线模拟器也记录
+`hint-resident-falls-back`，不会为了遵守提示而制造超预算或死锁。`host_backed`
+仍可在未使用额外完整驻留槽时选择原生热池。
+
+运行器新增两个显式参数：`--resident-hint-policy adaptive` 和
+`--resident-min-hint-output-tokens`。前者必须与 `--future-policy deadline`、
+`--resident-limit` 同时启用；后者的运行器默认值为 128，因此当前
+`mixed12k_unequal` 中 12K/128 的长请求可以申请驻留，12K/64 的长请求会
+退到原生热池。统计写入每 rank 的 `request_residency` telemetry，至少观察
+`future_hint_claim_attempts`、`future_hint_declines`、`future_hint_missing`、
+`future_hint_invalid` 和 `future_decision_reasons`。
+
+这一步的验收目标是“占用槽的请求确实是策略希望保护的请求”，而不是仅凭驻留
+请求数宣称加速。性能结论仍需和静态驻留、原生 HiSparse 在同一独占窗口配对比较。
 
 ## 6. 状态机与失败回退
 

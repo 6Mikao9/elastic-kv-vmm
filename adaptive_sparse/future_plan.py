@@ -21,6 +21,8 @@ import math
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from .future_residency import RESIDENCE_HINTS
+
 
 POLICIES = ("fifo", "longest", "mode-aware", "future")
 
@@ -51,6 +53,7 @@ class RequestProfile:
     deadline_ms: int | None = None
     prefix_group: str | None = None
     shared_prefix_tokens: int = 0
+    residence_hint: str = "auto"
 
     def __post_init__(self) -> None:
         if not self.request_id:
@@ -67,6 +70,8 @@ class RequestProfile:
             raise ValueError(f"{self.request_id}: invalid shared_prefix_tokens")
         if self.shared_prefix_tokens and not self.prefix_group:
             raise ValueError(f"{self.request_id}: prefix_group is required for reuse")
+        if self.residence_hint not in RESIDENCE_HINTS:
+            raise ValueError(f"{self.request_id}: invalid residence_hint")
 
     @property
     def sequence_tokens(self) -> int:
@@ -92,6 +97,7 @@ class PlannerConfig:
     sparse_decode_tokens_per_ms: float = 16.0
     max_active_requests: int = 8
     lookahead_ms: int = 0
+    auto_resident_output_threshold: int = 1
 
     def __post_init__(self) -> None:
         positive_ints = {
@@ -99,6 +105,7 @@ class PlannerConfig:
             "kv_bytes_per_token": self.kv_bytes_per_token,
             "sparse_hot_tokens": self.sparse_hot_tokens,
             "max_active_requests": self.max_active_requests,
+            "auto_resident_output_threshold": self.auto_resident_output_threshold,
         }
         for name, value in positive_ints.items():
             if value < 1:
@@ -260,11 +267,34 @@ def _feasible_mode(
         return None
     active_bytes = sum(item.admission.resident_kv_bytes for item in active)
     workspace = request.prompt_tokens * config.prefill_workspace_bytes_per_token
-    order = (preferred, ResidencyMode.HI_SPARSE if preferred is ResidencyMode.RESIDENT else ResidencyMode.RESIDENT)
+    native_hold = _hold_bytes(request, ResidencyMode.HI_SPARSE, config)
+    if request.sequence_tokens <= config.sparse_hot_tokens:
+        if active_bytes + workspace + native_hold <= config.memory_budget_bytes:
+            return ResidencyMode.HI_SPARSE, "fits-native-hot-set"
+        return None
+    if request.residence_hint == "resident":
+        order = (ResidencyMode.RESIDENT, ResidencyMode.HI_SPARSE)
+    elif request.residence_hint == "host_backed":
+        order = (ResidencyMode.HI_SPARSE,)
+    elif request.output_tokens < config.auto_resident_output_threshold:
+        order = (ResidencyMode.HI_SPARSE,)
+    else:
+        order = (preferred, ResidencyMode.HI_SPARSE if preferred is ResidencyMode.RESIDENT else ResidencyMode.RESIDENT)
     for mode in order:
         hold = _hold_bytes(request, mode, config)
         if active_bytes + workspace + hold <= config.memory_budget_bytes:
-            reason = "fits-resident" if mode is ResidencyMode.RESIDENT else "fits-bounded-hot-set"
+            if request.residence_hint == "resident":
+                reason = (
+                    "hint-resident"
+                    if mode is ResidencyMode.RESIDENT
+                    else "hint-resident-falls-back"
+                )
+            elif request.residence_hint == "host_backed":
+                reason = "hint-requires-bounded-hot-set"
+            elif request.output_tokens < config.auto_resident_output_threshold:
+                reason = "hint-short-auto"
+            else:
+                reason = "fits-resident" if mode is ResidencyMode.RESIDENT else "fits-bounded-hot-set"
             return mode, reason
     return None
 
@@ -330,7 +360,10 @@ def _select(
         modes: list[tuple[ResidencyMode, str]] = [first]
         sparse_spare = _hold_bytes(choice, ResidencyMode.HI_SPARSE, config)
         workspace = choice.prompt_tokens * config.prefill_workspace_bytes_per_token
-        if first[0] is ResidencyMode.RESIDENT and active_bytes + sparse_spare + workspace <= config.memory_budget_bytes:
+        if (choice.residence_hint == "auto"
+                and choice.output_tokens >= config.auto_resident_output_threshold
+                and first[0] is ResidencyMode.RESIDENT
+                and active_bytes + sparse_spare + workspace <= config.memory_budget_bytes):
             modes.append((ResidencyMode.HI_SPARSE, "lookahead-protects-imminent-demand"))
         for mode, reason in modes:
             displaced = _future_contention(choice, mode, active_bytes, pending, future, now_ms, config)

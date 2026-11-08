@@ -55,6 +55,12 @@ deadline r2 的 future telemetry 为 84 个 scheduler tick、1 次队列重排�
 
 非自适应轮次结束时，每个 rank 的 VMM backing 从约 960 MiB 峰值回到 240 MiB，`owned_pages=0`、`reclaimable_bytes=0`。240 MiB 是 sink、保留映射和驱动粒度等仍存活引用的结果，不能写成“空闲占用为零”。自动压力轮次仍保留相同 sink 基线。
 
+## 请求级驻留提示的下一切片
+
+上面的已测矩阵让 future hint 影响等待顺序，但驻留槽的选择仍沿用长请求默认规则。代码现新增了默认关闭的请求级策略：在请求进入 HiSparse staging 时读取同一 hint 的 `residence`。`host_backed` 主动放弃完整 GPU 槽，`resident` 在有槽和物理 reserve 时请求完整驻留，`auto` 依据预计输出长度与阈值选择。运行入口为 `--resident-hint-policy adaptive`，并要求同时启用 `--future-policy deadline` 与 `--resident-limit`。
+
+当前 `mixed12k_unequal` 的验收设计是阈值 128：一个 12K 输入、64 输出 token 的长请求退到原生热池；另一个 12K 输入、128 输出 token 的长请求可申请驻留。该切片目前只有纯策略、排序和源码接入验证；尚未在独占 A100 上完成 paired run，因此不能把“少占槽”或“命中预期请求”写成性能收益。后续需要同时检查每 rank 的 `future_decision_reasons`、真实驻留层行数、TTFT/TPOT、VMM backing 和整卡 NVML。
+
 ## 正确性与可复现门禁
 
 - 两组自适应轮次的语义烟测通过，请求 token 数完整。

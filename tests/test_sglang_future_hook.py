@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from adaptive_sparse import sglang_future_hook as hook
+from adaptive_sparse.future_residency import decide_resident_claim
 from adaptive_sparse.sglang_future_hook import apply_to_waiting_queue, order_requests, snapshot_stats
 
 
@@ -25,6 +26,21 @@ def request(name, prompt, created, payload):
 
 
 class SGLangFutureHookTest(unittest.TestCase):
+    def test_legacy_hint_fields_remain_distinguishable_from_omitted_values(self):
+        hint = hook.FutureHint.from_payload({"deadline_after_ms": 50})
+        self.assertIsNone(hint.residence)
+        self.assertIsNone(hint.expected_output_tokens)
+        decision = decide_resident_claim(
+            sequence_tokens=8192,
+            native_buffer_tokens=4096,
+            slots_available=True,
+            hint_residence=hint.residence,
+            expected_output_tokens=hint.expected_output_tokens,
+            minimum_hint_output_tokens=128,
+        )
+        self.assertTrue(decision.claim)
+        self.assertEqual(decision.reason, "long-request-default")
+
     def test_deadline_reorders_after_native_priority(self):
         long = request(
             "long",
@@ -96,6 +112,53 @@ class SGLangFutureHookTest(unittest.TestCase):
         second = request("second", 10, 1.0, {"deadline_after_ms": 100})
         ordered = order_requests([first, second], now_s=1.0)
         self.assertEqual([item.request_id for item in ordered], ["first", "second"])
+
+    def test_residency_hint_orders_equal_priority_work(self):
+        background = request(
+            "background",
+            100,
+            1.0,
+            {"expected_output_tokens": 1000, "residence": "host_backed"},
+        )
+        automatic = request(
+            "automatic",
+            100,
+            1.0,
+            {"expected_output_tokens": 1000, "residence": "auto"},
+        )
+        critical = request(
+            "critical",
+            100,
+            1.0,
+            {"expected_output_tokens": 1000, "residence": "resident"},
+        )
+        ordered = order_requests(
+            [background, automatic, critical], now_s=1.01
+        )
+        self.assertEqual(
+            [item.request_id for item in ordered],
+            ["critical", "automatic", "background"],
+        )
+
+    def test_deadline_still_precedes_residency_tie_break(self):
+        resident = request(
+            "resident",
+            100,
+            1.0,
+            {"expected_output_tokens": 1000, "residence": "resident"},
+        )
+        urgent = request(
+            "urgent",
+            100,
+            1.0,
+            {
+                "expected_output_tokens": 1000,
+                "deadline_after_ms": 50,
+                "residence": "host_backed",
+            },
+        )
+        ordered = order_requests([resident, urgent], now_s=1.01)
+        self.assertEqual([item.request_id for item in ordered], ["urgent", "resident"])
 
     def test_missing_matched_prefix_count_is_treated_as_zero(self):
         item = request("fresh", 10, 1.0, {"deadline_after_ms": 100})

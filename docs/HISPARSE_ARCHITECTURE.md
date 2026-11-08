@@ -67,6 +67,19 @@ allocator page for the newest token. The native top-k budget specifies
 selected blocks. The hot-buffer capacity also has to accommodate those
 selections and the coordinator's layout constraints.
 
+## Known-future hint consumer
+
+The opt-in future path can carry a `residence` hint with each request.
+At HiSparse staging admission, `host_backed` yields the complete-GPU slot,
+`resident` requests it when capacity exists, and `auto` compares predicted
+output length with a configured threshold. This decision runs after the
+request and its prompt are known, so it can use the observed allocated KV
+length. All TP ranks apply the same policy and the existing physical-reserve
+vote remains authoritative. Missing hints preserve the legacy long-request
+default; the feature is inert unless `EKV_RESIDENT_HINT_POLICY=adaptive`.
+[Hint residency policy](../adaptive_sparse/future_residency.py) ·
+[Future scheduler hook](../adaptive_sparse/sglang_future_hook.py)
+
 ## Budget and migration
 
 The scheduler evaluates committed main-KV backing at safe eager

@@ -33,6 +33,14 @@ Prefill activation allocation and MiniMax CUDA Graph support remain
 separate extensions. A configured prefill headroom term is not ownership
 of the activation allocator. See the [research report](HISPARSE_REPORT_ZH.md).
 
+Known-future rollout hints now have two connected consumers: the scheduler can
+stabilize the waiting order after SGLang's native policy, and an opt-in
+request-residency policy can decide whether a long request claims a complete-GPU
+KV slot or stays on the native bounded HiSparse path. The latter is enabled with
+`--resident-hint-policy adaptive`; it remains disabled by default and still
+passes every native capacity check. This is an integrated mechanism, not yet a
+measured end-to-end speed result.
+
 ### Performance targets and next optimizations (2026-11-04)
 
 The dynamic policy has two reference targets: approach fully GPU-resident

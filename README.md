@@ -108,6 +108,13 @@ share one process without changing sampling or attention behavior. See [the
 compatibility boundary](docs/KV_HINTS_COMPAT.md), [scheduler integration
 design](docs/FUTURE_PLANNER_DESIGN.md), and [smoke script](scripts/container_future_smoke.sh).
 
+The MiniMax request-residency path can consume the same hint. With
+`--resident-hint-policy adaptive`, `host_backed` yields a complete-GPU KV slot,
+`resident` requests one when capacity and the per-rank reserve permit it, and
+`auto` uses the predicted output length. The policy is opt-in and remains below
+SGLang's native admission and physical-reserve checks. Its paired GPU experiment
+is specified in the [HiSparse reproduction guide](docs/HISPARSE_REPRODUCE.md).
+
 Summarize only explicitly selected completed runs:
 
 ```bash

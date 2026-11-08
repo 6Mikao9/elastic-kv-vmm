@@ -76,6 +76,39 @@ def check_capacity(opener, requested, ratio):
             "derivation": "Audited MiniMax pool and allocator code; logical/index capacity is physical pool size times ratio."}
 
 
+def validate_resident_hint_options(parser, *, policy, minimum_tokens, resident_limit, future_policy):
+    if minimum_tokens < 1:
+        parser.error("resident hint output threshold must be positive")
+    if policy == "adaptive" and (not resident_limit or future_policy == "off"):
+        parser.error("adaptive resident hints require future hints and request residency")
+
+
+def resident_hint_environment(policy, minimum_tokens, resident_limit):
+    if not resident_limit:
+        return {}
+    return {
+        "EKV_RESIDENT_HINT_POLICY": policy,
+        "EKV_RESIDENT_MIN_HINT_OUTPUT_TOKENS": str(minimum_tokens),
+    }
+
+
+def resident_hint_manifest(policy, minimum_tokens):
+    return {
+        "resident_hint_policy": policy,
+        "resident_min_hint_output_tokens": minimum_tokens,
+    }
+
+
+def resident_hint_sources(resident_limit):
+    if not resident_limit:
+        return ()
+    return (
+        "adaptive_sparse/request_residency.py",
+        "adaptive_sparse/future_residency.py",
+        "adaptive_sparse/resident_lookup.py",
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", type=Path, required=True)
@@ -114,6 +147,8 @@ def main():
     parser.add_argument("--validation-tail-new-tokens", type=int, default=0)
     parser.add_argument("--resident-resolver", choices=("torch", "triton"), default="torch")
     parser.add_argument("--resident-full-batch-swap", action="store_true")
+    parser.add_argument("--resident-hint-policy", choices=("off", "adaptive"), default="off")
+    parser.add_argument("--resident-min-hint-output-tokens", type=int, default=128)
     parser.add_argument("--adaptive-budget-mib", type=int, default=0)
     parser.add_argument("--adaptive-low-mib", type=int, default=0)
     parser.add_argument("--adaptive-prefill-headroom-mib", type=int, default=0)
@@ -169,6 +204,13 @@ def main():
         parser.error("chunk-aware retention requires adaptive migrations")
     if args.resident_full_batch_swap and (not args.resident_limit or args.resident_resolver != "triton"):
         parser.error("full-batch swap requires resident requests and Triton resolver")
+    validate_resident_hint_options(
+        parser,
+        policy=args.resident_hint_policy,
+        minimum_tokens=args.resident_min_hint_output_tokens,
+        resident_limit=args.resident_limit,
+        future_policy=args.future_policy,
+    )
     if args.adaptive_plan_capture and not args.logical_shadow:
         parser.error("allocation plan capture is diagnostic and requires logical shadow")
     if (args.adaptive_force_demote_step or args.adaptive_force_promote_step) and not args.logical_shadow:
@@ -243,6 +285,7 @@ def main():
         environment.pop("EKV_MINIMAX_SM80_BF16", None)
         environment.pop("EKV_ALLOCATOR_STATS_DIR", None)
     for name in ("EKV_VMM_STATS_DIR", "EKV_RESIDENT_LIMIT", "EKV_RESIDENT_FREE_RESERVE",
+                 "EKV_RESIDENT_HINT_POLICY", "EKV_RESIDENT_MIN_HINT_OUTPUT_TOKENS",
                  "EKV_LAYER_TRACE_DIR", "EKV_DISABLE_FUSED_QKNORM", "EKV_RESIDENT_RESOLVER"):
         environment.pop(name, None)
     environment.pop("EKV_FUTURE_POLICY", None)
@@ -284,6 +327,10 @@ def main():
         environment["EKV_RESIDENT_LIMIT"] = str(args.resident_limit)
         environment["EKV_RESIDENT_FREE_RESERVE"] = str(args.resident_free_reserve)
         environment["EKV_RESIDENT_RESOLVER"] = args.resident_resolver
+        environment.update(resident_hint_environment(
+            args.resident_hint_policy, args.resident_min_hint_output_tokens,
+            args.resident_limit,
+        ))
     command = [sys.executable, "-u", *launch, "--model-path",
                str(args.model_path.resolve()), *server_args]
     sources = ("scripts/run_case.py", "benchmarks/client.py", "scripts/run_hisparse_smoke.py",
@@ -303,7 +350,7 @@ def main():
     if args.future_policy != "off":
         sources += ("adaptive_sparse/sglang_future_hook.py", "adaptive_sparse/kv_hints_compat.py")
     if args.resident_limit:
-        sources += ("adaptive_sparse/request_residency.py", "adaptive_sparse/resident_lookup.py")
+        sources += resident_hint_sources(args.resident_limit)
     if args.diagnostic_captures:
         sources += ("benchmarks/hisparse_correctness.py",)
     if args.trace_layers:
@@ -348,6 +395,9 @@ def main():
         "validation_tail_new_tokens": tail_tokens,
         "resident_resolver": args.resident_resolver if args.resident_limit else None,
         "resident_full_batch_swap": args.resident_full_batch_swap,
+        **resident_hint_manifest(
+            args.resident_hint_policy, args.resident_min_hint_output_tokens
+        ),
         "adaptive_settings": adaptive_settings if adaptive else None,
         "chunk_aware_retention": args.chunk_aware_retention,
         "future_policy": args.future_policy,
@@ -357,6 +407,9 @@ def main():
     results = {"mode": args.mode, "tp_size": args.tp_size,
                "sm80_bf16_projections": args.sm80_bf16_projections,
                "vmm_backing": args.vmm_backing, "resident_limit": args.resident_limit,
+               **resident_hint_manifest(
+                   args.resident_hint_policy, args.resident_min_hint_output_tokens
+               ),
                "future_policy": args.future_policy,
                "status": "running", "probes": []}
     server = None

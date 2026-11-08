@@ -34,7 +34,11 @@ The wire envelope is versioned and bounded:
       "action_id": "request-42",
       "action_type": "elastic.future",
       "action_version": "1",
-      "payload": {"deadline_after_ms": 1800}
+      "payload": {
+        "deadline_after_ms": 1800,
+        "expected_output_tokens": 1024,
+        "residence": "auto"
+      }
     }
   ]
 }
@@ -44,6 +48,15 @@ Unknown actions remain opaque so the transport can coexist with other versions.
 Malformed required fields fail request normalization. The future hook validates
 the action payload it consumes and falls back to native queue order when a
 waiting queue lacks complete planning metadata.
+
+`residence` accepts `auto`, `resident` or `host_backed`. It is inert unless the
+request-residency adapter is compiled into the run and
+`EKV_RESIDENT_HINT_POLICY=adaptive` is set. `resident` requests a complete-GPU
+KV slot subject to the configured slot count and per-rank physical reserve;
+`host_backed` yields that slot; `auto` compares `expected_output_tokens` with
+`EKV_RESIDENT_MIN_HINT_OUTPUT_TOKENS`. Missing or invalid planning metadata
+uses the legacy long-request behavior, and no path bypasses SGLang's native
+memory admission checks.
 
 The focused tests cover immutable envelope decoding, malformed input, batch and
 parallel expansion, pickling, HTTP-to-tokenizer-to-scheduler transport,

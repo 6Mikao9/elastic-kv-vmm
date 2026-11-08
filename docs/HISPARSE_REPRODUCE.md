@@ -124,6 +124,15 @@ bash "$RUN" "$GPUS" "$MODEL" native "$OUT/adaptive-off" \
 bash "$RUN" "$GPUS" "$MODEL" native "$OUT/adaptive-deadline" \
   "${COMMON[@]}" "${BENCH1[@]}" "${MIXED[@]}" "${PRESSURE[@]}" \
   --future-policy deadline "${MIXED12K[@]}"
+
+# Optional request-level residency policy. With the 128-token threshold, the
+# 12K/128 long request may claim a resident slot while the 12K/64 long request
+# stays on the native HiSparse hot path. The policy must be enabled together
+# with both future hints and request residency.
+bash "$RUN" "$GPUS" "$MODEL" native "$OUT/adaptive-deadline-residency" \
+  "${COMMON[@]}" "${BENCH1[@]}" "${MIXED[@]}" "${PRESSURE[@]}" \
+  --future-policy deadline --resident-hint-policy adaptive \
+  --resident-min-hint-output-tokens 128 "${MIXED12K[@]}"
 ```
 
 Before treating an arm as performance evidence, require a complete outer
@@ -131,6 +140,9 @@ Before treating an arm as performance evidence, require a complete outer
 invalid-hint and telemetry-error counters, matching source manifests, and a
 verified idle GPU window. Sequential order and warm state can dominate small
 differences; do not establish a speed claim from a single off/deadline pair.
+For the residency-policy arm also require nonzero `resident_layer_rows`, inspect
+the per-rank `future_decision_reasons`, and verify that the configured threshold
+rejected the intended short decoded requests before interpreting timing.
 
 The summarizer requires a completed outer `results.json`, the matching
 `source_manifest.json`, consistent runtime capacity and timing without

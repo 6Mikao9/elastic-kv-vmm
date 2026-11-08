@@ -85,6 +85,78 @@ class FuturePlanTest(unittest.TestCase):
         result = simulate(workload, self.config, "mode-aware")
         self.assertEqual(result.admissions[0].request_id, "z-deadline")
 
+    def test_explicit_host_backed_hint_uses_bounded_hot_set(self):
+        request = RequestProfile(
+            "background",
+            arrival_ms=0,
+            prompt_tokens=3000,
+            output_tokens=100,
+            residence_hint="host_backed",
+        )
+        result = simulate([request], self.config, "mode-aware")
+        self.assertEqual(result.admissions[0].mode, ResidencyMode.HI_SPARSE)
+        self.assertEqual(
+            result.admissions[0].reason, "hint-requires-bounded-hot-set"
+        )
+
+    def test_explicit_resident_hint_claims_an_available_slot(self):
+        request = RequestProfile(
+            "pinned",
+            arrival_ms=0,
+            prompt_tokens=3000,
+            output_tokens=100,
+            residence_hint="resident",
+        )
+        result = simulate([request], self.config, "mode-aware")
+        self.assertEqual(result.admissions[0].mode, ResidencyMode.RESIDENT)
+        self.assertEqual(result.admissions[0].reason, "hint-resident")
+
+    def test_explicit_resident_hint_falls_back_only_when_capacity_requires_it(self):
+        config = PlannerConfig(
+            memory_budget_bytes=2_000_000,
+            kv_bytes_per_token=1000,
+            prefill_workspace_bytes_per_token=0,
+            sparse_hot_tokens=1000,
+        )
+        request = RequestProfile(
+            "pinned",
+            arrival_ms=0,
+            prompt_tokens=100,
+            output_tokens=2000,
+            residence_hint="resident",
+        )
+        result = simulate([request], config, "mode-aware")
+        self.assertEqual(result.admissions[0].mode, ResidencyMode.HI_SPARSE)
+        self.assertEqual(result.admissions[0].reason, "hint-resident-falls-back")
+
+    def test_auto_hint_uses_output_threshold(self):
+        config = PlannerConfig(
+            memory_budget_bytes=8_500_000,
+            kv_bytes_per_token=1000,
+            prefill_workspace_bytes_per_token=0,
+            sparse_hot_tokens=2000,
+            auto_resident_output_threshold=128,
+        )
+        request = RequestProfile(
+            "short",
+            arrival_ms=0,
+            prompt_tokens=3000,
+            output_tokens=64,
+        )
+        result = simulate([request], config, "mode-aware")
+        self.assertEqual(result.admissions[0].mode, ResidencyMode.HI_SPARSE)
+        self.assertEqual(result.admissions[0].reason, "hint-short-auto")
+
+    def test_invalid_residence_hint_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "invalid residence_hint"):
+            RequestProfile(
+                "bad",
+                arrival_ms=0,
+                prompt_tokens=1,
+                output_tokens=1,
+                residence_hint="pinned",
+            )
+
     def test_simulation_is_deterministic_and_never_reports_overcommit(self):
         first = simulate(self.workload, self.config, "future")
         second = simulate(self.workload, self.config, "future")
