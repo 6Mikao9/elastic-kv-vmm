@@ -78,6 +78,49 @@ class ElasticAdmissionTest(unittest.TestCase):
         self.assertEqual(decision.active_after_bytes, 828)
         self.assertFalse(decision.defer_for_budget)
 
+    def test_prefill_workspace_can_demote_before_persistent_kv_overflows(self):
+        config = ElasticKVConfig(
+            memory_budget_bytes=1_000,
+            kv_bytes_per_token=2,
+            sparse_hot_tokens=64,
+            prefill_workspace_bytes_per_token=2,
+        )
+        decision = decide_elastic_admission(
+            submission("long", prompt=100, output=100),
+            active_bytes=410,
+            config=config,
+        )
+
+        self.assertEqual(decision.chosen_residence, "host_backed")
+        self.assertEqual(decision.reason, "prefill-headroom-demotion")
+        self.assertEqual(decision.active_after_bytes, 538)
+        self.assertEqual(decision.prefill_workspace_bytes, 200)
+        self.assertEqual(decision.prefill_peak_bytes, 738)
+        self.assertFalse(decision.prefill_over_budget)
+        self.assertFalse(decision.over_budget)
+        self.assertFalse(decision.defer_for_budget)
+
+    def test_prefill_workspace_waits_when_sparse_peak_also_overflows(self):
+        config = ElasticKVConfig(
+            memory_budget_bytes=1_000,
+            kv_bytes_per_token=2,
+            sparse_hot_tokens=64,
+            prefill_workspace_bytes_per_token=2,
+        )
+        decision = decide_elastic_admission(
+            submission("long", prompt=100, output=100),
+            active_bytes=700,
+            config=config,
+        )
+
+        self.assertEqual(decision.chosen_residence, "host_backed")
+        self.assertEqual(decision.prefill_peak_bytes, 1_028)
+        self.assertTrue(decision.prefill_over_budget)
+        self.assertFalse(decision.over_budget)
+        self.assertFalse(decision.future_over_budget)
+        self.assertTrue(decision.future_peak_over_budget)
+        self.assertTrue(decision.defer_for_budget)
+
     def test_short_or_explicit_host_request_uses_native_hot_set(self):
         short = decide_elastic_admission(
             submission("short", prompt=20, output=20), active_bytes=0, config=self.config
@@ -148,6 +191,62 @@ class ElasticAdmissionTest(unittest.TestCase):
         self.assertEqual(decision.active_after_bytes, 128)
         self.assertEqual(decision.future_effective_after_bytes, 528)
         self.assertFalse(decision.defer_for_budget)
+
+    def test_future_reservation_includes_future_prefill_workspace(self):
+        current = submission("background", weight=1.0, estimated_finish_ms=100)
+        urgent = submission(
+            "urgent",
+            weight=2.0,
+            submit_at_ms=20,
+            estimated_finish_ms=120,
+            deadline_after_ms=180,
+        )
+        config = ElasticKVConfig(
+            memory_budget_bytes=950,
+            kv_bytes_per_token=2,
+            sparse_hot_tokens=64,
+            prefill_workspace_bytes_per_token=1,
+            lookahead_ms=200,
+        )
+
+        decision = decide_elastic_admission(
+            current,
+            active_bytes=0,
+            config=config,
+            future_submissions=(current, urgent),
+            now_ms=0,
+        )
+
+        self.assertEqual(decision.chosen_residence, "host_backed")
+        self.assertEqual(decision.reason, "imminent-future-prefill-demotion")
+        self.assertEqual(decision.future_reserved_bytes, 400)
+        self.assertEqual(decision.future_prefill_bytes, 100)
+        self.assertEqual(decision.future_effective_after_bytes, 528)
+        self.assertEqual(decision.future_effective_peak_bytes, 728)
+        self.assertFalse(decision.defer_for_budget)
+
+    def test_future_prefill_only_pressure_gets_prefill_reason(self):
+        current = submission("current", prompt=1, output=199, weight=1.0)
+        urgent = submission("urgent", weight=2.0, submit_at_ms=20)
+        config = ElasticKVConfig(
+            memory_budget_bytes=850,
+            kv_bytes_per_token=2,
+            sparse_hot_tokens=64,
+            prefill_workspace_bytes_per_token=1,
+            lookahead_ms=200,
+        )
+
+        decision = decide_elastic_admission(
+            current,
+            active_bytes=0,
+            config=config,
+            future_submissions=(current, urgent),
+            now_ms=0,
+        )
+
+        self.assertEqual(decision.reason, "imminent-future-prefill-demotion")
+        self.assertEqual(decision.future_reserved_bytes, 400)
+        self.assertEqual(decision.future_prefill_bytes, 100)
 
     def test_future_reservation_ignores_nonoverlap_equal_weight_and_far_work(self):
         current = submission("current", weight=1.0, estimated_finish_ms=50)
@@ -252,17 +351,47 @@ class ElasticAdmissionTest(unittest.TestCase):
                         submission("bad"), active_bytes=value, config=self.config
                     )
 
+    def test_invalid_prefill_workspace_rate_is_rejected(self):
+        for value in (-1, 1.5, True):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    ValueError, "prefill_workspace_bytes_per_token"
+                ):
+                    ElasticKVConfig(
+                        memory_budget_bytes=1_000,
+                        kv_bytes_per_token=2,
+                        sparse_hot_tokens=64,
+                        prefill_workspace_bytes_per_token=value,
+                    )
+
+    def test_new_prefill_field_preserves_legacy_positional_argument_order(self):
+        config = ElasticKVConfig(1_000, 2, 64, 128, 5, 3)
+
+        self.assertEqual(config.auto_resident_output_tokens, 128)
+        self.assertEqual(config.lookahead_ms, 5)
+        self.assertEqual(config.max_future_reservations, 3)
+        self.assertEqual(config.prefill_workspace_bytes_per_token, 0)
+
     def test_planner_config_round_trips_into_live_budget(self):
         planner = PlannerConfig(
             memory_budget_bytes=self.config.memory_budget_bytes,
             kv_bytes_per_token=self.config.kv_bytes_per_token,
-            prefill_workspace_bytes_per_token=0,
+            prefill_workspace_bytes_per_token=3,
             sparse_hot_tokens=self.config.sparse_hot_tokens,
             auto_resident_output_threshold=self.config.auto_resident_output_tokens,
         )
         live = elastic_config_from_planner(planner)
 
-        self.assertEqual(live, self.config)
+        self.assertEqual(
+            live,
+            ElasticKVConfig(
+                memory_budget_bytes=self.config.memory_budget_bytes,
+                kv_bytes_per_token=self.config.kv_bytes_per_token,
+                sparse_hot_tokens=self.config.sparse_hot_tokens,
+                prefill_workspace_bytes_per_token=3,
+                auto_resident_output_tokens=self.config.auto_resident_output_tokens,
+            ),
+        )
 
 
 if __name__ == "__main__":

@@ -140,7 +140,12 @@ waiting are written into every request record and the paired summary.
 When the planner enables a positive `lookahead_ms`, the same admission check
 also reserves bounded capacity for imminent deadline or higher-weight requests
 that can overlap the current request. This decision is made once at admission;
-the existing scheduler hysteresis owns later demotion and promotion.
+the existing scheduler hysteresis owns later demotion and promotion. A calibrated
+`prefill_workspace_bytes_per_token` is part of both the current request's peak
+and the bounded future reservation. Per-request evidence separates persistent KV
+from `elastic_prefill_peak_bytes` and `elastic_future_effective_peak_bytes`, so a
+dropped arm can be attributed to activation pressure instead of being reported as
+ordinary KV contention.
 Shared immutable prefixes are also carried through the validated future hint;
 resident requests in one `prefix_group` are charged one prefix copy in the
 planner and future reservation model. The current runtime does not yet bind

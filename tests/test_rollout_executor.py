@@ -162,6 +162,117 @@ class RolloutExecutorTest(unittest.TestCase):
         self.assertEqual(second_hint["actions"][0]["payload"]["residence"], "host_backed")
         self.assertEqual(result["summary"]["runtime_demotions"], 1)
 
+    def test_runtime_activation_peak_demotes_new_request_and_exports_ledger(self):
+        base = submission()
+        hint = {
+            key: value for key, value in base.hint.items() if key != "deadline_after_ms"
+        }
+        first = RolloutSubmission(
+            request_id="first",
+            planned_arrival_ms=0,
+            submit_at_ms=0,
+            estimated_finish_ms=100,
+            kind=base.kind,
+            prompt_tokens=50,
+            output_tokens=50,
+            hint={**hint, "expected_output_tokens": 50},
+        )
+        second = RolloutSubmission(
+            request_id="second",
+            planned_arrival_ms=0,
+            submit_at_ms=0,
+            estimated_finish_ms=100,
+            kind=base.kind,
+            prompt_tokens=100,
+            output_tokens=50,
+            hint={**hint, "expected_output_tokens": 50},
+        )
+        first_started = threading.Event()
+        second_started = threading.Event()
+        seen = {}
+
+        def generate(url, spec, timeout, stream):
+            seen[spec["request_id"]] = spec["future_hint"]
+            if spec["request_id"] == "first":
+                first_started.set()
+                self.assertTrue(second_started.wait(1.0))
+            else:
+                self.assertTrue(first_started.is_set())
+                second_started.set()
+            return {
+                "_started_perf_s": time.perf_counter(),
+                "end_to_end_s": 0.01,
+                "output_tokens": 50,
+                "ttft_s": 0.004,
+                "tpot_s": 0.0001,
+            }
+
+        result = execute_rollout(
+            "http://server/generate",
+            [first, second],
+            generator=generate,
+            elastic_kv_config=ElasticKVConfig(
+                memory_budget_bytes=1_400,
+                kv_bytes_per_token=2,
+                sparse_hot_tokens=64,
+                prefill_workspace_bytes_per_token=7,
+            ),
+            poll_interval_ms=1,
+        )
+
+        by_id = {row["request_id"]: row for row in result["requests"]}
+        first_row = by_id["first"]
+        second_row = by_id["second"]
+        self.assertEqual(first_row["runtime_residence"], "resident")
+        self.assertEqual(second_row["runtime_residence"], "host_backed")
+        self.assertEqual(
+            second_row["elastic_admission_reason"],
+            "prefill-headroom-demotion",
+        )
+        self.assertEqual(second_row["elastic_prefill_workspace_bytes"], 700)
+        self.assertEqual(second_row["elastic_prefill_peak_bytes"], 1378)
+        self.assertFalse(second_row["elastic_prefill_over_budget"])
+        self.assertEqual(
+            seen["second"]["actions"][0]["payload"]["residence"],
+            "host_backed",
+        )
+        self.assertEqual(result["summary"]["prefill_headroom_demotions"], 1)
+
+    def test_runtime_activation_over_budget_reports_peak_cause(self):
+        request = RolloutSubmission(
+            request_id="large-activation",
+            planned_arrival_ms=0,
+            submit_at_ms=0,
+            estimated_finish_ms=100,
+            kind="chat",
+            prompt_tokens=100,
+            output_tokens=50,
+            hint={
+                "release_after_ms": 0,
+                "expected_output_tokens": 50,
+                "weight": 1.0,
+                "kind": "chat",
+                "residence": "resident",
+            },
+        )
+
+        with self.assertRaisesRegex(
+            RolloutExecutionError,
+            "bounded KV hot set plus prefill workspace",
+        ):
+            execute_rollout(
+                "http://server/generate",
+                [request],
+                generator=lambda *args: self.fail("request should not be sent"),
+                elastic_kv_config=ElasticKVConfig(
+                    memory_budget_bytes=1_000,
+                    kv_bytes_per_token=2,
+                    sparse_hot_tokens=64,
+                    prefill_workspace_bytes_per_token=9,
+                ),
+                poll_interval_ms=1,
+            )
+
     def test_managed_rollout_reserves_for_imminent_urgent_request(self):
         background = RolloutSubmission(
             request_id="background",

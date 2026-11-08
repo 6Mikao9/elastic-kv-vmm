@@ -26,6 +26,7 @@ class ElasticKVConfig:
     auto_resident_output_tokens: int = 128
     lookahead_ms: int = 0
     max_future_reservations: int = 4
+    prefill_workspace_bytes_per_token: int = 0
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -43,6 +44,14 @@ class ElasticKVConfig:
             or self.lookahead_ms < 0
         ):
             raise ValueError("lookahead_ms must be a nonnegative integer")
+        if (
+            isinstance(self.prefill_workspace_bytes_per_token, bool)
+            or not isinstance(self.prefill_workspace_bytes_per_token, int)
+            or self.prefill_workspace_bytes_per_token < 0
+        ):
+            raise ValueError(
+                "prefill_workspace_bytes_per_token must be a nonnegative integer"
+            )
 
     def hold_bytes(self, submission: RolloutSubmission, residence: str) -> int:
         """Return the predicted per-rank KV bytes for one placement."""
@@ -55,6 +64,9 @@ class ElasticKVConfig:
         )
         return held_tokens * self.kv_bytes_per_token
 
+    def prefill_workspace_bytes(self, submission: RolloutSubmission) -> int:
+        return submission.prompt_tokens * self.prefill_workspace_bytes_per_token
+
 
 def elastic_config_from_planner(config: PlannerConfig) -> ElasticKVConfig:
     """Project the offline resource model into the live admission ledger."""
@@ -63,6 +75,7 @@ def elastic_config_from_planner(config: PlannerConfig) -> ElasticKVConfig:
         memory_budget_bytes=config.memory_budget_bytes,
         kv_bytes_per_token=config.kv_bytes_per_token,
         sparse_hot_tokens=config.sparse_hot_tokens,
+        prefill_workspace_bytes_per_token=config.prefill_workspace_bytes_per_token,
         auto_resident_output_tokens=config.auto_resident_output_threshold,
         lookahead_ms=config.lookahead_ms,
     )
@@ -81,9 +94,15 @@ class ElasticAdmissionDecision:
     defer_for_budget: bool
     over_budget: bool
     future_reserved_bytes: int = 0
+    future_prefill_bytes: int = 0
     future_reserved_requests: int = 0
     future_effective_after_bytes: int = 0
     future_over_budget: bool = False
+    prefill_workspace_bytes: int = 0
+    prefill_peak_bytes: int = 0
+    future_effective_peak_bytes: int = 0
+    prefill_over_budget: bool = False
+    future_peak_over_budget: bool = False
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -98,9 +117,15 @@ class ElasticAdmissionDecision:
             "defer_for_budget": self.defer_for_budget,
             "over_budget": self.over_budget,
             "future_reserved_bytes": self.future_reserved_bytes,
+            "future_prefill_bytes": self.future_prefill_bytes,
             "future_reserved_requests": self.future_reserved_requests,
             "future_effective_after_bytes": self.future_effective_after_bytes,
             "future_over_budget": self.future_over_budget,
+            "prefill_workspace_bytes": self.prefill_workspace_bytes,
+            "prefill_peak_bytes": self.prefill_peak_bytes,
+            "future_effective_peak_bytes": self.future_effective_peak_bytes,
+            "prefill_over_budget": self.prefill_over_budget,
+            "future_peak_over_budget": self.future_peak_over_budget,
         }
 
 
@@ -128,7 +153,7 @@ def _future_reservation(
     *,
     now_ms: float,
     config: ElasticKVConfig,
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     """Reserve bounded capacity for more urgent requests that can overlap now.
 
     The executor receives a known rollout schedule. Counting every queued
@@ -140,13 +165,14 @@ def _future_reservation(
     """
 
     if config.lookahead_ms == 0:
-        return 0, 0
+        return 0, 0, 0
     current_hint = FutureHint.from_payload(dict(submission.hint))
     current_finish_ms = now_ms + max(
         1, submission.estimated_finish_ms - submission.submit_at_ms
     )
     horizon_end_ms = now_ms + config.lookahead_ms
-    reserved_bytes = 0
+    reserved_kv_bytes = 0
+    reserved_prefill_bytes = 0
     reserved_requests = 0
     resident_prefixes: dict[str, list[int]] = {}
     for future in future_submissions:
@@ -164,7 +190,8 @@ def _future_reservation(
         if not protected:
             continue
         placement, _ = _preferred_residence(future, config)
-        reserved_bytes += config.hold_bytes(future, placement)
+        reserved_kv_bytes += config.hold_bytes(future, placement)
+        reserved_prefill_bytes += config.prefill_workspace_bytes(future)
         if (
             placement == "resident"
             and future_hint.prefix_group is not None
@@ -176,12 +203,12 @@ def _future_reservation(
         reserved_requests += 1
         if reserved_requests >= config.max_future_reservations:
             break
-    reserved_bytes -= sum(
+    reserved_kv_bytes -= sum(
         (len(lengths) - 1) * min(lengths) * config.kv_bytes_per_token
         for lengths in resident_prefixes.values()
         if len(lengths) > 1
     )
-    return reserved_bytes, reserved_requests
+    return reserved_kv_bytes, reserved_prefill_bytes, reserved_requests
 
 
 def decide_elastic_admission(
@@ -218,24 +245,33 @@ def decide_elastic_admission(
     planned = hint.residence
     resident_bytes = config.hold_bytes(submission, "resident")
     sparse_bytes = config.hold_bytes(submission, "host_backed")
+    workspace_bytes = config.prefill_workspace_bytes(submission)
     chosen, reason = _preferred_residence(submission, config)
-    future_bytes, future_count = _future_reservation(
+    future_kv_bytes, future_prefill_bytes, future_count = _future_reservation(
         submission, queued, now_ms=now_ms, config=config
     )
+    future_bytes = future_kv_bytes + future_prefill_bytes
 
-    if chosen == "resident" and active_bytes + resident_bytes > config.memory_budget_bytes:
-        chosen = "host_backed"
-        reason = "aggregate-budget-demotion"
-    elif (
-        chosen == "resident"
-        and active_bytes + resident_bytes + future_bytes
-        > config.memory_budget_bytes
-    ):
-        chosen = "host_backed"
-        reason = "imminent-future-demotion"
+    if chosen == "resident":
+        resident_after = active_bytes + resident_bytes
+        resident_peak = resident_after + workspace_bytes
+        if resident_after > config.memory_budget_bytes:
+            chosen = "host_backed"
+            reason = "aggregate-budget-demotion"
+        elif resident_peak > config.memory_budget_bytes:
+            chosen = "host_backed"
+            reason = "prefill-headroom-demotion"
+        elif resident_after + future_kv_bytes > config.memory_budget_bytes:
+            chosen = "host_backed"
+            reason = "imminent-future-demotion"
+        elif resident_peak + future_bytes > config.memory_budget_bytes:
+            chosen = "host_backed"
+            reason = "imminent-future-prefill-demotion"
     added = sparse_bytes if chosen == "host_backed" else resident_bytes
     after = active_bytes + added
-    effective_after = after + future_bytes
+    prefill_peak = after + workspace_bytes
+    effective_after = after + future_kv_bytes
+    effective_peak = prefill_peak + future_bytes
     return ElasticAdmissionDecision(
         request_id=submission.request_id,
         planned_residence=planned,
@@ -245,10 +281,16 @@ def decide_elastic_admission(
         active_after_bytes=after,
         resident_bytes=resident_bytes,
         sparse_bytes=sparse_bytes,
-        defer_for_budget=effective_after > config.memory_budget_bytes,
+        defer_for_budget=effective_peak > config.memory_budget_bytes,
         over_budget=after > config.memory_budget_bytes,
-        future_reserved_bytes=future_bytes,
+        future_reserved_bytes=future_kv_bytes,
+        future_prefill_bytes=future_prefill_bytes,
         future_reserved_requests=future_count,
         future_effective_after_bytes=effective_after,
         future_over_budget=effective_after > config.memory_budget_bytes,
+        prefill_workspace_bytes=workspace_bytes,
+        prefill_peak_bytes=prefill_peak,
+        future_effective_peak_bytes=effective_peak,
+        prefill_over_budget=prefill_peak > config.memory_budget_bytes,
+        future_peak_over_budget=effective_peak > config.memory_budget_bytes,
     )

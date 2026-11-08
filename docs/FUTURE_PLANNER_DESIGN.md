@@ -531,13 +531,30 @@ horizon 内的后续请求。预留只覆盖同时满足以下条件的请求：
 映射完整 KV。
 
 当前请求仍在预算内时，若 `active + current + imminent_future` 超限，它会在
-请求级选择上退为 `host_backed`，原因记为 `imminent-future-demotion`。这个决定
+请求级选择上退为 `host_backed`，原因记为 `imminent-future-demotion`。当前请求
+自身的 prefill workspace 使峰值越界时记为 `prefill-headroom-demotion`；未来请求的
+KV 与 prefill workspace 共同使峰值越界时记为
+`imminent-future-prefill-demotion`。这个决定
 只发生在请求准入，随后的整个请求生命周期保持稳定；运行中的动态迁移继续由
 `SchedulerBudget` 的 dwell、low-water stable interval、joint demotion、每轮
 字节上限和 in-flight 限制防抖。rollout 结果逐请求记录
-`elastic_future_reserved_bytes`、`elastic_future_reserved_requests`、
-`elastic_future_effective_after_bytes` 和 `elastic_future_over_budget`，汇总
-记录 `future_reservation_admissions` 与 `future_reservation_demotions`。
+`elastic_future_reserved_bytes`、`elastic_future_prefill_bytes`、
+`elastic_future_reserved_requests`、
+`elastic_future_effective_after_bytes`、`elastic_future_over_budget`、
+`elastic_prefill_workspace_bytes`、`elastic_prefill_peak_bytes`、
+`elastic_future_effective_peak_bytes`、`elastic_prefill_over_budget` 和
+`elastic_future_peak_over_budget`。
+其中 `future_reserved_bytes` 只记录未来持久 KV，未来 activation workspace 单独记录为
+`future_prefill_bytes`。`future_effective_after_bytes` 是保留兼容的“当前驻留 KV +
+未来持久 KV”字段，
+但不含当前请求自己的 prefill workspace；`future_effective_peak_bytes` 才是把
+当前 prefill 也加入后的完整容量判定账本。`future_over_budget` 与
+`prefill_over_budget` 分别保留未来预留和当前 prefill 的归因，
+`future_peak_over_budget` 才汇总两者。执行器在无法观察 SGLang 精确 prefill
+完成边界时，会把每个在途请求的 workspace 保守计到请求结束，避免多个并发
+prefill 漏记。汇总记录
+`future_reservation_admissions`、`future_reservation_demotions` 与
+`prefill_headroom_demotions`。
 
 这是已知未来控制面的容量策略，不是对未知线上请求的预测。共享前缀或跨请求
 共享物理 chunk 仍应使用实际 owner index 抵扣；当前 CPU 测试只验证确定性预算

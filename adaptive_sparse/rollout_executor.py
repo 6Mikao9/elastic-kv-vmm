@@ -372,7 +372,14 @@ class _PendingRequest:
     def hold_bytes(self) -> int:
         if self.admission is None:
             return 0
-        return self.admission.active_after_bytes - self.admission.active_before_bytes
+        # The executor cannot observe SGLang's exact prefill completion boundary.
+        # Keep each in-flight request's workspace charged until completion; this
+        # is a conservative upper bound when multiple prefills overlap.
+        return (
+            self.admission.active_after_bytes
+            - self.admission.active_before_bytes
+            + self.admission.prefill_workspace_bytes
+        )
 
 
 def _select_due(
@@ -471,11 +478,23 @@ def _measure_result(
                 "elastic_active_after_bytes": admission.active_after_bytes,
                 "elastic_over_budget": admission.over_budget,
                 "elastic_future_reserved_bytes": admission.future_reserved_bytes,
+                "elastic_future_prefill_bytes": admission.future_prefill_bytes,
                 "elastic_future_reserved_requests": admission.future_reserved_requests,
                 "elastic_future_effective_after_bytes": (
                     admission.future_effective_after_bytes
                 ),
                 "elastic_future_over_budget": admission.future_over_budget,
+                "elastic_prefill_workspace_bytes": (
+                    admission.prefill_workspace_bytes
+                ),
+                "elastic_prefill_peak_bytes": admission.prefill_peak_bytes,
+                "elastic_future_effective_peak_bytes": (
+                    admission.future_effective_peak_bytes
+                ),
+                "elastic_prefill_over_budget": admission.prefill_over_budget,
+                "elastic_future_peak_over_budget": (
+                    admission.future_peak_over_budget
+                ),
             }
         )
     return row
@@ -585,7 +604,8 @@ def _execute_managed_rollout(
                         continue
                     if not pending and not deadline_forced:
                         raise RolloutExecutionError(
-                            f"{submission.request_id}: sparse hot set exceeds the total elastic KV budget"
+                            f"{submission.request_id}: bounded KV hot set plus "
+                            "prefill workspace exceeds the total elastic budget"
                         )
 
             dispatch_ms = (clock.now() - origin) * 1000.0
@@ -717,7 +737,12 @@ def _finalize_rollout(
             int(row.get("elastic_future_reserved_requests", 0)) > 0 for row in rows
         ),
         "future_reservation_demotions": sum(
-            row.get("elastic_admission_reason") == "imminent-future-demotion"
+            row.get("elastic_admission_reason")
+            in ("imminent-future-demotion", "imminent-future-prefill-demotion")
+            for row in rows
+        ),
+        "prefill_headroom_demotions": sum(
+            row.get("elastic_admission_reason") == "prefill-headroom-demotion"
             for row in rows
         ),
         "efficiency": _efficiency(rows),
