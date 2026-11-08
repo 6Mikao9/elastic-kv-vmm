@@ -15,21 +15,31 @@ transport error.
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 import json
 import math
 import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from .elastic_admission import ElasticAdmissionDecision, ElasticKVConfig, decide_elastic_admission
+from .elastic_admission import (
+    ElasticAdmissionDecision,
+    ElasticKVConfig,
+    decide_elastic_admission,
+)
 from .future_plan import RolloutPlan, RolloutSubmission
-from .sglang_future_hook import FutureHint
+from .sglang_future_hook import ACTION_VERSION, FutureHint
 
 
 class RolloutExecutionError(RuntimeError):
     """A live plan violated a transport, timing, or evidence invariant."""
+
+
+def _ceil_milliseconds(value: float) -> int:
+    """Ceil a clock-derived duration without adding a spurious millisecond."""
+
+    return math.ceil(value - 1e-7)
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,15 +67,24 @@ def make_kv_hints(
     *,
     deadline_after_ms: int | None = None,
     residence_override: str | None = None,
+    clock_now_s: float | None = None,
 ) -> dict[str, object]:
     """Wrap a planner payload in the SGLang versioned hint envelope."""
 
     payload = _future_payload(submission.hint)
     if submission.deadline_ms is not None:
-        payload["deadline_after_ms"] = (
+        remaining_ms = (
             max(0, submission.deadline_ms - submission.submit_at_ms)
             if deadline_after_ms is None
             else deadline_after_ms
+        )
+        payload["deadline_after_ms"] = remaining_ms
+        dispatch_clock_s = time.perf_counter() if clock_now_s is None else clock_now_s
+        if not math.isfinite(dispatch_clock_s) or dispatch_clock_s < 0:
+            raise RolloutExecutionError("dispatch clock must be finite and nonnegative")
+        payload["deadline_clock"] = "perf_counter"
+        payload["deadline_absolute_ms"] = (
+            _ceil_milliseconds(dispatch_clock_s * 1000.0 + remaining_ms)
         )
     if residence_override is not None:
         if residence_override not in ("resident", "host_backed"):
@@ -81,7 +100,7 @@ def make_kv_hints(
             {
                 "action_id": f"{request_id}:future",
                 "action_type": "elastic.future",
-                "action_version": "1",
+                "action_version": ACTION_VERSION,
                 "payload": payload,
             }
         ],
@@ -618,6 +637,7 @@ def _execute_managed_rollout(
                 "kind": submission.kind,
             }
             if emit_hints:
+                dispatch_clock_s = clock.now()
                 deadline_after_ms = (
                     None
                     if submission.deadline_ms is None
@@ -626,8 +646,11 @@ def _execute_managed_rollout(
                 spec["future_hint"] = make_kv_hints(
                     submission,
                     deadline_after_ms=(
-                        None if deadline_after_ms is None else int(deadline_after_ms)
+                        None
+                        if deadline_after_ms is None
+                        else _ceil_milliseconds(deadline_after_ms)
                     ),
+                    clock_now_s=dispatch_clock_s,
                     residence_override=(
                         None
                         if admission is None
@@ -848,6 +871,7 @@ def execute_rollout(
                 "kind": submission.kind,
             }
             if emit_hints:
+                dispatch_clock_s = replay_clock.now()
                 deadline_after_ms = (
                     None
                     if submission.deadline_ms is None
@@ -856,8 +880,11 @@ def execute_rollout(
                 spec["future_hint"] = make_kv_hints(
                     submission,
                     deadline_after_ms=(
-                        None if deadline_after_ms is None else int(deadline_after_ms)
+                        None
+                        if deadline_after_ms is None
+                        else _ceil_milliseconds(deadline_after_ms)
                     ),
+                    clock_now_s=dispatch_clock_s,
                 )
             future = pool.submit(generate, url, spec, timeout_s, stream)
             pending.append((submission, dispatch_lateness_ms, future))

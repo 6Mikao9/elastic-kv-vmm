@@ -29,6 +29,23 @@ def hinted_request(request_id, *, payload, received=9.5, current=64, prompt=32):
 
 
 class RuntimeValueTest(unittest.TestCase):
+    def test_absolute_deadline_does_not_require_scheduler_receive_time(self):
+        request = hinted_request(
+            "absolute",
+            payload={
+                "deadline_after_ms": 1000,
+                "deadline_clock": "perf_counter",
+                "deadline_absolute_ms": 10300,
+                "weight": 4,
+            },
+        )
+        request.time_stats = NS()
+
+        values, stats = runtime_values([request], now_s=10.0)
+
+        self.assertEqual(values["absolute"].deadline_remaining_ms, 300)
+        self.assertEqual(stats, {"hinted": 1, "invalid": 0})
+
     def test_extracts_deadline_weight_kind_prefix_and_remaining_work(self):
         request = hinted_request(
             "r",

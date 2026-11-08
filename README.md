@@ -196,9 +196,11 @@ backports only request validation and propagation; it does not change attention
 or allocator behavior.
 The known-future planner now has a live executor that consumes its
 `submit_at_ms` schedule, fails on malformed or late submissions, preserves the
-original absolute deadline, and records planned versus actual latency and
-residency. A matching unhinted control arm can be run with `--no-hints` for
-paired real-serving measurements.
+original absolute deadline, stamps a host-local `perf_counter` deadline at HTTP
+dispatch, and records planned versus actual latency and residency. This keeps
+transport and tokenization delay from becoming extra deadline slack; cross-host
+clocks require a separate calibration protocol. A matching unhinted control arm
+can be run with `--no-hints` for paired real-serving measurements.
 The offline comparison also includes a bounded `oracle` policy. It searches
 request order, resident/HiSparse placement and intentional idle transitions;
 identical request signatures are collapsed, and the existing `future` plan is

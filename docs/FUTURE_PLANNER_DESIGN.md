@@ -61,10 +61,12 @@ Mamba 和 paged allocator 约束仍由原生 `PrefillAdder` 决定。规划器�
 {
   "action_id": "request-42",
   "action_type": "elastic.future",
-  "action_version": "1",
+  "action_version": "2",
   "payload": {
     "release_after_ms": 250,
     "deadline_after_ms": 1800,
+    "deadline_clock": "perf_counter",
+    "deadline_absolute_ms": 9123456800,
     "expected_output_tokens": 192,
     "kind": "tool",
     "residence": "auto",
@@ -73,10 +75,14 @@ Mamba 和 paged allocator 约束仍由原生 `PrefillAdder` 决定。规划器�
 }
 ```
 
-时间必须相对于同一个请求事件，推荐相对于 `Req.time_stats.created_time`。
-不要混用 Wall clock 与 `time.perf_counter()`。所有数字都要做有限值、非负值和
-上限校验。`kv_hints` 是受信任 orchestrator 的内部提示通道，不应当成任意应用
-客户端的安全控制接口。
+action version 2 在 HTTP 实际发送时同时写入 `deadline_after_ms` 和同机
+`perf_counter` 时钟域下的 `deadline_absolute_ms`。scheduler 接收请求后使用绝对
+值计算剩余时间，因此网络、tokenization 和跨进程排队不会被误算成额外 slack。
+旧 action version 1 仍按 scheduler 相对时间解释，以保持兼容；新执行器只发送
+version 2。该绝对时钟假定 orchestrator 与 SGLang 位于同一主机。跨机部署需要
+改用经过校准的 Unix clock 或显式时钟偏移。所有数字都要做有限值、非负值和上限
+校验。`kv_hints` 是受信任 orchestrator 的内部提示通道，不应当成任意应用客户端
+的安全控制接口。
 
 ### 2.2 原生排序发生在 prefill 准入内部
 
@@ -271,8 +277,10 @@ python3 scripts/future_plan_compare.py \
 执行边界。它按 `submit_at_ms` 单调唤醒，发送确定性的 tokenized prompt，并把
 同一份计划任务包成 `kv_hints`。每条执行记录同时保存计划/实际提交与完成时间、
 提交抖动、deadline 目标、deadline 命中、TTFT、TPOT 和输出 token 数。计划中的
-`deadline_ms` 保留原始绝对期限；每次实际发送前，runtime hint 的
-`deadline_after_ms` 会按本次真实提交时刻重新计算，避免传输抖动悄悄延长期限。
+`deadline_ms` 保留计划器时间线中的原始期限；每次实际发送前，runtime hint 的
+`deadline_after_ms` 会按本次真实提交时刻重新计算，同时写入同机
+`perf_counter` 绝对 deadline。旧版本可以使用相对字段，新 scheduler 优先使用
+绝对字段并分别验证两者的一致性。
 
 执行器在发出任何 HTTP 请求之前拒绝以下不一致：重复 ID、到达时间晚于提交时间、
 预估完成早于提交、hint 的 `kind` 或输出长度与 submission 不同、控制器填充了

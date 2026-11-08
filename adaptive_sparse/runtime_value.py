@@ -243,15 +243,18 @@ def runtime_value_from_hint(request: Any, hint: Any, *, now_s: float) -> Runtime
         return None
     deadline = getattr(hint, "deadline_after_ms", None)
     if deadline is not None:
-        from .sglang_future_hook import _request_age_ms
+        from .sglang_future_hook import _request_age_ms, deadline_remaining_ms
 
-        try:
-            age_ms = _request_age_ms(request, now_s)
-        except (AttributeError, TypeError, ValueError) as exc:
-            raise ValueError(
-                "deadline hint requires a scheduler receive timestamp"
-            ) from exc
-        deadline = max(0, math.ceil(deadline - age_ms))
+        if getattr(hint, "deadline_clock", None) is None:
+            try:
+                age_ms = _request_age_ms(request, now_s)
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "relative deadline hint requires a scheduler receive timestamp"
+                ) from exc
+            deadline = deadline_remaining_ms(hint, age_ms=age_ms)
+        else:
+            deadline = deadline_remaining_ms(hint, now_s=now_s)
     return RuntimeRequestValue(
         request_id=request_id,
         weight=float(getattr(hint, "weight", 1.0)),

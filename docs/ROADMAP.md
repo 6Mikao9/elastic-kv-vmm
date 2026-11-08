@@ -126,10 +126,12 @@ Future-aware admission now reserves interval peaks instead of summing every item
 inside the horizon, skips deadline protection when positive post-current slack
 remains, and recomputes service duration for backlogged requests. TP prefill-plan
 signatures also distinguish KV from activation bytes. These are CPU-validated
-accounting fixes; the next protocol revision should unify deadline timing on a
-request-creation clock (or transport an absolute deadline plus calibrated clock
-offset), because the current HTTP dispatch-relative hint can otherwise gain
-network and queue time as extra slack.
+accounting fixes. The rollout executor now emits action version 2 with a
+host-local `perf_counter` absolute deadline captured at HTTP dispatch; the
+scheduler prefers it and retains version-1 relative hints as a compatibility
+fallback. This removes network, tokenization and queue time from deadline slack
+within one host. Cross-host rollout remains future work and needs calibrated
+Unix-clock offsets rather than assuming a shared monotonic reference.
 
 Active residency now consumes the same immutable hint at demotion time.  A
 conservative retention value combines business weight, remaining decode work,

@@ -1,18 +1,22 @@
-from types import SimpleNamespace
 import os
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from adaptive_sparse import sglang_future_hook as hook
 from adaptive_sparse.future_residency import decide_resident_claim
-from adaptive_sparse.sglang_future_hook import apply_to_waiting_queue, order_requests, snapshot_stats
+from adaptive_sparse.sglang_future_hook import (
+    apply_to_waiting_queue,
+    order_requests,
+    snapshot_stats,
+)
 
 
-def request(name, prompt, created, payload):
+def request(name, prompt, created, payload, *, version="1"):
     action = SimpleNamespace(
         action_type="elastic.future",
-        action_version="1",
+        action_version=version,
         payload=payload,
     )
     return SimpleNamespace(
@@ -26,6 +30,80 @@ def request(name, prompt, created, payload):
 
 
 class SGLangFutureHookTest(unittest.TestCase):
+    def test_absolute_deadline_uses_dispatch_clock_not_request_age(self):
+        hint = hook.FutureHint.from_payload(
+            {
+                "deadline_after_ms": 50,
+                "deadline_clock": "perf_counter",
+                "deadline_absolute_ms": 1050,
+            }
+        )
+
+        self.assertEqual(
+            hook.deadline_remaining_ms(hint, now_s=1.02, age_ms=500),
+            30,
+        )
+
+    def test_absolute_deadline_orders_without_scheduler_receive_time(self):
+        long = request(
+            "long",
+            1000,
+            0.0,
+            {"expected_output_tokens": 7000},
+            version="2",
+        )
+        short = request(
+            "short",
+            100,
+            0.0,
+            {
+                "deadline_after_ms": 50,
+                "deadline_clock": "perf_counter",
+                "deadline_absolute_ms": 1050,
+                "expected_output_tokens": 400,
+            },
+            version="2",
+        )
+        long.time_stats = SimpleNamespace()
+        short.time_stats = SimpleNamespace()
+
+        ordered = order_requests(
+            [long, short],
+            now_s=1.01,
+            prefill_tokens_per_s=1000,
+            decode_tokens_per_s=2000,
+        )
+
+        self.assertEqual([item.request_id for item in ordered], ["short", "long"])
+
+    def test_absolute_deadline_rejects_partial_or_unknown_clock(self):
+        cases = (
+            {"deadline_after_ms": 50, "deadline_clock": "perf_counter"},
+            {"deadline_after_ms": 50, "deadline_absolute_ms": 1050},
+            {
+                "deadline_after_ms": 50,
+                "deadline_clock": "unix",
+                "deadline_absolute_ms": 1050,
+            },
+            {"deadline_clock": "perf_counter", "deadline_absolute_ms": 1050},
+        )
+        for payload in cases:
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                hook.FutureHint.from_payload(payload)
+
+        legacy = request(
+            "legacy",
+            10,
+            1.0,
+            {
+                "deadline_after_ms": 50,
+                "deadline_clock": "perf_counter",
+                "deadline_absolute_ms": 1050,
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "version 1"):
+            hook._extract_hint(legacy)
+
     def test_legacy_hint_fields_remain_distinguishable_from_omitted_values(self):
         hint = hook.FutureHint.from_payload({"deadline_after_ms": 50})
         self.assertIsNone(hint.residence)
@@ -367,9 +445,9 @@ class SGLangFutureHookTest(unittest.TestCase):
         compat_install.assert_not_called()
 
     def test_stats_are_published_atomically(self):
+        import json
         import tempfile
         from pathlib import Path
-        import json
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "future.json"

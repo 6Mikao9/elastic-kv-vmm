@@ -35,9 +35,11 @@ The wire envelope is versioned and bounded:
     {
       "action_id": "request-42",
       "action_type": "elastic.future",
-      "action_version": "1",
+      "action_version": "2",
       "payload": {
         "deadline_after_ms": 1800,
+        "deadline_clock": "perf_counter",
+        "deadline_absolute_ms": 9123456800,
         "expected_output_tokens": 1024,
         "residence": "auto"
       }
@@ -50,6 +52,13 @@ Unknown actions remain opaque so the transport can coexist with other versions.
 Malformed required fields fail request normalization. The future hook validates
 the action payload it consumes and falls back to native queue order when a
 waiting queue lacks complete planning metadata.
+
+Action version 2 carries an optional host-local `perf_counter` absolute deadline
+alongside the legacy relative field. The rollout executor stamps it at HTTP
+dispatch so scheduler receive time does not erase network and tokenization
+latency. Version 1 remains accepted for relative-only hints. The executor and
+server must share a host for the current clock-domain guarantee; cross-host use
+requires a calibrated wall-clock protocol.
 
 `residence` accepts `auto`, `resident` or `host_backed`. It is inert unless the
 request-residency adapter is compiled into the run and

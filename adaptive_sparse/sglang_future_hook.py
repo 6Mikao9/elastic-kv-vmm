@@ -8,17 +8,17 @@ and request-slot checks remain authoritative. The hook is disabled by default.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from functools import wraps
 import math
 import os
-from pathlib import Path
 import time
+from dataclasses import dataclass
+from functools import wraps
+from pathlib import Path
 from typing import Any, Iterable
 
-
 ACTION_TYPE = "elastic.future"
-ACTION_VERSION = "1"
+ACTION_VERSION = "2"
+SUPPORTED_ACTION_VERSIONS = frozenset(("1", "2"))
 POLICY_ENV = "EKV_FUTURE_POLICY"
 STATS_PATH_ENV = "EKV_FUTURE_STATS_PATH"
 HORIZON_ENV = "EKV_FUTURE_ORDERING_HORIZON_MS"
@@ -45,6 +45,8 @@ _stats = {
 class FutureHint:
     release_after_ms: int = 0
     deadline_after_ms: int | None = None
+    deadline_clock: str | None = None
+    deadline_absolute_ms: int | None = None
     expected_output_tokens: int | None = None
     weight: float = 1.0
     kind: str = "generic"
@@ -59,6 +61,8 @@ class FutureHint:
         allowed = {
             "release_after_ms",
             "deadline_after_ms",
+            "deadline_clock",
+            "deadline_absolute_ms",
             "expected_output_tokens",
             "weight",
             "kind",
@@ -74,6 +78,24 @@ class FutureHint:
         deadline = None if deadline_raw is None else _bounded_int(deadline_raw, "deadline_after_ms")
         if deadline is not None and deadline < release:
             raise ValueError("deadline_after_ms precedes release_after_ms")
+        deadline_clock = payload.get("deadline_clock")
+        deadline_absolute_raw = payload.get("deadline_absolute_ms")
+        if (deadline_clock is None) != (deadline_absolute_raw is None):
+            raise ValueError(
+                "deadline_clock and deadline_absolute_ms must be supplied together"
+            )
+        if deadline_clock is not None:
+            if deadline is None:
+                raise ValueError(
+                    "absolute deadline requires deadline_after_ms for compatibility"
+                )
+            if deadline_clock != "perf_counter":
+                raise ValueError("unsupported deadline_clock")
+            deadline_absolute = _bounded_int64(
+                deadline_absolute_raw, "deadline_absolute_ms"
+            )
+        else:
+            deadline_absolute = None
         expected_raw = payload.get("expected_output_tokens")
         expected = (
             None
@@ -108,6 +130,8 @@ class FutureHint:
         return cls(
             release,
             deadline,
+            deadline_clock,
+            deadline_absolute,
             expected,
             weight,
             kind,
@@ -125,6 +149,14 @@ def _bounded_int(value: Any, name: str, *, minimum: int = 0) -> int:
     return value
 
 
+def _bounded_int64(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer")
+    if not 0 <= value <= (1 << 63) - 1:
+        raise ValueError(f"{name} is outside the supported range")
+    return value
+
+
 def _extract_hint(request: Any) -> FutureHint | None:
     envelope = getattr(request, "kv_hints", None)
     actions = getattr(envelope, "actions", None)
@@ -138,9 +170,13 @@ def _extract_hint(request: Any) -> FutureHint | None:
     if len(matches) != 1:
         raise ValueError("request must carry exactly one elastic.future action")
     action = matches[0]
-    if getattr(action, "action_version", None) != ACTION_VERSION:
+    action_version = getattr(action, "action_version", None)
+    if action_version not in SUPPORTED_ACTION_VERSIONS:
         raise ValueError("unsupported elastic.future action version")
-    return FutureHint.from_payload(getattr(action, "payload", None))
+    hint = FutureHint.from_payload(getattr(action, "payload", None))
+    if action_version == "1" and hint.deadline_clock is not None:
+        raise ValueError("action version 1 cannot carry an absolute deadline clock")
+    return hint
 
 
 def _request_age_ms(request: Any, now_s: float) -> float:
@@ -153,6 +189,24 @@ def _request_age_ms(request: Any, now_s: float) -> float:
     if not isinstance(received, (int, float)) or not math.isfinite(received) or received <= 0:
         raise ValueError("request scheduler receive time is unavailable")
     return max(0.0, (now_s - float(received)) * 1000.0)
+
+
+def deadline_remaining_ms(
+    hint: FutureHint,
+    *,
+    now_s: float | None = None,
+    age_ms: float | None = None,
+) -> int | None:
+    """Resolve the remaining deadline without confusing dispatch and receipt clocks."""
+    if hint.deadline_after_ms is None:
+        return None
+    if hint.deadline_clock == "perf_counter":
+        if now_s is None or not math.isfinite(now_s):
+            raise ValueError("absolute deadline requires a finite perf_counter time")
+        return max(0, math.ceil(hint.deadline_absolute_ms - now_s * 1000.0))
+    if age_ms is None or not math.isfinite(age_ms):
+        raise ValueError("relative deadline requires request age")
+    return max(0, math.ceil(hint.deadline_after_ms - age_ms))
 
 
 def _prompt_tokens(request: Any) -> int:
@@ -196,7 +250,19 @@ def order_requests(
         if hint is None:
             _stats["fallback_missing_hint"] += 1
             return queue
-        age_ms = _request_age_ms(request, now_s)
+        try:
+            age_ms = _request_age_ms(request, now_s)
+        except (AttributeError, TypeError, ValueError):
+            if (
+                hint.release_after_ms != 0
+                or horizon_ms is not None
+                or (
+                    hint.deadline_after_ms is not None
+                    and hint.deadline_clock != "perf_counter"
+                )
+            ):
+                raise
+            age_ms = 0.0
         if horizon_ms is not None and hint.release_after_ms - age_ms > horizon_ms:
             _stats["fallback_horizon"] += 1
             return queue
@@ -212,10 +278,13 @@ def order_requests(
             raise ValueError("deadline planning requires expected_output_tokens")
         decode_ms = 1000.0 * (hint.expected_output_tokens or 1) / decode_tokens_per_s
         estimated_request_ms = prefill_ms + decode_ms
+        remaining_deadline_ms = deadline_remaining_ms(
+            hint, now_s=now_s, age_ms=age_ms
+        )
         latest_start = (
             float("inf")
-            if hint.deadline_after_ms is None
-            else hint.deadline_after_ms - age_ms - estimated_request_ms
+            if remaining_deadline_ms is None
+            else remaining_deadline_ms - estimated_request_ms
         )
         residency_rank = {
             "resident": 0,

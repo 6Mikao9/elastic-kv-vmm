@@ -1,10 +1,10 @@
 import json
-from pathlib import Path
 import tempfile
 import threading
 import time
 import unittest
 from dataclasses import replace
+from pathlib import Path
 
 from adaptive_sparse.elastic_admission import ElasticKVConfig
 from adaptive_sparse.future_plan import (
@@ -79,14 +79,23 @@ class RolloutExecutorTest(unittest.TestCase):
         )
 
     def test_wraps_payload_in_the_runtime_envelope(self):
-        envelope = make_kv_hints(submission())
+        envelope = make_kv_hints(submission(), clock_now_s=10.0)
 
         self.assertEqual(envelope["protocol_version"], "1")
         self.assertEqual(envelope["message_id"], "request-1")
         self.assertEqual(envelope["actions"][0]["action_type"], "elastic.future")
+        self.assertEqual(envelope["actions"][0]["action_version"], "2")
         self.assertEqual(envelope["actions"][0]["payload"]["residence"], "resident")
-        adjusted = make_kv_hints(submission(), deadline_after_ms=17)
+        payload = envelope["actions"][0]["payload"]
+        self.assertEqual(payload["deadline_clock"], "perf_counter")
+        self.assertEqual(payload["deadline_absolute_ms"], 10100)
+        adjusted = make_kv_hints(
+            submission(), deadline_after_ms=17, clock_now_s=10.0
+        )
         self.assertEqual(adjusted["actions"][0]["payload"]["deadline_after_ms"], 17)
+        self.assertEqual(
+            adjusted["actions"][0]["payload"]["deadline_absolute_ms"], 10017
+        )
         demoted = make_kv_hints(submission(), residence_override="host_backed")
         self.assertEqual(demoted["actions"][0]["payload"]["residence"], "host_backed")
 
@@ -428,6 +437,10 @@ class RolloutExecutorTest(unittest.TestCase):
         self.assertTrue(row["actual_deadline_hit"])
         self.assertEqual(result["summary"]["deadline_hits"], 1)
         self.assertEqual(seen[0][1]["future_hint"]["message_id"], "request-1")
+        absolute_deadline = seen[0][1]["future_hint"]["actions"][0]["payload"][
+            "deadline_absolute_ms"
+        ]
+        self.assertEqual(absolute_deadline, 10050)
         self.assertEqual(seen[0][3], True)
 
     def test_throughput_includes_planned_initial_idle(self):
