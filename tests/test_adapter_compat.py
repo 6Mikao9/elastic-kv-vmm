@@ -1,5 +1,6 @@
 import sys
 import unittest
+from contextlib import nullcontext
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
@@ -280,9 +281,9 @@ class AdapterCompatibilityTest(unittest.TestCase):
 
             observed_allocator = model_runner.TokenToKVPoolAllocator
             allocator_probe = SimpleNamespace(
-                free_slots=SimpleNamespace(count=40),
+                free_slots=SimpleNamespace(count=40, ranges=[(1, 41)]),
                 ctrl=SimpleNamespace(
-                    physical_available_tokens=lambda logical: min(logical, 17)
+                    physical_available_tokens=lambda logical, ranges: min(logical, 17)
                 ),
             )
             self.assertEqual(observed_allocator.available_size(allocator_probe), 17)
@@ -354,7 +355,7 @@ class AdapterCompatibilityTest(unittest.TestCase):
         ctrl = object.__new__(adapter.Residency)
         ctrl.admission_policy = "physical"
         ctrl.pool = SimpleNamespace(device="cuda:0")
-        ctrl.arenas = [SimpleNamespace(planes=2)]
+        ctrl.arenas = [SimpleNamespace(planes=2, mapped_chunks={0, 1})]
         ctrl.chunk_bytes = 1_000
         ctrl.slot_bytes = 100
         ctrl.prefill_headroom_bytes = 500
@@ -362,17 +363,19 @@ class AdapterCompatibilityTest(unittest.TestCase):
         ctrl.counts = [0] * 100
         ctrl.live = adapter.np.zeros(100, dtype=adapter.np.bool_)
         ctrl.live[0] = True
-        ctrl.precommitted = {20, 21}
+        ctrl.precommitted = {2}
         ctrl.counters = {}
 
         with patch.object(
             adapter.torch.cuda, "mem_get_info", return_value=(5_500, 10_000)
         ):
-            admitted = ctrl.physical_available_tokens(100)
+            admitted = ctrl.physical_available_tokens(100, [(1, 101)])
 
-        # 2 new logical chunks + 1 retained free chunk + 2 precommitted
-        # chunks, at 10 tokens per chunk, with 2 planes per VMM commit.
-        self.assertEqual(admitted, 50)
+        # Chunks 0-2 are already mapped or precommitted. Free chunks 3-4 fit
+        # the remaining two-chunk budget. Slot 0 is the sink, so the first
+        # three chunks contain 9 + 10 + 10 usable slots and the next two add
+        # 10 each.
+        self.assertEqual(admitted, 49)
         self.assertEqual(ctrl.counters["physical_chunk_cost_bytes"], 2_000)
         self.assertEqual(ctrl.counters["physical_headroom_bytes"], 500)
         self.assertEqual(ctrl.counters["physical_limited_calls"], 1)
@@ -381,8 +384,31 @@ class AdapterCompatibilityTest(unittest.TestCase):
         ctrl = object.__new__(adapter.Residency)
         ctrl.admission_policy = "logical"
         with patch.object(adapter.torch.cuda, "mem_get_info") as mem_info:
-            self.assertEqual(ctrl.physical_available_tokens(7), 7)
+            self.assertEqual(ctrl.physical_available_tokens(7, None), 7)
         mem_info.assert_not_called()
+
+    def test_physical_admission_credits_mapped_holes_before_new_chunks(self):
+        ctrl = object.__new__(adapter.Residency)
+        ctrl.admission_policy = "physical"
+        ctrl.pool = SimpleNamespace(device="cuda:0")
+        ctrl.arenas = [SimpleNamespace(planes=1, mapped_chunks={0, 1, 2})]
+        ctrl.chunk_bytes = 1_000
+        ctrl.slot_bytes = 100
+        ctrl.prefill_headroom_bytes = 0
+        ctrl.counters = {}
+        ctrl.precommitted = set()
+
+        with patch.object(
+            adapter.torch.cuda, "mem_get_info", return_value=(0, 10_000)
+        ), patch.object(
+            adapter.torch.cuda, "device", return_value=nullcontext()
+        ), patch.object(adapter.torch.cuda, "empty_cache"):
+            admitted = ctrl.physical_available_tokens(
+                10, [(1, 6), (11, 16)]
+            )
+
+        self.assertEqual(admitted, 10)
+        self.assertNotIn("physical_limited_calls", ctrl.counters)
 
 
 if __name__ == "__main__":

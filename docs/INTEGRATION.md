@@ -19,7 +19,7 @@ must remain off because it owns a different backing lifecycle.
 |---|---|---|
 | Physical memory | [elastic_vmm.cpp](../native/elastic_vmm.cpp), [backing.py](../elastic_kv/backing.py) | Reserve stable virtual addresses, map and zero newly committed CUDA chunks, then unmap and release unused physical handles. CuPy/DLPack exposes those addresses as PyTorch tensors. |
 | Pool construction | [adapter.py](../elastic_kv/adapter.py) | On 0.5.2, hook `ModelRunner.init_memory_pool`; on the newer API, replace the MHA class and allocator at their `mem_cache` import sites and wrap `KVCacheConfigurator.configure()`. Both routes replace `MHATokenToKVPool._create_buffers` to provide demand-backed K/V planes. |
-| Slot allocation | [adapter.py](../elastic_kv/adapter.py) | V5 tracks free ID ranges on the host, favors low IDs and admits ranges before writes. Contiguous allocations use slices of a persistent GPU ID tensor. Fragmented allocations return the selected IDs through the existing allocator interface. Physical admission mode bounds `available_size()` before SGLang builds a batch by charging prefill headroom and new VMM chunk commits against current device free memory. |
+| Slot allocation | [adapter.py](../elastic_kv/adapter.py) | V5 tracks free ID ranges on the host, favors low IDs and admits ranges before writes. Contiguous allocations use slices of a persistent GPU ID tensor. Fragmented allocations return the selected IDs through the existing allocator interface. Physical admission mode bounds `available_size()` before SGLang builds a batch by charging prefill headroom only when the low-ID free prefix first touches an unmapped VMM chunk. |
 | Residency | [adapter.py](../elastic_kv/adapter.py) | V5 defers ordinary reclaim until the pool drains, synchronizes before unmapping and can retain a configurable low-ID chunk reserve with `EKV_RETAIN_CHUNKS`. `EKV_PRECOMMIT_CHUNKS` optionally precommits the next logical chunk and moves its zeroing to a private nonblocking CUDA stream; the first real `ensure` remains the readiness barrier. A global `EKV_PRECOMMIT_MAX_CHUNKS` cap bounds speculative physical backing. Logical capacity remains fixed. |
 | Startup | [launch.py](../elastic_kv/launch.py), [adapter.py](../elastic_kv/adapter.py) | Install hooks in the server process tree and reject unsupported configurations. |
 
@@ -57,7 +57,9 @@ exceeds free memory. A shortfall is recorded and allocation proceeds through
 the usual path instead of changing the scheduler contract. The target is a
 heuristic in this mode. Physical admission separately exposes a conservative
 budget through the native `available_size()` query, allowing `PrefillAdder` to
-reduce a batch before VMM commit. The prefill headroom remains an estimate, and
+reduce a batch before VMM commit. Already mapped free ranges and precommitted
+chunks remain available under pressure instead of being lost to a coarse
+chunks-to-tokens calculation. The prefill headroom remains an estimate, and
 transactional allocation failure, exact activation ownership and cross-process
 memory grants remain separate work.
 

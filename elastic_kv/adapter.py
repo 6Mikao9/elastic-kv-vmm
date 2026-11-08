@@ -161,14 +161,15 @@ class Residency:
             raise ValueError("slot exceeds VMM chunk size")
         return np.concatenate((first, last[last != first]))
 
-    def physical_available_tokens(self, logical_free_tokens):
+    def physical_available_tokens(self, logical_free_tokens, free_ranges):
         """Bound scheduler admission by the bytes VMM can actually commit.
 
-        Existing mapped but free token slots are intentionally not credited in
-        this first runtime slice. The result is therefore conservative. The
-        configured prefill headroom is charged here, before ``prepare_for_extend``
-        allocates activations, so KV backing and the prefill working set share
-        one physical-device budget at scheduler admission time.
+        The scheduler allocates slots in ``free_ranges`` order. Slots whose
+        chunks are already mapped consume no new backing and are credited;
+        only the first touch of another chunk spends physical budget. The
+        configured prefill headroom is charged here, before
+        ``prepare_for_extend`` allocates activations, so KV backing and the
+        prefill working set share one device budget at admission time.
         """
 
         if logical_free_tokens < 0:
@@ -179,6 +180,13 @@ class Residency:
             return 0
         if self.slot_bytes <= 0 or self.slot_bytes > self.chunk_bytes:
             raise ValueError("physical admission requires 0 < slot_bytes <= chunk_bytes")
+        ranges = tuple(free_ranges)
+        if any(start < 1 or stop <= start for start, stop in ranges):
+            raise ValueError("free_ranges must contain positive half-open ranges")
+        if sum(stop - start for start, stop in ranges) != logical_free_tokens:
+            raise ValueError("free_ranges length must match logical_free_tokens")
+        if any(left[1] > right[0] for left, right in zip(ranges, ranges[1:])):
+            raise ValueError("free_ranges must be sorted and disjoint")
 
         chunk_cost = sum(
             self.chunk_bytes * getattr(arena, "planes", 1)
@@ -213,17 +221,42 @@ class Residency:
             free = after
 
         usable = max(0, free - self.prefill_headroom_bytes)
-        new_chunks = usable // chunk_cost
-        tokens_per_chunk = self.chunk_bytes // self.slot_bytes
-        retained_free_chunks = 0
-        if not self.live[1:].any():
-            retained_free_chunks = max(
-                0, min(self.retain_chunks, len(self.counts)) - 1
+        chunk_budget = usable // chunk_cost
+        backed_chunks = set(self.precommitted)
+        if self.arenas:
+            backed_chunks.update(
+                set.intersection(*(set(arena.mapped_chunks) for arena in self.arenas))
             )
-        capacity = (
-            new_chunks + retained_free_chunks + len(self.precommitted)
-        ) * tokens_per_chunk
-        admitted = min(logical_free_tokens, capacity)
+        admitted = 0
+        for start, stop in ranges:
+            remaining = logical_free_tokens - admitted
+            if remaining <= 0:
+                break
+            stop = min(stop, start + remaining)
+            position = start
+            while position < stop:
+                first = position * self.slot_bytes // self.chunk_bytes
+                last = ((position + 1) * self.slot_bytes - 1) // self.chunk_bytes
+                missing = {
+                    chunk
+                    for chunk in range(first, last + 1)
+                    if chunk not in backed_chunks
+                }
+                if len(missing) > chunk_budget:
+                    break
+                chunk_budget -= len(missing)
+                backed_chunks.update(missing)
+                # Every slot before next_position uses only chunks through
+                # ``last`` and is therefore fully backed by this decision.
+                next_position = max(
+                    position + 1,
+                    ((last + 1) * self.chunk_bytes) // self.slot_bytes,
+                )
+                segment_end = min(stop, next_position)
+                admitted += segment_end - position
+                position = segment_end
+            if position < stop:
+                break
         self.counters["physical_headroom_bytes"] = self.prefill_headroom_bytes
         self.counters["physical_chunk_cost_bytes"] = chunk_cost
         self.counters["physical_available_tokens_min"] = min(
@@ -527,7 +560,9 @@ def install():
 
         def available_size(self):
             if MODE == "v5":
-                return self.ctrl.physical_available_tokens(self.free_slots.count)
+                return self.ctrl.physical_available_tokens(
+                    self.free_slots.count, self.free_slots.ranges
+                )
             if MODE in HOST_FREE_MODES and hasattr(self, "host_free"):
                 return int(np.count_nonzero(self.host_free))
             return super().available_size()

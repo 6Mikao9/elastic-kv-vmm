@@ -102,9 +102,11 @@ Use a fresh output directory for every run. Substitute `baseline` or `v0`–`v4`
 Set `EKV_ADMISSION_POLICY=physical` (or use the corresponding launcher option)
 with V5 to bound SGLang's allocator `available_size()` by current device free
 memory, the configured prefill headroom and the exact cost of committing a new
-VMM chunk. The scheduler can then reduce an extend or decode batch before KV
-commit. The gate is conservative and remains inside one process; it is not yet
-a cross-instance reservation or a guarantee against concurrent allocator races.
+VMM chunk. Already mapped holes and precommitted chunks remain usable, so the
+scheduler reduces an extend or decode batch only when its low-ID free prefix
+actually needs unmapped backing. The gate remains inside one process; it is not
+yet a cross-instance reservation or a guarantee against concurrent allocator
+races.
 
 For an existing isolated environment, the primary entry point is `python3 -m elastic_kv` (or `elastic-sglang` after installing `pyproject.toml`). It validates elastic settings before importing SGLang, installs the adapter, and forwards the remaining arguments to SGLang. The launcher now owns precommit lookahead, future-ordering horizon and both telemetry destinations as well as their `EKV_*` environment equivalents, so spawned SGLang workers receive one validated manifest. `python3 -m elastic_kv.launch` remains compatible with the experiment scripts. The module entry point is required so the adapter is installed in the spawned scheduler process as well as the launcher. See [server usage](docs/SERVER.md); `EKV_STATS_PATH` optionally records residency telemetry.
 

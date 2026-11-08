@@ -58,11 +58,12 @@ With `--elastic-admission-policy physical`, V5's allocator reports a
 conservative physical token budget through SGLang's native `available_size()`
 call. The budget charges the configured prefill headroom and the bytes needed
 to commit a new logical KV chunk before SGLang builds an extend/decode batch.
-It also counts only precommitted and explicitly retained free chunks as already
-backed. Use `--elastic-activation-policy both` to trim unreferenced VMM chunks
-and reclaim PyTorch cache under the same pressure gate. This reduces admission
-before VMM commit; it is not yet a cross-process reservation or a guarantee
-against a concurrent CUDA allocator race.
+Already mapped free slots and precommitted chunks consume no new backing and
+remain schedulable even when free device memory is tight. Use
+`--elastic-activation-policy both` to trim unreferenced VMM chunks and reclaim
+PyTorch cache under the same pressure gate. This reduces admission before VMM
+commit; it is not yet a cross-process reservation or a guarantee against a
+concurrent CUDA allocator race.
 
 Set `--elastic-future-stats-path` (or `EKV_FUTURE_STATS_PATH`) to atomically
 export scheduler hook counters from `adaptive_sparse.sglang_future_hook`; these
