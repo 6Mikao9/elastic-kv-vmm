@@ -30,6 +30,9 @@ class ElasticConfigTest(unittest.TestCase):
                 "EKV_PREFILL_WORKSPACE_MAX_MIB": "768",
                 "EKV_PRECOMMIT_CHUNKS": "2",
                 "EKV_PRECOMMIT_MAX_CHUNKS": "3",
+                "EKV_PREDICTIVE_PREWARM_MODE": "enforce",
+                "EKV_PREDICTIVE_PREWARM_TTL_MS": "275",
+                "EKV_PREDICTIVE_PREWARM_MAX_CHUNKS": "6",
                 "EKV_FUTURE_POLICY": "deadline",
                 "EKV_FUTURE_ORDERING_HORIZON_MS": "2000",
                 "EKV_FUTURE_STATS_PATH": "/tmp/future.json",
@@ -55,6 +58,9 @@ class ElasticConfigTest(unittest.TestCase):
         self.assertEqual(config.prefill_workspace_max_mib, 768)
         self.assertEqual(config.precommit_chunks, 2)
         self.assertEqual(config.precommit_max_chunks, 3)
+        self.assertEqual(config.predictive_prewarm_mode, "enforce")
+        self.assertEqual(config.predictive_prewarm_ttl_ms, 275)
+        self.assertEqual(config.predictive_prewarm_max_chunks, 6)
         self.assertEqual(config.future_policy, "deadline")
         self.assertEqual(config.future_ordering_horizon_ms, 2000)
         self.assertEqual(config.future_stats_path, "/tmp/future.json")
@@ -94,6 +100,27 @@ class ElasticConfigTest(unittest.TestCase):
             ElasticConfig(precommit_chunks=5)
         with self.assertRaisesRegex(ValueError, "must cover"):
             ElasticConfig(precommit_chunks=2, precommit_max_chunks=1)
+
+    def test_predictive_prewarm_requires_bounded_v5_leases(self):
+        with self.assertRaisesRegex(ValueError, "requires elastic mode v5"):
+            ElasticConfig(mode="v4", predictive_prewarm_mode="dry_run")
+        with self.assertRaisesRegex(ValueError, "positive TTL"):
+            ElasticConfig(
+                mode="v5",
+                predictive_prewarm_mode="enforce",
+                predictive_prewarm_ttl_ms=0,
+            )
+        with self.assertRaisesRegex(ValueError, "between 0 and 64"):
+            ElasticConfig(predictive_prewarm_max_chunks=65)
+        config = ElasticConfig(
+            mode="v5",
+            predictive_prewarm_mode="enforce",
+            predictive_prewarm_ttl_ms=275,
+            predictive_prewarm_max_chunks=6,
+        )
+        self.assertEqual(
+            config.as_env()["EKV_PREDICTIVE_PREWARM_MODE"], "enforce"
+        )
 
     def test_dynamic_prefill_workspace_requires_v5_physical_admission(self):
         with self.assertRaisesRegex(ValueError, "dynamic prefill workspace requires"):
@@ -182,6 +209,12 @@ class ElasticConfigTest(unittest.TestCase):
                 "2",
                 "--elastic-precommit-max-chunks",
                 "4",
+                "--elastic-predictive-prewarm-mode",
+                "enforce",
+                "--elastic-predictive-prewarm-ttl-ms",
+                "275",
+                "--elastic-predictive-prewarm-max-chunks",
+                "6",
                 "--elastic-future-ordering-horizon-ms",
                 "1500",
                 "--elastic-future-stats-path",
@@ -218,6 +251,9 @@ class ElasticConfigTest(unittest.TestCase):
                 config.future_policy,
                 config.precommit_chunks,
                 config.precommit_max_chunks,
+                config.predictive_prewarm_mode,
+                config.predictive_prewarm_ttl_ms,
+                config.predictive_prewarm_max_chunks,
                 config.future_ordering_horizon_ms,
                 config.future_stats_path,
                 config.prefill_headroom_scoped,
@@ -241,6 +277,9 @@ class ElasticConfigTest(unittest.TestCase):
                 "deadline",
                 2,
                 4,
+                "enforce",
+                275,
+                6,
                 1500,
                 "/tmp/future.json",
                 True,

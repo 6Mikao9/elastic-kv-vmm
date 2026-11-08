@@ -31,6 +31,10 @@ DEFAULT_FUTURE_ORDERING_HORIZON_MS = 0
 DEFAULT_GLOBAL_BROKER_STALE_SECONDS = 120
 GLOBAL_BROKER_FAIR_MODES = ("off", "observe", "enforce")
 GLOBAL_BROKER_PREFILL_MODES = ("off", "observe", "enforce")
+PREDICTIVE_PREWARM_MODES = ("off", "dry_run", "enforce")
+DEFAULT_PREDICTIVE_PREWARM_MODE = "off"
+DEFAULT_PREDICTIVE_PREWARM_TTL_MS = 2000
+DEFAULT_PREDICTIVE_PREWARM_MAX_CHUNKS = 8
 
 
 def _integer(name: str, value: object, *, minimum: int) -> int:
@@ -79,6 +83,9 @@ class ElasticConfig:
     prefill_headroom_mib: int = DEFAULT_PREFILL_HEADROOM_MIB
     precommit_chunks: int = DEFAULT_PRECOMMIT_CHUNKS
     precommit_max_chunks: int = 1
+    predictive_prewarm_mode: str = DEFAULT_PREDICTIVE_PREWARM_MODE
+    predictive_prewarm_ttl_ms: int = DEFAULT_PREDICTIVE_PREWARM_TTL_MS
+    predictive_prewarm_max_chunks: int = DEFAULT_PREDICTIVE_PREWARM_MAX_CHUNKS
     future_policy: str = DEFAULT_FUTURE_POLICY
     future_ordering_horizon_ms: int = DEFAULT_FUTURE_ORDERING_HORIZON_MS
     stats_path: str | None = None
@@ -121,6 +128,23 @@ class ElasticConfig:
         if self.precommit_max_chunks < max(1, self.precommit_chunks):
             raise ValueError(
                 "precommit_max_chunks must cover precommit_chunks"
+            )
+        if self.predictive_prewarm_mode not in PREDICTIVE_PREWARM_MODES:
+            raise ValueError("unknown predictive prewarm mode")
+        if self.predictive_prewarm_mode != "off" and self.mode != "v5":
+            raise ValueError("predictive prewarm requires elastic mode v5")
+        if self.predictive_prewarm_ttl_ms < 0:
+            raise ValueError("predictive_prewarm_ttl_ms must be nonnegative")
+        if not 0 <= self.predictive_prewarm_max_chunks <= 64:
+            raise ValueError(
+                "predictive_prewarm_max_chunks must be between 0 and 64"
+            )
+        if self.predictive_prewarm_mode != "off" and (
+            self.predictive_prewarm_ttl_ms < 1
+            or self.predictive_prewarm_max_chunks < 1
+        ):
+            raise ValueError(
+                "predictive prewarm requires positive TTL and max chunks"
             )
         if self.future_policy not in FUTURE_POLICIES:
             raise ValueError(f"unknown future policy: {self.future_policy!r}")
@@ -237,6 +261,26 @@ class ElasticConfig:
                 ),
                 minimum=1,
             ),
+            predictive_prewarm_mode=env.get(
+                "EKV_PREDICTIVE_PREWARM_MODE",
+                DEFAULT_PREDICTIVE_PREWARM_MODE,
+            ).strip().lower(),
+            predictive_prewarm_ttl_ms=_integer(
+                "EKV_PREDICTIVE_PREWARM_TTL_MS",
+                env.get(
+                    "EKV_PREDICTIVE_PREWARM_TTL_MS",
+                    DEFAULT_PREDICTIVE_PREWARM_TTL_MS,
+                ),
+                minimum=0,
+            ),
+            predictive_prewarm_max_chunks=_integer(
+                "EKV_PREDICTIVE_PREWARM_MAX_CHUNKS",
+                env.get(
+                    "EKV_PREDICTIVE_PREWARM_MAX_CHUNKS",
+                    DEFAULT_PREDICTIVE_PREWARM_MAX_CHUNKS,
+                ),
+                minimum=0,
+            ),
             future_policy=env.get("EKV_FUTURE_POLICY", DEFAULT_FUTURE_POLICY),
             future_ordering_horizon_ms=_integer(
                 "EKV_FUTURE_ORDERING_HORIZON_MS",
@@ -320,6 +364,9 @@ class ElasticConfig:
         prefill_headroom_mib: int | None = None,
         precommit_chunks: int | None = None,
         precommit_max_chunks: int | None = None,
+        predictive_prewarm_mode: str | None = None,
+        predictive_prewarm_ttl_ms: int | None = None,
+        predictive_prewarm_max_chunks: int | None = None,
         future_policy: str | None = None,
         future_ordering_horizon_ms: int | None = None,
         stats_path: str | None = None,
@@ -349,6 +396,12 @@ class ElasticConfig:
                 ("prefill_headroom_mib", prefill_headroom_mib),
                 ("precommit_chunks", precommit_chunks),
                 ("precommit_max_chunks", precommit_max_chunks),
+                ("predictive_prewarm_mode", predictive_prewarm_mode),
+                ("predictive_prewarm_ttl_ms", predictive_prewarm_ttl_ms),
+                (
+                    "predictive_prewarm_max_chunks",
+                    predictive_prewarm_max_chunks,
+                ),
                 ("future_policy", future_policy),
                 ("future_ordering_horizon_ms", future_ordering_horizon_ms),
                 ("stats_path", stats_path),
@@ -387,6 +440,13 @@ class ElasticConfig:
             "EKV_PREFILL_HEADROOM_MIB": str(self.prefill_headroom_mib),
             "EKV_PRECOMMIT_CHUNKS": str(self.precommit_chunks),
             "EKV_PRECOMMIT_MAX_CHUNKS": str(self.precommit_max_chunks),
+            "EKV_PREDICTIVE_PREWARM_MODE": self.predictive_prewarm_mode,
+            "EKV_PREDICTIVE_PREWARM_TTL_MS": str(
+                self.predictive_prewarm_ttl_ms
+            ),
+            "EKV_PREDICTIVE_PREWARM_MAX_CHUNKS": str(
+                self.predictive_prewarm_max_chunks
+            ),
             "EKV_FUTURE_POLICY": self.future_policy,
             "EKV_FUTURE_ORDERING_HORIZON_MS": str(
                 self.future_ordering_horizon_ms
@@ -450,6 +510,11 @@ class ElasticConfig:
             "prefill_headroom_mib": self.prefill_headroom_mib,
             "precommit_chunks": self.precommit_chunks,
             "precommit_max_chunks": self.precommit_max_chunks,
+            "predictive_prewarm_mode": self.predictive_prewarm_mode,
+            "predictive_prewarm_ttl_ms": self.predictive_prewarm_ttl_ms,
+            "predictive_prewarm_max_chunks": (
+                self.predictive_prewarm_max_chunks
+            ),
             "future_policy": self.future_policy,
             "future_ordering_horizon_ms": self.future_ordering_horizon_ms,
             "stats_path": self.stats_path,
