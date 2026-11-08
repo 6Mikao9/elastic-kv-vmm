@@ -148,6 +148,7 @@ def _future_reservation(
     horizon_end_ms = now_ms + config.lookahead_ms
     reserved_bytes = 0
     reserved_requests = 0
+    resident_prefixes: dict[str, list[int]] = {}
     for future in future_submissions:
         if future.request_id == submission.request_id:
             continue
@@ -164,9 +165,22 @@ def _future_reservation(
             continue
         placement, _ = _preferred_residence(future, config)
         reserved_bytes += config.hold_bytes(future, placement)
+        if (
+            placement == "resident"
+            and future_hint.prefix_group is not None
+            and future_hint.shared_prefix_tokens > 0
+        ):
+            resident_prefixes.setdefault(future_hint.prefix_group, []).append(
+                future_hint.shared_prefix_tokens
+            )
         reserved_requests += 1
         if reserved_requests >= config.max_future_reservations:
             break
+    reserved_bytes -= sum(
+        (len(lengths) - 1) * min(lengths) * config.kv_bytes_per_token
+        for lengths in resident_prefixes.values()
+        if len(lengths) > 1
+    )
     return reserved_bytes, reserved_requests
 
 

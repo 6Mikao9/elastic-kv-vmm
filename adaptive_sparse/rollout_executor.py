@@ -94,6 +94,7 @@ def validate_submissions(submissions: Iterable[RolloutSubmission]) -> tuple[Roll
     ordered = tuple(submissions)
     if not ordered:
         raise RolloutExecutionError("rollout contains no submissions")
+    prefix_lengths: dict[str, set[int]] = {}
     for item in ordered:
         if not isinstance(item.request_id, str) or not item.request_id:
             raise RolloutExecutionError("each rollout submission needs a request ID")
@@ -129,6 +130,14 @@ def validate_submissions(submissions: Iterable[RolloutSubmission]) -> tuple[Roll
             raise RolloutExecutionError(
                 f"{item.request_id}: hint output estimate does not match output_tokens"
             )
+        if hint.shared_prefix_tokens > item.prompt_tokens:
+            raise RolloutExecutionError(
+                f"{item.request_id}: shared prefix exceeds prompt length"
+            )
+        if hint.prefix_group is not None:
+            prefix_lengths.setdefault(hint.prefix_group, set()).add(
+                hint.shared_prefix_tokens
+            )
         if item.deadline_ms is not None:
             if type(item.deadline_ms) is not int or item.deadline_ms < item.planned_arrival_ms:
                 raise RolloutExecutionError(
@@ -143,6 +152,14 @@ def validate_submissions(submissions: Iterable[RolloutSubmission]) -> tuple[Roll
                 f"{item.request_id}: deadline hint lacks the original absolute deadline"
             )
         make_kv_hints(item)
+    inconsistent = next(
+        (group for group, lengths in prefix_lengths.items() if len(lengths) > 1),
+        None,
+    )
+    if inconsistent is not None:
+        raise RolloutExecutionError(
+            f"prefix group {inconsistent}: inconsistent shared prefix lengths"
+        )
     ids = [item.request_id for item in ordered]
     if len(set(ids)) != len(ids):
         raise RolloutExecutionError("rollout request IDs must be unique")

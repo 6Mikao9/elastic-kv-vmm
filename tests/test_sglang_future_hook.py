@@ -41,6 +41,22 @@ class SGLangFutureHookTest(unittest.TestCase):
         self.assertTrue(decision.claim)
         self.assertEqual(decision.reason, "long-request-default")
 
+    def test_shared_prefix_identity_is_validated_and_preserved(self):
+        hint = hook.FutureHint.from_payload(
+            {
+                "prefix_group": "system-prefix",
+                "shared_prefix_tokens": 4096,
+            }
+        )
+        self.assertEqual(hint.prefix_group, "system-prefix")
+        self.assertEqual(hint.shared_prefix_tokens, 4096)
+        with self.assertRaisesRegex(ValueError, "prefix_group"):
+            hook.FutureHint.from_payload({"shared_prefix_tokens": 1})
+        with self.assertRaisesRegex(ValueError, "shared_prefix_tokens"):
+            hook.FutureHint.from_payload(
+                {"prefix_group": "group", "shared_prefix_tokens": True}
+            )
+
     def test_deadline_reorders_after_native_priority(self):
         long = request(
             "long",

@@ -141,6 +141,11 @@ When the planner enables a positive `lookahead_ms`, the same admission check
 also reserves bounded capacity for imminent deadline or higher-weight requests
 that can overlap the current request. This decision is made once at admission;
 the existing scheduler hysteresis owns later demotion and promotion.
+Shared immutable prefixes are also carried through the validated future hint;
+resident requests in one `prefix_group` are charged one prefix copy in the
+planner and future reservation model. The current runtime does not yet bind
+Top-K reads to another request's resident prefix, so this is not a measured
+serving-memory result.
 The 0.5.17 API and request-transport tests pass; a real model server could not
 start on the available 5090 host because PyTorch CUDA initialization failed after
 container `nvidia-smi` succeeded. That blocker is recorded without converting it

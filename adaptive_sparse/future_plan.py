@@ -240,6 +240,7 @@ class PlanResult:
     search_expansions: int = 0
     search_truncated: bool = False
     fallback_policy: str | None = None
+    peak_shared_prefix_credit_bytes: int = 0
 
     @property
     def search_exact(self) -> bool:
@@ -260,6 +261,7 @@ class PlanResult:
             "policy": self.policy,
             "peak_memory_bytes": self.peak_memory_bytes,
             "peak_backed_bytes": self.peak_backed_bytes,
+            "peak_shared_prefix_credit_bytes": self.peak_shared_prefix_credit_bytes,
             "makespan_ms": self.makespan_ms,
             "weighted_completion_ms": self.weighted_completion_ms,
             "deadline_misses": self.deadline_misses,
@@ -357,6 +359,48 @@ def _hold_bytes(request: RequestProfile, mode: ResidencyMode, config: PlannerCon
     return tokens * config.kv_bytes_per_token
 
 
+def _placement_memory(
+    placements: Sequence[tuple[RequestProfile, ResidencyMode]],
+    config: PlannerConfig,
+) -> tuple[int, int]:
+    """Return aggregate KV and shared-prefix credit for active placements.
+
+    Only resident requests can share a complete immutable prefix. HiSparse
+    requests remain fully charged by their bounded hot set because its Top-K
+    selection is not guaranteed to retain the shared prefix. This is a
+    conservative planner model, not a claim that the runtime lookup exists.
+    """
+
+    total = 0
+    resident_prefixes: dict[str, list[int]] = {}
+    for request, mode in placements:
+        total += _hold_bytes(request, mode, config)
+        if (
+            mode is ResidencyMode.RESIDENT
+            and request.prefix_group is not None
+            and request.shared_prefix_tokens > 0
+        ):
+            resident_prefixes.setdefault(request.prefix_group, []).append(
+                request.shared_prefix_tokens
+            )
+    credit_tokens = sum(
+        (len(lengths) - 1) * min(lengths)
+        for lengths in resident_prefixes.values()
+        if len(lengths) > 1
+    )
+    credit = credit_tokens * config.kv_bytes_per_token
+    return total - credit, credit
+
+
+def _active_placements(
+    active: Sequence[_Active],
+) -> list[tuple[RequestProfile, ResidencyMode]]:
+    return [
+        (item.request, item.admission.mode)
+        for item in active
+    ]
+
+
 def _duration_ms(request: RequestProfile, mode: ResidencyMode, config: PlannerConfig) -> int:
     prefill = _ceil_duration(request.prompt_tokens, config.prefill_tokens_per_ms)
     decode_rate = (
@@ -380,7 +424,7 @@ def _urgency(request: RequestProfile, now_ms: int, config: PlannerConfig) -> flo
 def _future_contention(
     request: RequestProfile,
     mode: ResidencyMode,
-    active_bytes: int,
+    active: Sequence[_Active],
     pending: Sequence[RequestProfile],
     future: Sequence[RequestProfile],
     now_ms: int,
@@ -396,7 +440,9 @@ def _future_contention(
     if (not pending and not future) or mode is ResidencyMode.HI_SPARSE:
         return 0
     finish = now_ms + _duration_ms(request, mode, config)
-    spend = active_bytes + _hold_bytes(request, mode, config)
+    spend, _ = _placement_memory(
+        (*_active_placements(active), (request, mode)), config
+    )
     displaced = 0
     future_need = 0
     for item in (*pending, *future):
@@ -421,20 +467,15 @@ def _feasible_mode(
     config: PlannerConfig,
     preferred: ResidencyMode = ResidencyMode.RESIDENT,
     *,
-    extra_hold_bytes: int = 0,
-    extra_active_requests: int = 0,
+    extra_placements: Sequence[tuple[RequestProfile, ResidencyMode]] = (),
 ) -> tuple[ResidencyMode, str] | None:
-    if extra_hold_bytes < 0 or extra_active_requests < 0:
-        raise ValueError("extra active state must be nonnegative")
-    if len(active) + extra_active_requests > config.max_active_requests:
+    if len(active) + len(extra_placements) > config.max_active_requests:
         return None
-    active_bytes = (
-        sum(item.admission.resident_kv_bytes for item in active)
-        + extra_hold_bytes
-    )
     workspace = request.prompt_tokens * config.prefill_workspace_bytes_per_token
     native_hold = _hold_bytes(request, ResidencyMode.HI_SPARSE, config)
+    placements = (*_active_placements(active), *extra_placements)
     if request.sequence_tokens <= config.sparse_hot_tokens:
+        active_bytes, _ = _placement_memory(placements, config)
         if active_bytes + workspace + native_hold <= config.memory_budget_bytes:
             return ResidencyMode.HI_SPARSE, "fits-native-hot-set"
         return None
@@ -447,8 +488,10 @@ def _feasible_mode(
     else:
         order = (preferred, ResidencyMode.HI_SPARSE if preferred is ResidencyMode.RESIDENT else ResidencyMode.RESIDENT)
     for mode in order:
-        hold = _hold_bytes(request, mode, config)
-        if active_bytes + workspace + hold <= config.memory_budget_bytes:
+        aggregate, _ = _placement_memory(
+            (*placements, (request, mode)), config
+        )
+        if aggregate + workspace <= config.memory_budget_bytes:
             if request.residence_hint == "resident":
                 reason = (
                     "hint-resident"
@@ -483,7 +526,6 @@ def _defer_for_imminent_work(
     """
 
     current_prefill = _ceil_duration(choice.prompt_tokens, config.prefill_tokens_per_ms)
-    held_choice = _hold_bytes(choice, mode, config)
     choice_duration = _duration_ms(choice, mode, config)
     for item in future:
         if item.arrival_ms > now_ms + config.lookahead_ms:
@@ -503,8 +545,7 @@ def _defer_for_imminent_work(
             item,
             active,
             config,
-            extra_hold_bytes=held_choice,
-            extra_active_requests=1,
+            extra_placements=((choice, mode),),
         )
         memory_blocked = with_choice is None
         deadline_blocked = (
@@ -548,7 +589,6 @@ def _select(
     )
     if not pending:
         return None
-    active_bytes = sum(item.admission.resident_kv_bytes for item in active)
     if policy == "fifo":
         choice = pending[0]
         selected = _feasible_mode(choice, active, config)
@@ -594,15 +634,23 @@ def _select(
         if first is None:
             continue
         modes: list[tuple[ResidencyMode, str]] = [first]
-        sparse_spare = _hold_bytes(choice, ResidencyMode.HI_SPARSE, config)
         workspace = choice.prompt_tokens * config.prefill_workspace_bytes_per_token
+        sparse_memory, _ = _placement_memory(
+            (
+                *_active_placements(active),
+                (choice, ResidencyMode.HI_SPARSE),
+            ),
+            config,
+        )
         if (choice.residence_hint == "auto"
                 and choice.output_tokens >= config.auto_resident_output_threshold
                 and first[0] is ResidencyMode.RESIDENT
-                and active_bytes + sparse_spare + workspace <= config.memory_budget_bytes):
+                and sparse_memory + workspace <= config.memory_budget_bytes):
             modes.append((ResidencyMode.HI_SPARSE, "lookahead-protects-imminent-demand"))
         for mode, reason in modes:
-            displaced = _future_contention(choice, mode, active_bytes, pending, future, now_ms, config)
+            displaced = _future_contention(
+                choice, mode, active, pending, future, now_ms, config
+            )
             urgency = _urgency(choice, now_ms, config)
             # Priority and deadlines decide whether work is worth reserving.
             # Sparse placement is cheaper for following requests, while its
@@ -646,6 +694,7 @@ class _OracleState:
     active: tuple[_Active, ...]
     admissions: tuple[Admission, ...]
     peak_memory_bytes: int
+    peak_shared_prefix_credit_bytes: int
 
 
 def _feasible_modes(
@@ -680,10 +729,16 @@ def _oracle_admission_child(
     config: PlannerConfig,
 ) -> _OracleState:
     active = _normalize_active(state.active, state.now_ms)
-    base = sum(item.admission.resident_kv_bytes for item in active)
     hold = _hold_bytes(request, mode, config)
     workspace = request.prompt_tokens * config.prefill_workspace_bytes_per_token
     prefill = _ceil_duration(request.prompt_tokens, config.prefill_tokens_per_ms)
+    aggregate, shared_credit = _placement_memory(
+        (
+            *_active_placements(active),
+            (request, mode),
+        ),
+        config,
+    )
     admission = Admission(
         request_id=request.request_id,
         arrival_ms=request.arrival_ms,
@@ -703,7 +758,10 @@ def _oracle_admission_child(
         ),
         active=(*active, _Active(request, admission)),
         admissions=(*state.admissions, admission),
-        peak_memory_bytes=max(state.peak_memory_bytes, base + hold + workspace),
+        peak_memory_bytes=max(state.peak_memory_bytes, aggregate + workspace),
+        peak_shared_prefix_credit_bytes=max(
+            state.peak_shared_prefix_credit_bytes, shared_credit
+        ),
     )
 
 
@@ -777,6 +835,7 @@ def _result_from_admissions(
     admissions: Sequence[Admission],
     peak_memory_bytes: int,
     *,
+    peak_shared_prefix_credit_bytes: int = 0,
     search_expansions: int = 0,
     search_truncated: bool = False,
     fallback_policy: str | None = None,
@@ -810,6 +869,7 @@ def _result_from_admissions(
         search_expansions=search_expansions,
         search_truncated=search_truncated,
         fallback_policy=fallback_policy,
+        peak_shared_prefix_credit_bytes=peak_shared_prefix_credit_bytes,
     )
 
 
@@ -833,6 +893,7 @@ def _simulate_oracle(
         active=(),
         admissions=(),
         peak_memory_bytes=0,
+        peak_shared_prefix_credit_bytes=0,
     )
     stack = [initial]
     best = replace(
@@ -859,6 +920,9 @@ def _simulate_oracle(
                 workload,
                 state.admissions,
                 state.peak_memory_bytes,
+                peak_shared_prefix_credit_bytes=(
+                    state.peak_shared_prefix_credit_bytes
+                ),
             )
             if _oracle_objective(result) < _oracle_objective(best):
                 best = result
@@ -956,12 +1020,25 @@ def _validate_workload(
     ids = [item.request_id for item in workload]
     if len(set(ids)) != len(ids):
         raise ValueError("request IDs must be unique")
+    prefix_lengths: dict[str, set[int]] = {}
     for item in workload:
+        if item.prefix_group is not None:
+            prefix_lengths.setdefault(item.prefix_group, set()).add(
+                item.shared_prefix_tokens
+            )
         sparse = _feasible_mode(item, (), config, preferred=ResidencyMode.HI_SPARSE)
         if sparse is None:
             raise ValueError(
                 f"{item.request_id}: no residency mode fits the configured budget"
             )
+    inconsistent = next(
+        (group for group, lengths in prefix_lengths.items() if len(lengths) > 1),
+        None,
+    )
+    if inconsistent is not None:
+        raise ValueError(
+            f"prefix_group {inconsistent!r} has inconsistent shared prefix lengths"
+        )
 
 
 def _simulate_greedy(
@@ -980,10 +1057,10 @@ def _simulate_greedy(
     now_ms = min(item.arrival_ms for item in workload)
     prefill_busy_until = -1
     peak = 0
+    peak_shared_credit = 0
 
     while unstarted or active:
         active = [item for item in active if item.admission.finish_ms > now_ms]
-        base = sum(item.admission.resident_kv_bytes for item in active)
         if not unstarted and not active:
             break
         if not unstarted:
@@ -1015,7 +1092,15 @@ def _simulate_greedy(
                 prefill_workspace_bytes=workspace,
                 reason=reason,
             )
-            peak = max(peak, base + hold + workspace)
+            aggregate, shared_credit = _placement_memory(
+                (
+                    *_active_placements(active),
+                    (request, mode),
+                ),
+                config,
+            )
+            peak = max(peak, aggregate + workspace)
+            peak_shared_credit = max(peak_shared_credit, shared_credit)
             unstarted.pop(request.request_id)
             active.append(_Active(request, admission))
             admissions.append(admission)
@@ -1040,6 +1125,7 @@ def _simulate_greedy(
         workload,
         admissions,
         peak,
+        peak_shared_prefix_credit_bytes=peak_shared_credit,
     )
 
 
@@ -1091,6 +1177,9 @@ def plan_rollout(
             hint["deadline_after_ms"] = max(
                 0, request.deadline_ms - admission.start_ms
             )
+        if request.prefix_group is not None:
+            hint["prefix_group"] = request.prefix_group
+            hint["shared_prefix_tokens"] = request.shared_prefix_tokens
         submissions.append(
             RolloutSubmission(
                 request_id=request.request_id,

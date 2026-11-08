@@ -210,6 +210,37 @@ oracle 只验证离线决策质量，不会在 scheduler 热路径运行，也�
 权重；`plan_rollout()` 只把它写成 `FutureHint.weight`，不会赋值给 SGLang 的
 `request.priority`，因此原生硬优先级层级仍由 SGLang 所有。
 
+### 4.0.1 已实现：共享前缀的规划容量抵扣
+
+`prefix_group` 与 `shared_prefix_tokens` 现在进入规划器和运行时 hint。对于同一
+prefix group 的多个同时驻留请求，规划器只计算一份不可变共享前缀 KV：
+
+```text
+resident aggregate
+  = sum(每请求完整或 HiSparse hot-set)
+  - sum_group((resident成员数 - 1) * 组内最小 shared_prefix_tokens
+              * kv_bytes_per_token)
+```
+
+只有 `resident` 成员参与抵扣；HiSparse 的 Top-K 选择不保证包含前缀，因此仍按
+完整有界热集计费。同一 group 内不同请求若声明不同前缀长度，规划入口直接拒绝，
+避免把不同内容误算成共享。已知未来准入会同时抵扣多个 imminent resident 请求
+之间的共享前缀，防止预留空间被重复计算。
+
+`elastic.future` payload 已能无损携带 `prefix_group` 和
+`shared_prefix_tokens`，但当前 SGLang 实跑范围仍关闭 radix cache，也没有把
+第二个请求直接绑定到第一个请求的完整驻留 KV。因此这一步已经完成的是确定性容量
+模型、计划输出、hint 校验与传输；真实共享 backing 或 Top-K 跨请求命中仍需单独
+实现引用、写保护、模型/权重版本和 lifetime 校验，不能把规划节省直接写成已测
+运行时显存收益。
+
+当前回归 fixture 使用两条各 2,000-token 的请求、1,500-token 相同前缀和
+2,600-token 预算。启用共享后两条请求都能 resident，规划峰值 2,500 token，
+共享抵扣 1,500 token；去掉共享元数据后，模拟器把第二条降为 200-token
+HiSparse hot-set，峰值反而只有 2,200 token。固定速率下，前者模拟 makespan
+为 254 ms，后者为 1,004 ms。这个例子说明共享前缀用少量额外驻留字节换取了更少
+的 HiSparse 模式，也说明不能只比较峰值显存；它是确定性策略回放，不是模型实测。
+
 ### 4.1 受控 rollout 的可执行计划
 
 `plan_rollout()` 把离线策略结果转换成 orchestrator 可执行的动作。每个 action

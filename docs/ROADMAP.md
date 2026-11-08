@@ -81,6 +81,15 @@ validated in deterministic CPU tests; it remains to measure whether
 control-plane idle time and prediction error are worthwhile on real serving
 workloads.
 
+The planner and request hint now carry shared-prefix identity. Deterministic
+capacity accounting charges a shared immutable prefix once when multiple
+requests in the same `prefix_group` are simultaneously resident, and imminent
+future reservations apply the same credit. HiSparse requests remain fully
+charged because their Top-K hot set is not guaranteed to retain the prefix.
+This is planning and transport evidence; the current radix-disabled SGLang
+runtime does not yet reference another request's resident KV or resolve a
+Top-K hit from it.
+
 The controller now also tracks the real in-flight set.  A bounded concurrency
 mode turns planned timestamps into earliest admission times, deadline ordering
 selects among already-eligible requests, and an aggregate byte ledger demotes

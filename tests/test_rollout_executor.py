@@ -4,6 +4,7 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import replace
 
 from adaptive_sparse.elastic_admission import ElasticKVConfig
 from adaptive_sparse.future_plan import (
@@ -438,6 +439,10 @@ class RolloutExecutorTest(unittest.TestCase):
                 {"hint": {**base.hint, "release_after_ms": 1, "deadline_after_ms": 40}},
                 "release_after_ms=0",
             ),
+            (
+                {"hint": {**base.hint, "prefix_group": "group", "shared_prefix_tokens": 33}},
+                "shared prefix exceeds prompt length",
+            ),
         )
         for update, message in cases:
             with self.subTest(message=message):
@@ -460,6 +465,36 @@ class RolloutExecutorTest(unittest.TestCase):
                         generator=lambda *args: self.fail("request should not be sent"),
                     )
 
+    def test_rejects_inconsistent_shared_prefix_plan_before_dispatch(self):
+        base = submission()
+        first = replace(
+            base,
+            request_id="first",
+            hint={
+                **base.hint,
+                "prefix_group": "group",
+                "shared_prefix_tokens": 16,
+            },
+        )
+        second = replace(
+            base,
+            request_id="second",
+            hint={
+                **base.hint,
+                "prefix_group": "group",
+                "shared_prefix_tokens": 8,
+            },
+        )
+
+        with self.assertRaisesRegex(
+            RolloutExecutionError, "inconsistent shared prefix lengths"
+        ):
+            execute_rollout(
+                "http://server/generate",
+                [first, second],
+                generator=lambda *args: self.fail("request should not be sent"),
+            )
+
     def test_rejects_zero_parallelism(self):
         with self.assertRaisesRegex(ValueError, "max_parallel must be positive"):
             execute_rollout(
@@ -478,6 +513,8 @@ class RolloutExecutorTest(unittest.TestCase):
                     prompt_tokens=32,
                     output_tokens=8,
                     deadline_ms=100,
+                    prefix_group="request-prefix",
+                    shared_prefix_tokens=16,
                 )
             ],
             PlannerConfig(
@@ -496,6 +533,8 @@ class RolloutExecutorTest(unittest.TestCase):
         self.assertEqual(loaded[0].prompt_tokens, 32)
         self.assertEqual(loaded[0].output_tokens, 8)
         self.assertEqual(loaded[0].hint["expected_output_tokens"], 8)
+        self.assertEqual(loaded[0].hint["prefix_group"], "request-prefix")
+        self.assertEqual(loaded[0].hint["shared_prefix_tokens"], 16)
 
     def test_residency_evidence_reconciles_all_tp_ranks(self):
         with tempfile.TemporaryDirectory() as directory:

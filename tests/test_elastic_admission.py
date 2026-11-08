@@ -18,6 +18,8 @@ def submission(
     submit_at_ms=0,
     estimated_finish_ms=100,
     deadline_after_ms=None,
+    prefix_group=None,
+    shared_prefix_tokens=0,
 ):
     hint = {
         "release_after_ms": 0,
@@ -28,6 +30,9 @@ def submission(
     }
     if deadline_after_ms is not None:
         hint["deadline_after_ms"] = deadline_after_ms
+    if prefix_group is not None:
+        hint["prefix_group"] = prefix_group
+        hint["shared_prefix_tokens"] = shared_prefix_tokens
     return RolloutSubmission(
         request_id=request_id,
         planned_arrival_ms=0,
@@ -206,6 +211,38 @@ class ElasticAdmissionTest(unittest.TestCase):
             auto_resident_output_threshold=128,
         )
         self.assertEqual(elastic_config_from_planner(planner).lookahead_ms, 200)
+
+    def test_future_reservation_credits_shared_resident_prefixes(self):
+        current = submission("current", weight=1.0, estimated_finish_ms=100)
+        shared = [
+            submission(
+                request_id,
+                weight=2.0,
+                submit_at_ms=20,
+                estimated_finish_ms=120,
+                deadline_after_ms=180,
+                prefix_group="shared-prefix",
+                shared_prefix_tokens=80,
+            )
+            for request_id in ("shared-a", "shared-b")
+        ]
+        config = ElasticKVConfig(
+            memory_budget_bytes=1_000,
+            kv_bytes_per_token=2,
+            sparse_hot_tokens=64,
+            lookahead_ms=200,
+        )
+
+        decision = decide_elastic_admission(
+            current,
+            active_bytes=0,
+            config=config,
+            future_submissions=(current, *shared),
+            now_ms=0,
+        )
+
+        self.assertEqual(decision.future_reserved_requests, 2)
+        self.assertEqual(decision.future_reserved_bytes, 640)
 
     def test_invalid_active_bytes_are_rejected(self):
         for value in (-1, 1.5, True):

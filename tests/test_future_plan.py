@@ -3,6 +3,7 @@ import math
 from pathlib import Path
 import tempfile
 import unittest
+from dataclasses import replace
 
 from adaptive_sparse.future_plan import (
     PlanResult,
@@ -317,6 +318,76 @@ class FuturePlanTest(unittest.TestCase):
                 shared_prefix_tokens=5,
             )
 
+    def test_resident_shared_prefix_backing_is_counted_once(self):
+        config = PlannerConfig(
+            memory_budget_bytes=2_600,
+            kv_bytes_per_token=1,
+            prefill_workspace_bytes_per_token=0,
+            sparse_hot_tokens=200,
+            prefill_tokens_per_ms=1000,
+            resident_decode_tokens_per_ms=2,
+            sparse_decode_tokens_per_ms=0.5,
+            max_active_requests=2,
+        )
+        shared = [
+            RequestProfile(
+                request_id,
+                arrival_ms=0,
+                prompt_tokens=1500,
+                output_tokens=500,
+                residence_hint="resident",
+                prefix_group="shared-system-prompt",
+                shared_prefix_tokens=1500,
+            )
+            for request_id in ("shared-a", "shared-b")
+        ]
+        unshared = [
+            replace(
+                item,
+                prefix_group=None,
+                shared_prefix_tokens=0,
+            )
+            for item in shared
+        ]
+
+        with_sharing = simulate(shared, config, "mode-aware")
+        without_sharing = simulate(unshared, config, "mode-aware")
+
+        self.assertEqual(
+            {item.mode for item in with_sharing.admissions},
+            {ResidencyMode.RESIDENT},
+        )
+        self.assertEqual(with_sharing.peak_memory_bytes, 2500)
+        self.assertEqual(with_sharing.peak_shared_prefix_credit_bytes, 1500)
+        self.assertIn(
+            ResidencyMode.HI_SPARSE,
+            {item.mode for item in without_sharing.admissions},
+        )
+        self.assertEqual(without_sharing.peak_shared_prefix_credit_bytes, 0)
+        self.assertLess(with_sharing.makespan_ms, without_sharing.makespan_ms)
+
+    def test_inconsistent_shared_prefix_group_is_rejected(self):
+        workload = [
+            RequestProfile(
+                "a",
+                arrival_ms=0,
+                prompt_tokens=100,
+                output_tokens=100,
+                prefix_group="group",
+                shared_prefix_tokens=50,
+            ),
+            RequestProfile(
+                "b",
+                arrival_ms=0,
+                prompt_tokens=100,
+                output_tokens=100,
+                prefix_group="group",
+                shared_prefix_tokens=60,
+            ),
+        ]
+        with self.assertRaisesRegex(ValueError, "inconsistent shared prefix"):
+            simulate(workload, self.config, "future")
+
     def test_non_finite_rates_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "finite positive"):
             PlannerConfig(
@@ -453,6 +524,25 @@ class FuturePlanTest(unittest.TestCase):
         )
         for item in plan.submissions:
             FutureHint.from_payload(item.hint)
+
+    def test_rollout_plan_carries_shared_prefix_identity(self):
+        workload = [
+            RequestProfile(
+                "shared",
+                arrival_ms=0,
+                prompt_tokens=100,
+                output_tokens=100,
+                prefix_group="system",
+                shared_prefix_tokens=80,
+            )
+        ]
+        submission = plan_rollout(workload, self.config, "future").submissions[0]
+
+        self.assertEqual(submission.hint["prefix_group"], "system")
+        self.assertEqual(submission.hint["shared_prefix_tokens"], 80)
+        parsed = FutureHint.from_payload(submission.hint)
+        self.assertEqual(parsed.prefix_group, "system")
+        self.assertEqual(parsed.shared_prefix_tokens, 80)
 
     def test_rollout_plan_is_json_serializable_and_rejects_unknown_policy(self):
         payload = plan_rollout(self.workload, self.config, "future").as_dict()

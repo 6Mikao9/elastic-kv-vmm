@@ -49,6 +49,8 @@ class FutureHint:
     weight: float = 1.0
     kind: str = "generic"
     residence: str | None = None
+    prefix_group: str | None = None
+    shared_prefix_tokens: int = 0
 
     @classmethod
     def from_payload(cls, payload: Any) -> "FutureHint":
@@ -61,6 +63,8 @@ class FutureHint:
             "weight",
             "kind",
             "residence",
+            "prefix_group",
+            "shared_prefix_tokens",
         }
         unknown = set(payload) - allowed
         if unknown:
@@ -88,7 +92,29 @@ class FutureHint:
         residence = payload.get("residence")
         if residence is not None and residence not in ("auto", "resident", "host_backed"):
             raise ValueError("invalid residence hint")
-        return cls(release, deadline, expected, weight, kind, residence)
+        prefix_group = payload.get("prefix_group")
+        if prefix_group is not None and (
+            not isinstance(prefix_group, str)
+            or not prefix_group
+            or len(prefix_group) > 64
+        ):
+            raise ValueError("prefix_group must be a short non-empty string")
+        shared_prefix_tokens = _bounded_int(
+            payload.get("shared_prefix_tokens", 0),
+            "shared_prefix_tokens",
+        )
+        if shared_prefix_tokens and prefix_group is None:
+            raise ValueError("prefix_group is required for shared_prefix_tokens")
+        return cls(
+            release,
+            deadline,
+            expected,
+            weight,
+            kind,
+            residence,
+            prefix_group,
+            shared_prefix_tokens,
+        )
 
 
 def _bounded_int(value: Any, name: str, *, minimum: int = 0) -> int:
