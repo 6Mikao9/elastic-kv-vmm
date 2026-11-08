@@ -211,6 +211,8 @@ class Backing:
             "global_broker_claim_retries": 0,
             "global_broker_claim_wait_ns": 0,
             "global_broker_claim_releases": 0,
+            "global_broker_claim_shrinks": 0,
+            "global_broker_claim_shrunk_bytes": 0,
             "global_broker_peak_claim_bytes": 0,
         }
 
@@ -371,6 +373,33 @@ class Backing:
         if released:
             self._metrics["global_broker_claim_releases"] += 1
         return released
+
+    def shrink_broker_claim(self, key, maximum_bytes, *, kind="prefill"):
+        """Shrink a held temporary claim after SGLang selects a concrete batch."""
+
+        if self._broker is None:
+            return None
+        normalized = str(key)
+        if not normalized:
+            raise ValueError("broker claim key must be nonempty")
+        normalized_kind = str(kind)
+        if not normalized_kind or len(normalized_kind) > 64:
+            raise ValueError("broker claim kind must be a short nonempty string")
+        maximum_bytes = operator.index(maximum_bytes)
+        if maximum_bytes < 1:
+            raise ValueError("maximum broker claim bytes must be positive")
+        full_key = (
+            f"{self._broker.owner_id}/device-{self.device}/"
+            f"claim/{normalized_kind}/{normalized}"
+        )
+        previous = self._broker_claims.get(full_key)
+        revised = self._broker.shrink_claim(full_key, maximum_bytes)
+        if revised is not None:
+            self._broker_claims[full_key] = revised
+            if previous is not None and revised < previous:
+                self._metrics["global_broker_claim_shrinks"] += 1
+                self._metrics["global_broker_claim_shrunk_bytes"] += previous - revised
+        return revised
 
     @property
     def raw(self):

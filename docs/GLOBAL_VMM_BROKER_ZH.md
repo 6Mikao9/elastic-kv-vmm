@@ -66,7 +66,9 @@ prefill 的临时 claim 默认关闭。`EKV_GLOBAL_BROKER_PREFILL_MODE=observe` 
 等待队列的 workspace 估算和 broker 当前余量，不插入记录；`enforce` 在
 `Scheduler.get_new_batch_prefill` 选择 batch 前原子插入 claim。broker 的可用字节
 和 fairness 用量都会同时扣除 lease 与 claim，因此预热/压缩之后能腾出的空间不会
-被两个实例在同一时刻重复花掉。`ModelRunner.forward` 成功返回后才删除 claim；
+被两个实例在同一时刻重复花掉。原生调度器选出实际 batch 后，适配器会在同一事务
+中把 claim 缩到 `batch.input_ids.numel()` 对应的 workspace 估算；尚未进入本批的
+等待请求不会继续占着跨实例额度。`ModelRunner.forward` 成功返回后才删除 claim；
 scheduler 返回空 batch 时立即删除。scheduler 或 forward 抛错时不猜测激活和在途
 kernel 已经静止，claim 保留到 backend/process teardown。
 
@@ -261,3 +263,12 @@ CPU 上可以用 `python -m benchmarks.global_broker_latency` 单独测 SQLite �
 TTFT。改造前、后原始文件分别为
 [per-call](../results/global-broker-latency/windows-cpu-claims-per-call-20261109.json)
 和 [复用连接](../results/global-broker-latency/windows-cpu-claims-reused-20261109.json)。
+
+选批后缩容会多一次原子 SQLite 更新。同一 Windows CPU、500 次、复用连接的口径下，
+`claim+shrink+release` 的中位数为 1.773/1.790/1.792 ms，p95 为
+2.046/2.130/2.020 ms（`off/observe/enforce`）；相对 `claim+release`，每次 prefill
+边界新增的中位开销约 0.54–0.58 ms，p95 约 0.56–0.75 ms。它只在合法选批后执行一次，
+换来的是尚未进入本批的等待请求额度可在 forward 前交给其他实例。这个额外写事务的
+收益与代价仍需在目标 Linux/tmpfs 上结合 TTFT 和 claim denial 一起测量；当前数字只
+证明实现没有引入毫秒级以上的控制面退化，不能单独证明端到端收益。原始结果见
+[缩容基准](../results/global-broker-latency/windows-cpu-claims-shrink-20261109.json)。

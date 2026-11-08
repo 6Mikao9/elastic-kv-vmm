@@ -174,6 +174,22 @@ class GlobalAdmissionBrokerTest(unittest.TestCase):
             first.close()
             second.close()
 
+    def test_shrink_claim_is_atomic_bounded_and_never_grows(self):
+        first = self.broker("first", capacity=10)
+        second = self.broker("second", capacity=10)
+        try:
+            self.assertTrue(first.claim("prefill-0", 8).admit)
+            self.assertEqual(first.shrink_claim("prefill-0", 3), 3)
+            self.assertEqual(first.outstanding_bytes(), 3)
+            self.assertTrue(second.reserve({"kv-0": 7}).admit)
+            self.assertEqual(first.shrink_claim("prefill-0", 9), 3)
+            self.assertIsNone(first.shrink_claim("missing", 1))
+            with self.assertRaisesRegex(ValueError, "positive integer"):
+                first.shrink_claim("prefill-0", 0)
+        finally:
+            first.close()
+            second.close()
+
     def test_process_race_combines_leases_and_claims_atomically(self):
         context = multiprocessing.get_context("spawn")
         workers = 8

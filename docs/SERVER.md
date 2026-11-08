@@ -108,8 +108,10 @@ rate is still a calibrated model-specific estimate; it does not own or resize
 PyTorch's internal activation allocations. `--elastic-global-broker-prefill-mode
 observe` reports whether the estimate would fit the shared broker without
 inserting a claim. `enforce` inserts one temporary claim before
-`get_new_batch_prefill` and releases it only after the corresponding
-`ModelRunner.forward` succeeds. A denied claim returns no prefill batch. A
+`get_new_batch_prefill`, then atomically shrinks that claim to the selected
+batch's actual token estimate before the forward begins. It is released only
+after the corresponding `ModelRunner.forward` succeeds. A denied claim returns
+no prefill batch. A
 scheduler or forward exception deliberately retains the claim until process or
 backend teardown because activation and in-flight access quiescence cannot be
 proved. This mode coordinates admission against concurrent VMM growth; it does

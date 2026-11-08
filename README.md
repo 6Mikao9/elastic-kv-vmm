@@ -128,9 +128,12 @@ rejects accidental reuse of one file across GPUs.
 The opt-in `observe` prefill mode compares the waiting-prompt activation
 estimate with the shared broker and records whether it would fit. `enforce`
 atomically claims the estimate before SGLang chooses the prefill batch, so a
-peer process cannot spend the same VMM headroom first. The claim is released
-only after the matching model forward succeeds; empty batches release it
-immediately. A failed scheduler or forward keeps the claim until backend
+peer process cannot spend the same VMM headroom first. Once native scheduling
+selects a concrete batch, the same claim is atomically shrunk to the selected
+tokens' estimate so unconsumed waiting-queue budget becomes available before
+the forward starts. The claim is released only after the matching model
+forward succeeds; empty batches release it immediately. A failed scheduler or
+forward keeps the claim until backend
 teardown rather than assuming uncertain activation state is quiescent. This
 coordinates the admission budget but leaves PyTorch's activation allocation
 outside VMM ownership. Start with `observe`, then compare both arms on the same

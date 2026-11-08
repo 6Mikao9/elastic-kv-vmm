@@ -814,6 +814,48 @@ class GlobalAdmissionBroker:
             connection.commit()
         return released
 
+    def shrink_claim(self, key: str, maximum_bytes: int) -> int | None:
+        """Atomically reduce a held claim without reopening its admission window.
+
+        The native scheduler can select a subset of the requests covered by the
+        conservative pre-admission estimate.  Shrinking under the same key both
+        preserves the live reservation and makes unused capacity visible to VMM
+        leases and other processes before the prefill forward starts.
+        """
+
+        self._ensure_open()
+        normalized = str(key)
+        if not normalized:
+            raise ValueError("broker claim key must be nonempty")
+        if (
+            isinstance(maximum_bytes, bool)
+            or not isinstance(maximum_bytes, int)
+            or maximum_bytes < 1
+        ):
+            raise ValueError("maximum claim bytes must be a positive integer")
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT bytes FROM claims WHERE owner=? AND claim_key=?",
+                (self.owner_id, normalized),
+            ).fetchone()
+            if row is None:
+                connection.commit()
+                return None
+            previous = int(row[0])
+            revised = min(previous, maximum_bytes)
+            if revised < previous:
+                connection.execute(
+                    "UPDATE claims SET bytes=? WHERE owner=? AND claim_key=?",
+                    (revised, self.owner_id, normalized),
+                )
+            connection.execute(
+                "UPDATE owners SET last_seen=? WHERE owner=?",
+                (time.time(), self.owner_id),
+            )
+            connection.commit()
+        return revised
+
     def release_all(self) -> int:
         self._ensure_open()
         with self._connection() as connection:

@@ -206,6 +206,7 @@ class ActivationTest(unittest.TestCase):
 
             def __init__(self):
                 self.claims = []
+                self.shrinks = []
                 self.releases = []
 
             def claim_broker_capacity(self, key, byte_count):
@@ -215,6 +216,10 @@ class ActivationTest(unittest.TestCase):
             def release_broker_claim(self, key):
                 self.releases.append(key)
                 return 8
+
+            def shrink_broker_claim(self, key, maximum_bytes):
+                self.shrinks.append((key, maximum_bytes))
+                return min(8, maximum_bytes)
 
         class ScheduleBatch:
             def prepare_for_extend(self):
@@ -238,7 +243,10 @@ class ActivationTest(unittest.TestCase):
 
             def get_new_batch_prefill(self, running_batch):
                 self.claim_seen_by_scheduler = bool(backing.claims)
-                return SimpleNamespace(batch_size=1)
+                return SimpleNamespace(
+                    batch_size=1,
+                    input_ids=SimpleNamespace(numel=lambda: 3),
+                )
 
         modules = {
             "torch": torch,
@@ -275,11 +283,13 @@ class ActivationTest(unittest.TestCase):
         self.assertEqual(result, "forwarded")
         self.assertTrue(scheduler.claim_seen_by_scheduler)
         self.assertEqual(backing.claims[0][1], 8)
+        self.assertEqual(backing.shrinks, [(backing.claims[0][0], 6)])
         self.assertEqual(backing.releases, [backing.claims[0][0]])
         self.assertEqual(counters["activation_global_prefill_claim_admissions"], 1)
         self.assertEqual(
             counters["activation_global_prefill_claim_released_forward"], 1
         )
+        self.assertEqual(counters["activation_global_prefill_claim_shrunk_bytes"], 2)
 
     def test_global_prefill_claim_releases_when_scheduler_returns_empty(self):
         cuda = Mock()
@@ -351,6 +361,22 @@ class ActivationTest(unittest.TestCase):
         self.assertEqual(len(backing.releases), 1)
         self.assertEqual(
             counters["activation_global_prefill_claim_released_empty_batch"], 1
+        )
+
+    def test_prefill_batch_workspace_uses_selected_tokens_and_cap(self):
+        batch = SimpleNamespace(
+            batch_size=2,
+            input_ids=SimpleNamespace(numel=lambda: 5),
+        )
+        estimate = activation.estimate_prefill_batch_workspace(
+            batch, bytes_per_token=3, max_bytes=12
+        )
+        self.assertEqual(estimate.bytes, 12)
+        self.assertEqual(estimate.prompt_tokens, 5)
+        self.assertIsNone(
+            activation.estimate_prefill_batch_workspace(
+                SimpleNamespace(batch_size=1), bytes_per_token=3, max_bytes=12
+            )
         )
 
     def test_global_prefill_claim_survives_forward_error_until_teardown(self):

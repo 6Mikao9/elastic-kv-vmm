@@ -198,12 +198,17 @@ class GlobalBrokerBackingTest(unittest.TestCase):
                     backing.claim_broker_capacity("request-0", 2 * chunk)
                 )
                 self.assertEqual(observer.available_bytes(), 0)
+                self.assertEqual(
+                    backing.shrink_broker_claim("request-0", chunk), chunk
+                )
+                self.assertEqual(observer.available_bytes(), chunk)
                 with self.assertRaisesRegex(
                     RuntimeError, "global VMM capacity exhausted"
                 ):
-                    backing.ensure([0])
+                    backing.ensure([0, 1])
+                self.assertEqual(backing.ensure([1]), 1)
                 self.assertEqual(
-                    backing.release_broker_claim("request-0"), 2 * chunk
+                    backing.release_broker_claim("request-0"), chunk
                 )
                 self.assertEqual(backing.ensure([0]), 1)
                 self.assertEqual(
@@ -211,6 +216,9 @@ class GlobalBrokerBackingTest(unittest.TestCase):
                 )
                 self.assertEqual(
                     backing.metrics["global_broker_claim_releases"], 1
+                )
+                self.assertEqual(
+                    backing.metrics["global_broker_claim_shrunk_bytes"], chunk
                 )
             finally:
                 backing.close()

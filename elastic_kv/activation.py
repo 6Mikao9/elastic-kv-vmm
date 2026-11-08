@@ -5,7 +5,7 @@ recorded and normal allocation continues; scheduler admission is unchanged.
 """
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import os
 from functools import wraps
 from threading import local
@@ -103,6 +103,31 @@ def estimate_prefill_workspace(waiting_queue, *, bytes_per_token, max_bytes):
     )
 
 
+def estimate_prefill_batch_workspace(batch, *, bytes_per_token, max_bytes):
+    """Estimate the workspace of the concrete batch selected by SGLang."""
+
+    if bytes_per_token < 0 or max_bytes < 0:
+        raise ValueError("prefill workspace limits must be nonnegative")
+    if _batch_is_empty(batch):
+        return PrefillWorkspaceEstimate(bytes=0)
+    ids = getattr(batch, "input_ids", None)
+    if ids is None:
+        return None
+    numel = getattr(ids, "numel", None)
+    try:
+        tokens = numel() if callable(numel) else len(ids)
+        tokens = int(tokens)
+    except (TypeError, ValueError):
+        return None
+    if tokens < 0:
+        return None
+    return PrefillWorkspaceEstimate(
+        bytes=min(max_bytes, tokens * bytes_per_token),
+        prompt_tokens=tokens,
+        requests=1 if tokens else 0,
+    )
+
+
 def _find_broker_backing(controller):
     """Return the capacity owner shared by all arenas on this device."""
 
@@ -183,6 +208,29 @@ def _release_prefill_claim(claim, reason):
     else:
         _add(claim.counters, f"activation_global_prefill_claim_release_missing_{reason}")
     return released
+
+
+def _shrink_prefill_claim(claim, maximum_bytes):
+    global _PENDING_PREFILL_CLAIM
+
+    if claim is None or maximum_bytes < 1 or maximum_bytes >= claim.bytes:
+        return claim
+    revised = claim.backing.shrink_broker_claim(claim.key, maximum_bytes)
+    if revised is None or revised >= claim.bytes:
+        return claim
+    updated = replace(claim, bytes=int(revised))
+    if _PENDING_PREFILL_CLAIM is claim:
+        _PENDING_PREFILL_CLAIM = updated
+    _add(claim.counters, "activation_global_prefill_claim_shrinks")
+    _add(
+        claim.counters,
+        "activation_global_prefill_claim_shrunk_bytes",
+        claim.bytes - updated.bytes,
+    )
+    claim.counters["activation_global_prefill_claim_bytes_after_select"] = (
+        updated.bytes
+    )
+    return updated
 
 
 def _abandon_prefill_claim(claim, reason):
@@ -493,6 +541,29 @@ def install_activation_hooks():
                 if claim is not None and _batch_is_empty(batch):
                     _consume_pending_prefill_claim()
                     _release_prefill_claim(claim, "empty_batch")
+                elif claim is not None:
+                    selected = estimate_prefill_batch_workspace(
+                        batch,
+                        bytes_per_token=_PREFILL_WORKSPACE_RATE,
+                        max_bytes=_PREFILL_WORKSPACE_CAP,
+                    )
+                    if selected is not None:
+                        _add(
+                            counters,
+                            "activation_global_prefill_batch_estimates",
+                        )
+                        counters[
+                            "activation_global_prefill_batch_tokens_last"
+                        ] = selected.prompt_tokens
+                        counters[
+                            "activation_global_prefill_batch_bytes_last"
+                        ] = selected.bytes
+                        claim = _shrink_prefill_claim(claim, selected.bytes)
+                    else:
+                        _add(
+                            counters,
+                            "activation_global_prefill_batch_estimates_unknown",
+                        )
                 return batch
 
             prefill_with_workspace._elastic_activation_prefill_hook = True

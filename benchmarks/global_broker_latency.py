@@ -45,6 +45,7 @@ def _run_mode(mode, iterations, directory):
     owners = (first, second)
     samples_us = []
     claim_samples_us = []
+    claim_shrink_samples_us = []
     snapshot_samples_us = []
     try:
         first.reserve({"first-anchor": chunk})
@@ -69,6 +70,19 @@ def _run_mode(mode, iterations, directory):
             if index >= 50:
                 claim_samples_us.append(claim_elapsed_us)
 
+            claim_key = f"{owner.owner_id}/shrink-claim-{index}"
+            started = time.perf_counter_ns()
+            decision = owner.claim(claim_key, chunk)
+            revised = owner.shrink_claim(claim_key, chunk // 2)
+            released = owner.release_claim(claim_key)
+            if not decision.admit or revised != chunk // 2 or released != chunk // 2:
+                raise RuntimeError("broker benchmark claim shrink did not round trip")
+            claim_shrink_elapsed_us = (
+                time.perf_counter_ns() - started
+            ) / 1_000.0
+            if index >= 50:
+                claim_shrink_samples_us.append(claim_shrink_elapsed_us)
+
             started = time.perf_counter_ns()
             owner.snapshot()
             snapshot_elapsed_us = (time.perf_counter_ns() - started) / 1_000.0
@@ -86,6 +100,13 @@ def _run_mode(mode, iterations, directory):
         "median_claim_release_us": statistics.median(claim_samples_us),
         "p95_claim_release_us": _percentile(claim_samples_us, 0.95),
         "max_claim_release_us": max(claim_samples_us),
+        "median_claim_shrink_release_us": statistics.median(
+            claim_shrink_samples_us
+        ),
+        "p95_claim_shrink_release_us": _percentile(
+            claim_shrink_samples_us, 0.95
+        ),
+        "max_claim_shrink_release_us": max(claim_shrink_samples_us),
         "median_snapshot_us": statistics.median(snapshot_samples_us),
         "p95_snapshot_us": _percentile(snapshot_samples_us, 0.95),
         "max_snapshot_us": max(snapshot_samples_us),
