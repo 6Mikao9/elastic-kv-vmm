@@ -1,0 +1,230 @@
+{
+  "limitations": [
+    "Requests must declare prompt and output lengths at admission.",
+    "Request bases remain fixed, so packed allocations reserve their full final extents.",
+    "No prefix sharing, offload, migration, or GPU execution is modeled.",
+    "The objective is backing geometry and admission delay, not attention speed."
+  ],
+  "model": {
+    "arena_bytes_per_rank": 134217728,
+    "chunk_bytes_per_rank": 2097152,
+    "decode_tokens_per_ms": 20.0,
+    "max_active_requests": 16,
+    "prefill_tokens_per_ms": 8.0,
+    "row_bytes_per_token": 512
+  },
+  "placement": {
+    "fixed-affine": "every request begins on a chunk-aligned slot sized for the workload's largest final sequence",
+    "packed-affine": "exact final sequence extent, best-fit in one virtual arena; adjacent requests may share VMM chunks"
+  },
+  "results": [
+    {
+      "comparison": {
+        "fixed_peak_backing_bytes": 54525952,
+        "fixed_virtual_reservation_at_peak_bytes": 134217728,
+        "makespan_reduction_ms": 0.0,
+        "max_start_delay_reduction_ms": 0.0,
+        "packed_extra_active_requests_at_peak": 0,
+        "packed_peak_backing_bytes": 54525952,
+        "packed_shared_chunks_at_peak": 5,
+        "packed_shared_savings_at_peak_bytes": 12582912,
+        "packed_virtual_reservation_at_peak_bytes": 55278080,
+        "peak_backing_delta_bytes": 0,
+        "peak_backing_reduction_fraction": 0.0
+      },
+      "fixed_affine": {
+        "admitted_requests": 96,
+        "makespan_ms": 3310.3080966948464,
+        "max_active_requests": 16,
+        "max_start_delay_ms": 1547.516302481643,
+        "mean_start_delay_ms": 644.2361329404399,
+        "peak": {
+          "active_requests": 16,
+          "independent_bytes": 54525952,
+          "independent_chunks": 26,
+          "mapped_bytes": 54525952,
+          "mapped_chunks": 26,
+          "mapping_efficiency": 0.5928016075721154,
+          "reserved_bytes": 134217728,
+          "shared_chunks": 0,
+          "shared_savings_bytes": 0,
+          "tail_waste_bytes": 22202880,
+          "time_ms": 1393.2093566094923,
+          "useful_bytes": 32323072
+        },
+        "requests": 96,
+        "strategy": "fixed-affine",
+        "waiting_requests": 0
+      },
+      "max_total_tokens": 16020,
+      "min_total_tokens": 139,
+      "packed_affine": {
+        "admitted_requests": 96,
+        "makespan_ms": 3310.3080966948464,
+        "max_active_requests": 16,
+        "max_start_delay_ms": 1547.516302481643,
+        "mean_start_delay_ms": 644.2361329404399,
+        "peak": {
+          "active_requests": 16,
+          "independent_bytes": 67108864,
+          "independent_chunks": 32,
+          "mapped_bytes": 54525952,
+          "mapped_chunks": 26,
+          "mapping_efficiency": 0.5709416316105769,
+          "reserved_bytes": 55278080,
+          "shared_chunks": 5,
+          "shared_savings_bytes": 12582912,
+          "tail_waste_bytes": 23394816,
+          "time_ms": 1133.3080966948464,
+          "useful_bytes": 31131136
+        },
+        "requests": 96,
+        "strategy": "packed-affine",
+        "waiting_requests": 0
+      },
+      "request_count": 96,
+      "scenario": "mixed",
+      "seed": 137,
+      "total_tokens": 350450
+    },
+    {
+      "comparison": {
+        "fixed_peak_backing_bytes": 62914560,
+        "fixed_virtual_reservation_at_peak_bytes": 75497472,
+        "makespan_reduction_ms": 0.0,
+        "max_start_delay_reduction_ms": 0.0,
+        "packed_extra_active_requests_at_peak": 0,
+        "packed_peak_backing_bytes": 62914560,
+        "packed_shared_chunks_at_peak": 4,
+        "packed_shared_savings_at_peak_bytes": 8388608,
+        "packed_virtual_reservation_at_peak_bytes": 64499712,
+        "peak_backing_delta_bytes": 0,
+        "peak_backing_reduction_fraction": 0.0
+      },
+      "fixed_affine": {
+        "admitted_requests": 96,
+        "makespan_ms": 1880.6443228510238,
+        "max_active_requests": 16,
+        "max_start_delay_ms": 33.28883560455742,
+        "mean_start_delay_ms": 10.452670916431446,
+        "peak": {
+          "active_requests": 9,
+          "independent_bytes": 62914560,
+          "independent_chunks": 30,
+          "mapped_bytes": 62914560,
+          "mapped_chunks": 30,
+          "mapping_efficiency": 0.8248372395833333,
+          "reserved_bytes": 75497472,
+          "shared_chunks": 0,
+          "shared_savings_bytes": 0,
+          "tail_waste_bytes": 11020288,
+          "time_ms": 1413.0445583389378,
+          "useful_bytes": 51894272
+        },
+        "requests": 96,
+        "strategy": "fixed-affine",
+        "waiting_requests": 0
+      },
+      "max_total_tokens": 15730,
+      "min_total_tokens": 69,
+      "packed_affine": {
+        "admitted_requests": 96,
+        "makespan_ms": 1880.6443228510238,
+        "max_active_requests": 16,
+        "max_start_delay_ms": 33.28883560455742,
+        "mean_start_delay_ms": 10.452670916431446,
+        "peak": {
+          "active_requests": 9,
+          "independent_bytes": 71303168,
+          "independent_chunks": 34,
+          "mapped_bytes": 62914560,
+          "mapped_chunks": 30,
+          "mapping_efficiency": 0.8248372395833333,
+          "reserved_bytes": 64499712,
+          "shared_chunks": 4,
+          "shared_savings_bytes": 8388608,
+          "tail_waste_bytes": 11020288,
+          "time_ms": 1413.0445583389378,
+          "useful_bytes": 51894272
+        },
+        "requests": 96,
+        "strategy": "packed-affine",
+        "waiting_requests": 0
+      },
+      "request_count": 96,
+      "scenario": "short-heavy",
+      "seed": 137,
+      "total_tokens": 150142
+    },
+    {
+      "comparison": {
+        "fixed_peak_backing_bytes": 33554432,
+        "fixed_virtual_reservation_at_peak_bytes": 33554432,
+        "makespan_reduction_ms": 0.0,
+        "max_start_delay_reduction_ms": 0.0,
+        "packed_extra_active_requests_at_peak": 0,
+        "packed_peak_backing_bytes": 33554432,
+        "packed_shared_chunks_at_peak": 0,
+        "packed_shared_savings_at_peak_bytes": 0,
+        "packed_virtual_reservation_at_peak_bytes": 33554432,
+        "peak_backing_delta_bytes": 0,
+        "peak_backing_reduction_fraction": 0.0
+      },
+      "fixed_affine": {
+        "admitted_requests": 96,
+        "makespan_ms": 2726.2420066622526,
+        "max_active_requests": 16,
+        "max_start_delay_ms": 2037.3698865589772,
+        "mean_start_delay_ms": 979.1073991835805,
+        "peak": {
+          "active_requests": 16,
+          "independent_bytes": 33554432,
+          "independent_chunks": 16,
+          "mapped_bytes": 33554432,
+          "mapped_chunks": 16,
+          "mapping_efficiency": 0.770172119140625,
+          "reserved_bytes": 33554432,
+          "shared_chunks": 0,
+          "shared_savings_bytes": 0,
+          "tail_waste_bytes": 7711744,
+          "time_ms": 381.5,
+          "useful_bytes": 25842688
+        },
+        "requests": 96,
+        "strategy": "fixed-affine",
+        "waiting_requests": 0
+      },
+      "max_total_tokens": 4096,
+      "min_total_tokens": 4096,
+      "packed_affine": {
+        "admitted_requests": 96,
+        "makespan_ms": 2726.2420066622526,
+        "max_active_requests": 16,
+        "max_start_delay_ms": 2037.3698865589772,
+        "mean_start_delay_ms": 979.1073991835805,
+        "peak": {
+          "active_requests": 16,
+          "independent_bytes": 33554432,
+          "independent_chunks": 16,
+          "mapped_bytes": 33554432,
+          "mapped_chunks": 16,
+          "mapping_efficiency": 0.770172119140625,
+          "reserved_bytes": 33554432,
+          "shared_chunks": 0,
+          "shared_savings_bytes": 0,
+          "tail_waste_bytes": 7711744,
+          "time_ms": 381.5,
+          "useful_bytes": 25842688
+        },
+        "requests": 96,
+        "strategy": "packed-affine",
+        "waiting_requests": 0
+      },
+      "request_count": 96,
+      "scenario": "equal-length",
+      "seed": 137,
+      "total_tokens": 393216
+    }
+  ],
+  "scope": "CPU mapping-geometry simulation; not a GPU, model-attention, mapping-latency, or serving-throughput measurement"
+}

@@ -181,8 +181,11 @@ existing TP agreement and exact pre-commit checks. The [initial CPU
 microbenchmark](GROUP_INDEX_MICROBENCH.md) reduced a 32-request synthetic
 search from 256 examined combinations to 0–16 owner closures. The next step is
 to measure index maintenance on real allocator callbacks and run a paired
-serving trace against exhaustive search. Request-affine placement without
-excessive tail waste remains open.
+serving trace against exhaustive search. An initial CPU geometry simulation now
+shows that exact-length packed request ranges retain affine addressing, share
+chunks across neighboring requests and lower admission delay under a fixed
+arena; the same-concurrency peak union still matches fixed slots. A real trace,
+GPU mapping cost and serving comparison remain open.
 
 Separately, explore reuse of identical prefix KV that another request still
 holds on the GPU. A HiSparse Top-K lookup could first resolve a compatible

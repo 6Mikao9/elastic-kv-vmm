@@ -17,6 +17,16 @@ is implemented here. New rows must be initialized before reading, including
 regrowth within a retained chunk. Views are borrowed and must be retired before
 the ranges they reference are discarded or the arena closes.
 
+## Request-affine packing
+
+`affine_placement.py` isolates the tail-waste question for fixed virtual
+positions. It compares maximum-length, chunk-aligned request slots with exact-
+length request intervals packed into one arena. Both retain direct
+`base + token * row_bytes` addressing. A CPU event simulation charges only
+chunks touched by live prefixes and counts a chunk as shared when multiple
+requests use it. See the [placement report](../docs/AFFINE_PLACEMENT_SIM.md)
+for the deterministic fixtures and limitations.
+
 The GPU microbenchmark uses the **same VMM allocation, payload addresses,
 support set, output order and gather computation** in both arms:
 
@@ -112,7 +122,8 @@ can benefit from it; measure latency and transfer pressure as the batch grows.
 
 ```bash
 python -m unittest tests.test_virtual_layout tests.test_budget_ledger \
-  tests.test_scheduler_budget tests.test_adaptive_policy tests.test_adaptive_runtime -v
+  tests.test_affine_placement tests.test_scheduler_budget \
+  tests.test_adaptive_policy tests.test_adaptive_runtime -v
 ```
 
 CPU tests cover byte/element boundaries, rows crossing chunks, independent request

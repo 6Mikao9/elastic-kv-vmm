@@ -1,0 +1,147 @@
+import unittest
+
+from experimental.affine_placement import (
+    AffineArena,
+    AffineConfig,
+    AffineRequest,
+    Placement,
+    chunks_for_prefix,
+    simulate_affine_placement,
+)
+
+
+class AffinePlacementTest(unittest.TestCase):
+    def test_packed_affine_shares_tail_chunks(self):
+        requests = [
+            AffineRequest(f"r{index}", 0, prompt_tokens=2, output_tokens=8)
+            for index in range(4)
+        ]
+        config = AffineConfig(
+            arena_bytes=80,
+            chunk_bytes=8,
+            row_bytes=1,
+            max_active_requests=4,
+            prefill_tokens_per_ms=8,
+            decode_tokens_per_ms=20,
+        )
+
+        fixed = simulate_affine_placement(requests, config, "fixed-affine")
+        packed = simulate_affine_placement(requests, config, "packed-affine")
+
+        self.assertEqual(fixed.peak.mapped_bytes, 64)
+        self.assertEqual(fixed.peak.shared_chunks, 0)
+        self.assertEqual(packed.peak.mapped_bytes, 40)
+        self.assertEqual(packed.peak.useful_bytes, 40)
+        self.assertEqual(packed.peak.tail_waste_bytes, 0)
+        self.assertEqual(packed.peak.shared_chunks, 3)
+        self.assertEqual(packed.peak.shared_savings_bytes, 24)
+
+    def test_token_mapping_stays_affine_when_rows_cross_chunks(self):
+        arena = AffineArena(32, chunk_bytes=8)
+        first = arena.reserve("a", total_tokens=3, row_bytes=3)
+        second = arena.reserve("b", total_tokens=3, row_bytes=3)
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        assert first is not None and second is not None
+
+        self.assertEqual(first.start_byte, 0)
+        self.assertEqual(second.start_byte, 9)
+        self.assertEqual(first.token_offset(1), 3)
+        self.assertEqual(first.token_offset(2), 6)
+        self.assertEqual(second.token_offset(0), 9)
+        self.assertEqual(chunks_for_prefix(first, 3, 8), {0, 1})
+        self.assertEqual(chunks_for_prefix(second, 3, 8), {1, 2})
+
+    def test_page_boundaries_cover_every_chunk_transition(self):
+        row_bytes = 32 * 1024
+        placement = Placement(
+            "page-boundary",
+            start_byte=0,
+            reserved_bytes=129 * row_bytes,
+            total_tokens=129,
+            row_bytes=row_bytes,
+        )
+        expected_chunks = {
+            1: 1,
+            63: 1,
+            64: 1,
+            65: 2,
+            127: 2,
+            128: 2,
+            129: 3,
+        }
+
+        for pages, expected in expected_chunks.items():
+            with self.subTest(pages=pages):
+                self.assertEqual(
+                    len(chunks_for_prefix(placement, pages, 2 << 20)),
+                    expected,
+                )
+
+    def test_packed_tail_sharing_couples_reclaim(self):
+        packed = AffineArena(16, chunk_bytes=8)
+        first = packed.reserve("first", total_tokens=4, row_bytes=1)
+        second = packed.reserve("second", total_tokens=4, row_bytes=1)
+        assert first is not None and second is not None
+        self.assertEqual(chunks_for_prefix(first, 4, 8), {0})
+        self.assertEqual(chunks_for_prefix(second, 4, 8), {0})
+
+        packed.release("first")
+
+        self.assertEqual(chunks_for_prefix(packed["second"], 4, 8), {0})
+
+        private = AffineArena(16, chunk_bytes=8, slot_bytes=8)
+        first = private.reserve("first", total_tokens=4, row_bytes=1)
+        second = private.reserve("second", total_tokens=4, row_bytes=1)
+        assert first is not None and second is not None
+        self.assertEqual(chunks_for_prefix(first, 4, 8), {0})
+        self.assertEqual(chunks_for_prefix(second, 4, 8), {1})
+
+        private.release("first")
+
+        self.assertEqual(chunks_for_prefix(private["second"], 4, 8), {1})
+
+    def test_release_coalesces_ranges_and_keeps_fragmented_ranges_apart(self):
+        arena = AffineArena(32, chunk_bytes=8)
+        arena.reserve("a", 8, 1)
+        arena.reserve("b", 8, 1)
+        arena.reserve("c", 8, 1)
+        arena.release("b")
+        self.assertEqual(arena.free_ranges, ((8, 8), (24, 8)))
+        self.assertIsNone(arena.reserve("too-large", 9, 1))
+        arena.release("a")
+        self.assertEqual(arena.free_ranges, ((0, 16), (24, 8)))
+        arena.release("c")
+        self.assertEqual(arena.free_ranges, ((0, 32),))
+
+    def test_fixed_slot_rejects_a_request_larger_than_its_stride(self):
+        arena = AffineArena(32, chunk_bytes=8, slot_bytes=16)
+        with self.assertRaisesRegex(ValueError, "configured affine slot"):
+            arena.reserve("too-long", total_tokens=17, row_bytes=1)
+
+    def test_simulation_is_deterministic(self):
+        requests = [
+            AffineRequest("long", 0, 100, 300),
+            AffineRequest("short-a", 1, 20, 40),
+            AffineRequest("short-b", 2, 20, 40),
+        ]
+        config = AffineConfig(16_384, 2_048, 4, 3)
+        first = simulate_affine_placement(requests, config, "packed-affine")
+        second = simulate_affine_placement(requests, config, "packed-affine")
+        self.assertEqual(first, second)
+        self.assertEqual(first.admitted_requests, 3)
+        self.assertLessEqual(first.peak.mapped_bytes, config.arena_bytes)
+
+    def test_rejects_invalid_configuration_and_strategy(self):
+        with self.assertRaisesRegex(ValueError, "arena_bytes"):
+            AffineConfig(10, 8, 1, 1)
+        with self.assertRaisesRegex(ValueError, "strategy"):
+            simulate_affine_placement(
+                [AffineRequest("r", 0, 1, 1)],
+                AffineConfig(8, 8, 1, 1),
+                "page-table",
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
