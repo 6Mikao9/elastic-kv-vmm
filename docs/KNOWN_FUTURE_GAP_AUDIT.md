@@ -1,14 +1,16 @@
 # 已知未来规划器缺口审计
 
 审计日期：2026-11-09
-代码基线：`feature/sglang-framework`，`7a97e3f4d99f57813a34fdaf26431bcb2a003266`
+代码基线：`feature/sglang-framework`，`9419a78776addb2035fcba4c5ce44fc9f1daefff`
 
 ## 结论
 
 离线规划、hint 校验、请求排序和 CPU 增长账本的边界基本清楚，222 项相关
 CPU 测试全部通过。2026-11-09 的加固把调度钩子改为 fail-open、补齐全空闲
-TTL tick、修正多 plane 量纲并在预算动作后预热；相关 CPU 回归随后扩展到 415
-项（含 131 个子测试）。`enforce` 仍是显式 opt-in，且真实 serving A/B 尚缺，
+TTL tick、修正多 plane 量纲并在预算动作后预热；相关 CPU 回归随后扩展到 418
+项（含 131 个子测试）。其中一项使用真实 SGLang 0.5.17 `Scheduler` 类安装
+包装层，并注入 VMM 预热异常，验证原生 prefill 仍能接管。`enforce` 仍是显式
+opt-in，且真实 serving A/B 尚缺，
 因此还不能写入默认配置或声称性能收益。初始审计确认的缺口如下：
 
 1. 预热异常没有隔离，可能从可选的预测路径直接破坏一次正常 admission；
@@ -22,8 +24,9 @@ TTL tick、修正多 plane 量纲并在预算动作后预热；相关 CPU 回归
 A/B 和处置 OOM 尚未完成前，不应把 `enforce` 设为默认做共享或对外服务，更不应
 据此宣称 TTFT、吞吐或显存收益。
 
-当前状态：上述 P0/P1 的代码路径与 CPU 回归已修复；CUDA 命中/过量和同 trace
-serving A/B 仍属于发布门槛。新的 fail-open 行为不会修复已经 poisoned 的原生
+当前状态：上述 P0/P1 的代码路径与 CPU 回归已修复，真实 scheduler 包装层的
+异常回退也有兼容回归；CUDA 命中/过量和同 trace serving A/B 仍属于发布门槛。
+新的 fail-open 行为不会修复已经 poisoned 的原生
 VMM backing，它只保证预测路径不再额外阻断原生 admission，并停止后续预测。
 
 ## 缺口矩阵
@@ -37,7 +40,7 @@ VMM backing，它只保证预测路径不再额外阻断原生 admission，并�
 | P1 | 预热槽位换算把平面字节重复计入 | [`predictive_prewarm()`](../elastic_kv/adapter.py#L340) 用 `target_bytes / slot_bytes` 选择槽；但 `demand` 是 K/V 与全部层的总字节，而一个逻辑槽会同时映射所有 plane | 二层投影的最小样例中，4 MiB 需求映射了 8 MiB backing。层数越多，过度预热越明显，既削弱收益，也更早触发 OOM 或全局 broker 拒绝。 |
 | P1 | prewarm 在容量控制器腾挪之前发生 | [`scheduler_budget.py`](../adaptive_sparse/scheduler_budget.py#L1293) 先预热，随后才调用 `controller.boundary(...)` 执行既有迁移策略 | 内存紧张时先尝试 reserve，而不是先降级 running request 后利用释放出的空间，导致可避免的分配失败或无用 lease。`enforce` 的命中率和净收益会被系统性低估。 |
 | P1 | horizon 聚合按字节求和，而不是按时间重叠求峰值 | [`future_prefill.py`](../adaptive_sparse/future_prefill.py#L279) 把 horizon 中所有可估算条目的 KV 和 activation 直接相加 | 两个先后到达、互不重叠的请求仍按并发峰值计费，可能造成无必要的降级。共享前缀元数据也没有在这一层抵扣，当前实现偏保守但会污染性能结论。 |
-| P1 | 测试没有覆盖预测预热的真实接入失败语义 | [`smoke_predictive_prewarm.py`](../tests/smoke_predictive_prewarm.py#L70) 只显式调用生命周期；[`test_residency.py`](../tests/test_residency.py#L257) 只显式推进时钟。没有 scheduler hook 抛错、全空闲 TTL、broker denial、多 plane 单位或真实 hit 比例的测试 | 当前 222 项 CPU 测试与生命周期冒烟全部通过，仍无法发现上面三个核心缺口。 |
+| P1 | 真实 scheduler 接入失败回退已补回归 | [`test_scheduler_budget_sglang_integration.py`](../tests/test_scheduler_budget_sglang_integration.py) 在真实 SGLang 0.5.17 `Scheduler` 类上安装包装层，让 tracker 的 `predictive_prewarm()` 抛出异常 | 测试断言异常被记录、预测路径被失效且原生 prefill 的返回值保持不变。真实 CUDA hit/miss 和 serving A/B 仍不能由这条 CPU 回归替代。 |
 | P2 | 预热 telemetry 没有失败和拒绝归因 | counters 只有 tick、candidate、mapped、hit、expired，没有 `prewarm_error`、`broker_denied`、`requested_bytes` 与物理 mapped bytes 的独立字段 | 实验里看见 `candidate_chunks` 无法区分“没有触发”“被容量拒绝”“调用失败”，也无法核对过度映射。 |
 | P2 | 没有真实 serving A/B 证据 | 设计文档已明确只有 CPU 与显式 CUDA 冒烟；没有 native、forecast-disable、`dry_run`、`enforce` 的同 trace 配对结果 | 不能证明预测性扩容改善 TTFT、减少 OOM 或提高吞吐，也不能排除迁移抖动和 broker 争用造成的负收益。 |
 
@@ -128,6 +131,8 @@ Scheduler wrapper
 - 加固前隔离多平面核算：4 MiB demand -> 8 MiB backing，比例 2.0。
 - 加固后需求按 `slot_bytes *` 全部 arena 的 plane 数换算逻辑槽；物理字节遥测
   单独记录 requested、candidate 和 mapped bytes。
-- CUDA hit/miss、真实 scheduler 注入和同 trace serving A/B 仍未运行；本审计只
+- SGLang 0.5.17 真实 scheduler wrapper 异常注入回归通过；完整容器套件为
+  `418 passed, 2 skipped, 131 subtests passed`。
+- CUDA hit/miss 和同 trace serving A/B 仍未运行；本审计只
   确认代码契约、CPU 策略与资源记账，不把 CPU 证据外推成真实服务收益或正确性
   结论。
