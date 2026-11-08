@@ -395,6 +395,100 @@ class SchedulerBudgetTest(unittest.TestCase):
         self.assertEqual(policy.stats["rejected_dwell"], 2)
         self.assertEqual(policy.stats["rejected_cap"], 1)
 
+    def test_migration_time_cap_filters_request_and_force_bypasses_it(self):
+        policy = SchedulerBudget(
+            100, 0, 0, 0, byte_cap=100, migration_time_cap_ms=1_000,
+            initial_migration_bandwidth_bytes_per_s=10,
+        )
+        request = B(rid="a", kv=B(req_pool_idx=1, kv_committed_len=11))
+        batch = B(reqs=[request])
+        pool = B(layer_num=1, bytes_per_token_k=1, bytes_per_token_v=0)
+        policy.observe_residency(batch, {1}, 0)
+        self.assertEqual(policy.migration_byte_cap("demotion"), 10)
+        self.assertFalse(policy.eligible(request, pool, 1, False))
+        self.assertEqual(policy.stats["rejected_cap"], 1)
+        self.assertEqual(policy.stats["time_cap_rejections"], 1)
+        self.assertEqual(policy.stats["time_cap_rejections_demotion"], 1)
+        self.assertEqual(policy.stats["time_cap_rejections_promotion"], 0)
+        self.assertTrue(policy.eligible(request, pool, 1, True))
+
+    def test_fixed_byte_cap_and_time_cap_rejections_are_distinct(self):
+        policy = SchedulerBudget(
+            100, 0, 0, 0, byte_cap=10, migration_time_cap_ms=1_000,
+            initial_migration_bandwidth_bytes_per_s=5,
+        )
+        request = B(rid="a", kv=B(req_pool_idx=1, kv_committed_len=11))
+        batch = B(reqs=[request])
+        pool = B(layer_num=1, bytes_per_token_k=1, bytes_per_token_v=0)
+        policy.observe_residency(batch, {1}, 0)
+        self.assertFalse(policy.eligible(request, pool, 1, False))
+        self.assertEqual(policy.stats["rejected_cap"], 1)
+        self.assertEqual(policy.stats["time_cap_rejections"], 0)
+
+    def test_group_cap_observer_distinguishes_time_rejections(self):
+        tracker = B(
+            backing=B(mapped_chunks={9}),
+            refs={9: 2},
+            chunk_bytes=10,
+        )
+        requests = {
+            "a": (None, {1}, Counter({9: 1}), set()),
+            "b": (None, {2}, Counter({9: 1}), set()),
+        }
+        capacities = []
+        groups, _, _, _, rejected = _bounded_demotion_groups(
+            tracker, requests, lambda _: 9, max_group=2, byte_cap=15,
+            search_limit=4, cap_observer=capacities.append,
+        )
+        self.assertFalse(groups)
+        self.assertEqual(rejected, 1)
+        self.assertEqual(capacities, [18])
+
+    def test_record_updates_directional_bandwidth_and_time_cap_telemetry(self):
+        policy = SchedulerBudget(
+            100, 0, 0, 0, byte_cap=100,
+            migration_time_cap_ms=1_000,
+            initial_migration_bandwidth_bytes_per_s=10,
+        )
+        with patch("adaptive_sparse.scheduler_budget.time.monotonic", return_value=10.5):
+            policy.record("demotion", "prefill_pressure", 10, 20, 10)
+        self.assertEqual(policy.stats["demotion" + "s"], 1)
+        self.assertEqual(policy.stats["migration_seconds"], 0.5)
+        self.assertEqual(
+            policy.stats["migration_bandwidth_bytes_per_s"]["demotion"], 40
+        )
+        self.assertEqual(
+            policy.stats["migration_bandwidth_bytes_per_s"]["promotion"], 10
+        )
+        self.assertEqual(
+            policy.stats["migration_bandwidth_samples"],
+            {"demotion": 1, "promotion": 0},
+        )
+        self.assertEqual(
+            policy.stats["migration_effective_byte_cap"],
+            {"demotion": 40, "promotion": 10},
+        )
+
+    def test_different_rank_time_caps_leave_only_common_candidates(self):
+        request = B(rid="a", kv=B(req_pool_idx=1, kv_committed_len=20))
+        batch = B(reqs=[request])
+        pool = B(layer_num=1, bytes_per_token_k=1, bytes_per_token_v=0)
+        rank_caps = (50, 10)
+        rank_metrics = []
+        for cap in rank_caps:
+            policy = SchedulerBudget(
+                100, 0, 0, 0, byte_cap=100,
+                migration_time_cap_ms=1_000,
+                initial_migration_bandwidth_bytes_per_s=cap,
+            )
+            policy.observe_residency(batch, {1}, 0)
+            metrics = {}
+            if policy.eligible(request, pool, 1, False):
+                metrics["a"] = (10, 20)
+            rank_metrics.append(metrics)
+        self.assertEqual(rank_metrics, [{"a": (10, 20)}, {}])
+        self.assertEqual(_rank_demotions(rank_metrics), [])
+
     def test_low_water_requires_stability_after_excursion(self):
         policy = SchedulerBudget(100, 0, 0, 0, low=60, stable=2)
         policy.promote = Mock()

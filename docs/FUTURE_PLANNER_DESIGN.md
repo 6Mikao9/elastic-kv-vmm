@@ -547,7 +547,9 @@ KV 与 prefill workspace 共同使峰值越界时记为
 `imminent-future-prefill-demotion`。这个决定
 只发生在请求准入，随后的整个请求生命周期保持稳定；运行中的动态迁移继续由
 `SchedulerBudget` 的 dwell、low-water stable interval、joint demotion、每轮
-字节上限和 in-flight 限制防抖。rollout 结果逐请求记录
+字节上限、可选的迁移时间额度和 in-flight 限制防抖。时间额度通过近期成功事务
+的 demotion/promotion EWMA 带宽换算；没有真实样本时只使用配置的保守启动带宽，
+各 rank 仍经 collective 选择公共候选。rollout 结果逐请求记录
 `elastic_future_reserved_bytes`、`elastic_future_prefill_bytes`、
 `elastic_future_reserved_requests`、
 `elastic_future_effective_after_bytes`、`elastic_future_over_budget`、

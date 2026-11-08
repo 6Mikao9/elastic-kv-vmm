@@ -6,7 +6,18 @@
 
 ## 候选与迁移成本
 
-Demotion 先按各 rank 最小可回收字节除以最大传输字节计算迁移效率。请求携带 `kv_hints` 时，效率再除以一个有界 retention value：业务权重、剩余输出 token、距 deadline 的时间，以及有消费者证据的共享前缀会增加驻留价值；`kind`、`prefix_group` 和 active/future reuse consumer 数写入决策遥测。只带前缀长度但没有消费者时不增加价值。活跃消费者必须通过共享前缀 registry 的完整 fingerprint 精确匹配；waiting queue 预测只按 `prefix_group` 与长度做轻量匹配，并只影响排序。距离 deadline 不超过 `EKV_ADAPTIVE_DEADLINE_GUARD_MS`（默认 500 ms）的请求进入保护层，只在没有普通候选或强制迁移时最后降级；联合候选只要有一个成员受保护，整组也进入保护层。该值只影响已有迁移预算内的候选顺序，不覆盖 SGLang 原生硬 priority、准入或请求所有权。缺失或非法 hint 使用中性值，因此传统流量仍保持原排序。预测基于独占物理 chunk，迁移后另记录实际净释放。双请求候选按两者释放页的并集重新计算 chunk 引用，且要求每个 rank 的净释放预测为正。单请求或双请求事务的传输上限默认每 rank 512 MiB，可用 EKV_ADAPTIVE_MIGRATION_BYTE_CAP 调整。当前缺少滚动带宽和耗时额度。后续可用实测拷贝速率做启动前筛选。
+Demotion 先按各 rank 最小可回收字节除以最大传输字节计算迁移效率。请求携带 `kv_hints` 时，效率再除以一个有界 retention value：业务权重、剩余输出 token、距 deadline 的时间，以及有消费者证据的共享前缀会增加驻留价值；`kind`、`prefix_group` 和 active/future reuse consumer 数写入决策遥测。只带前缀长度但没有消费者时不增加价值。活跃消费者必须通过共享前缀 registry 的完整 fingerprint 精确匹配；waiting queue 预测只按 `prefix_group` 与长度做轻量匹配，并只影响排序。距离 deadline 不超过 `EKV_ADAPTIVE_DEADLINE_GUARD_MS`（默认 500 ms）的请求进入保护层，只在没有普通候选或强制迁移时最后降级；联合候选只要有一个成员受保护，整组也进入保护层。该值只影响已有迁移预算内的候选顺序，不覆盖 SGLang 原生硬 priority、准入或请求所有权。缺失或非法 hint 使用中性值，因此传统流量仍保持原排序。预测基于独占物理 chunk，迁移后另记录实际净释放。双请求候选按两者释放页的并集重新计算 chunk 引用，且要求每个 rank 的净释放预测为正。单请求或双请求事务的传输上限默认每 rank 512 MiB，可用 `EKV_ADAPTIVE_MIGRATION_BYTE_CAP` 调整。
+
+每次成功事务还会按方向记录“传输字节 / 墙钟耗时”，以 EWMA 更新 demotion 和 promotion 各自的带宽。真实样本出现前使用保守启动值；启用 `EKV_ADAPTIVE_MIGRATION_TIME_CAP_MS` 后，启动前额度取固定字节上限和 `估计带宽 × 时间上限` 的较小值。单请求、promotion 和联合候选都使用同一方向额度；联合候选按整组传输字节判定。固定上限拒绝仍计入 `rejected_cap`，仅由时间额度造成的拒绝另计入 `time_cap_rejections` 及方向计数。强制迁移继续绕过常规额度。每个 rank 使用自己的成功样本，单请求排名和联合候选随后仍经现有 collective 取公共结果，因此较慢 rank 无法被较快 rank 的副本绕过。遥测包括 `migration_bandwidth_bytes_per_s`、`migration_bandwidth_samples` 和 `migration_effective_byte_cap`。
+
+| 环境变量 | 默认值 | 作用 |
+|---|---:|---|
+| `EKV_ADAPTIVE_MIGRATION_BYTE_CAP` | `512 MiB/rank` | 固定单事务字节上限 |
+| `EKV_ADAPTIVE_MIGRATION_TIME_CAP_MS` | `0` | 目标迁移时间额度；`0` 只启用固定字节上限 |
+| `EKV_ADAPTIVE_INITIAL_BANDWIDTH_MIB_S` | `1024` | 首个真实样本前的保守带宽 |
+| `EKV_ADAPTIVE_BANDWIDTH_EWMA_ALPHA` | `0.25` | 成功样本对当前带宽估计的权重 |
+
+该估算只覆盖调度器已经实际完成的迁移事务。它不会预测未来 chunk 布局，也不包含 CPU 侧排队或另一个实例造成的 H2D/D2H 争用；因此时间额度是准入依据，不是端到端延迟保证。
 
 ## 防抖与 prefill 余量
 

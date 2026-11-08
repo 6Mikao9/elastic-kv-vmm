@@ -3,6 +3,7 @@
 import hashlib
 import json
 import logging
+import math
 import os
 import time
 from collections import Counter, deque
@@ -25,6 +26,7 @@ from .migration import (
     prepare_demote,
     prepare_promote,
 )
+from .migration_budget import MigrationBandwidthEstimator
 from .runtime_value import (
     DEFAULT_DEADLINE_GUARD_MS,
     PrefixReuseDemand,
@@ -98,7 +100,8 @@ def _releasable_group(tracker, candidates):
 
 
 def _bounded_demotion_groups(tracker, requests, cost, *, max_group,
-                             byte_cap, search_limit, rotation=0):
+                             byte_cap, search_limit, rotation=0,
+                             cap_observer=None):
     """Enumerate small request groups with a deterministic work bound.
 
     The common case has only a handful of resident long requests, so exhaustive
@@ -132,6 +135,8 @@ def _bounded_demotion_groups(tracker, requests, cost, *, max_group,
             transfer = sum(cost(request_id) for request_id in group)
             if transfer > byte_cap:
                 rejected_by_cap += 1
+                if cap_observer is not None:
+                    cap_observer(transfer)
                 continue
             released = _releasable_group(
                 tracker,
@@ -251,7 +256,8 @@ class PhysicalDemandIndex:
 
 
 def _indexed_demotion_groups(index, tracker, requests, cost, *, max_group,
-                             byte_cap, search_limit, rotation=0):
+                             byte_cap, search_limit, rotation=0,
+                             cap_observer=None):
     """Search owner closures before falling back to bounded enumeration."""
     if search_limit < 1:
         raise ValueError("search_limit must be positive")
@@ -274,6 +280,8 @@ def _indexed_demotion_groups(index, tracker, requests, cost, *, max_group,
         transfer = sum(cost(request_id) for request_id in group)
         if transfer > byte_cap:
             rejected_by_cap += 1
+            if cap_observer is not None:
+                cap_observer(transfer)
             continue
         released = _releasable_group(
             tracker,
@@ -289,7 +297,8 @@ def _indexed_demotion_groups(index, tracker, requests, cost, *, max_group,
 
 
 def _demand_index_demotion_groups(index, tracker, requests, cost, *, max_group,
-                                  byte_cap, search_limit, rotation=0):
+                                  byte_cap, search_limit, rotation=0,
+                                  cap_observer=None):
     """Use indexed owner closures and exact fallback for overlapping pages."""
     groups, chunks, indexed_examined, truncated, rejected = (
         _indexed_demotion_groups(
@@ -301,6 +310,7 @@ def _demand_index_demotion_groups(index, tracker, requests, cost, *, max_group,
             byte_cap=byte_cap,
             search_limit=search_limit,
             rotation=rotation,
+            cap_observer=cap_observer,
         )
     )
     if groups or not index.has_page_overlap:
@@ -317,6 +327,7 @@ def _demand_index_demotion_groups(index, tracker, requests, cost, *, max_group,
         byte_cap=byte_cap,
         search_limit=search_limit,
         rotation=rotation,
+        cap_observer=cap_observer,
     )
     return (
         groups,
@@ -348,13 +359,18 @@ class SchedulerBudget:
     def __init__(self, budget, headroom, dwell, force_step, low=0, stable=2,
                  observe=16, promote_step=0, stats_path=None, byte_cap=512 << 20,
                  max_group=1, capture_plans=False, trim_low_water=False,
-                 group_search_limit=256, deadline_guard_ms=DEFAULT_DEADLINE_GUARD_MS):
+                 group_search_limit=256, deadline_guard_ms=DEFAULT_DEADLINE_GUARD_MS,
+                 migration_time_cap_ms=0,
+                 initial_migration_bandwidth_bytes_per_s=1 << 30,
+                 migration_bandwidth_ewma_alpha=0.25):
         if max_group not in (1, 2, 3, 4):
             raise ValueError("max_group must be between 1 and 4")
         if group_search_limit < 1:
             raise ValueError("group_search_limit must be positive")
         if deadline_guard_ms < 0:
             raise ValueError("deadline_guard_ms must be nonnegative")
+        if migration_time_cap_ms < 0:
+            raise ValueError("migration_time_cap_ms must be nonnegative")
         self.budget = budget
         self.headroom = headroom
         self.dwell = dwell
@@ -370,6 +386,11 @@ class SchedulerBudget:
         self.max_group = max_group
         self.group_search_limit = group_search_limit
         self.deadline_guard_ms = deadline_guard_ms
+        self.migration_time_cap_ms = migration_time_cap_ms
+        self.migration_bandwidth = MigrationBandwidthEstimator(
+            initial_migration_bandwidth_bytes_per_s,
+            migration_bandwidth_ewma_alpha,
+        )
         self.capture_plans = capture_plans
         self.trim_low_water = trim_low_water
         self.demand_index = PhysicalDemandIndex()
@@ -411,6 +432,16 @@ class SchedulerBudget:
                       "prefix_reuse_active_consumers": 0,
                       "prefix_reuse_future_consumers": 0,
                       "deadline_last_resort_actions": 0,
+                      "migration_bandwidth_bytes_per_s": self.migration_bandwidth.snapshot(),
+                      "migration_bandwidth_samples": self.migration_bandwidth.sample_counts(),
+                      "migration_effective_byte_cap": {
+                          direction: self.migration_byte_cap(direction)
+                          for direction in MigrationBandwidthEstimator.DIRECTIONS
+                      },
+                      "migration_time_cap_ms": migration_time_cap_ms,
+                      "time_cap_rejections": 0,
+                      "time_cap_rejections_demotion": 0,
+                      "time_cap_rejections_promotion": 0,
                       "last_demotion_runtime_values": {},
                       "min_live_bytes": None, "max_live_bytes": 0,
                       "min_reclaimable_bytes": None, "max_reclaimable_bytes": 0}
@@ -425,13 +456,33 @@ class SchedulerBudget:
             temporary.write_text(json.dumps(self.stats, indent=2), encoding="utf-8")
             temporary.replace(self.stats_path)
 
+    def migration_byte_cap(self, direction="demotion"):
+        return self.migration_bandwidth.effective_byte_cap(
+            self.byte_cap, self.migration_time_cap_ms, direction
+        )
+
+    def _refresh_migration_telemetry(self):
+        self.stats["migration_bandwidth_bytes_per_s"] = (
+            self.migration_bandwidth.snapshot()
+        )
+        self.stats["migration_bandwidth_samples"] = (
+            self.migration_bandwidth.sample_counts()
+        )
+        self.stats["migration_effective_byte_cap"] = {
+            direction: self.migration_byte_cap(direction)
+            for direction in MigrationBandwidthEstimator.DIRECTIONS
+        }
+
     def record(self, direction, reason, started, transfer, actual):
+        elapsed = time.monotonic() - started
         self.stats[direction + "s"] += 1
-        self.stats["migration_seconds"] += time.monotonic() - started
+        self.stats["migration_seconds"] += elapsed
         self.stats["transfer_bytes"] += transfer
         self.stats["released_bytes" if direction == "demotion" else "growth_bytes"] += actual
         reasons = self.stats["reasons"]
         reasons[reason] = reasons.get(reason, 0) + 1
+        self.migration_bandwidth.observe(direction, transfer, elapsed)
+        self._refresh_migration_telemetry()
         self.publish()
 
     def observe_residency(self, batch, resident, now):
@@ -446,11 +497,18 @@ class SchedulerBudget:
         return request.kv.kv_committed_len * pool.layer_num * (
             pool.bytes_per_token_k + pool.bytes_per_token_v)
 
-    def eligible(self, request, pool, now, forced):
+    def eligible(self, request, pool, now, forced, direction="demotion"):
         if forced:
             return True
-        if self.transfer_cost(request, pool) > self.byte_cap:
+        transfer = self.transfer_cost(request, pool)
+        if transfer > self.byte_cap:
             self.stats["rejected_cap"] += 1
+            return False
+        effective_cap = self.migration_byte_cap(direction)
+        if transfer > effective_cap:
+            self.stats["rejected_cap"] += 1
+            self.stats["time_cap_rejections"] += 1
+            self.stats["time_cap_rejections_" + direction] += 1
             return False
         if now - self.residency_since[request.rid][1] < self.dwell:
             self.stats["rejected_dwell"] += 1
@@ -692,13 +750,23 @@ class SchedulerBudget:
             index_updates = self.demand_index.sync(requests)
             self.stats["group_index_updates"] += index_updates
             self.stats["group_index_ticks"] += 1
+            effective_byte_cap = self.migration_byte_cap("demotion")
+
+            def observe_group_cap(transfer):
+                if transfer > self.byte_cap:
+                    return
+                if effective_byte_cap < self.byte_cap:
+                    self.stats["time_cap_rejections"] += 1
+                    self.stats["time_cap_rejections_demotion"] += 1
+
             (groups, group_chunks, examined, fallback_examined, index_truncated,
              fallback_truncated, rejected_by_cap,
              used_fallback) = _demand_index_demotion_groups(
                 self.demand_index, tracker, requests, cost,
-                max_group=self.max_group, byte_cap=self.byte_cap,
+                max_group=self.max_group, byte_cap=effective_byte_cap,
                 search_limit=self.group_search_limit,
                 rotation=self.stats["group_search_ticks"],
+                cap_observer=observe_group_cap,
             )
             self.stats["group_search_ticks"] += 1
             self.stats["group_search_evaluated"] += examined + fallback_examined
@@ -843,7 +911,9 @@ class SchedulerBudget:
                     or length != kv.kv_allocated_len or length <= coordinator.device_buffer_size
                     or int(coordinator.req_device_buffer_size[row]) != coordinator.padded_buffer_size):
                 continue
-            if not self.eligible(request, pool, now, forced):
+            if not self.eligible(
+                request, pool, now, forced, direction="promotion"
+            ):
                 continue
             pages = -(-length // pool.page_size)
             available_tokens = physical.available_size()
@@ -928,6 +998,15 @@ def install_scheduler_budget():
     promote = int(os.environ.get("EKV_ADAPTIVE_FORCE_PROMOTE_STEP", "0"))
     stats_dir = os.environ.get("EKV_ADAPTIVE_STATS_DIR")
     cap = int(os.environ.get("EKV_ADAPTIVE_MIGRATION_BYTE_CAP", str(512 << 20)))
+    time_cap_ms = int(os.environ.get(
+        "EKV_ADAPTIVE_MIGRATION_TIME_CAP_MS", "0"
+    ))
+    initial_bandwidth_mib_s = float(os.environ.get(
+        "EKV_ADAPTIVE_INITIAL_BANDWIDTH_MIB_S", "1024"
+    ))
+    bandwidth_ewma_alpha = float(os.environ.get(
+        "EKV_ADAPTIVE_BANDWIDTH_EWMA_ALPHA", "0.25"
+    ))
     max_group = int(os.environ.get("EKV_ADAPTIVE_MAX_GROUP", "1"))
     group_search_limit = int(os.environ.get(
         "EKV_ADAPTIVE_GROUP_SEARCH_LIMIT", "256"
@@ -958,11 +1037,15 @@ def install_scheduler_budget():
             "EKV_FUTURE_PREFILL_AUTO_RESIDENT_TOKENS", "128"
         )),
     )
-    if not budget and not force and not promote and future_mode == "off":
+    if (not budget and not force and not promote and not time_cap_ms
+            and future_mode == "off"):
         return
     if (min(budget, headroom, force, dwell, low, stable, promote) < 0
             or observe < 1 or cap < 1 or group_search_limit < 1
             or deadline_guard_ms < 0
+            or time_cap_ms < 0 or not math.isfinite(initial_bandwidth_mib_s)
+            or initial_bandwidth_mib_s <= 0
+            or not 0 < bandwidth_ewma_alpha <= 1
             or max_group not in (1, 2, 3, 4)
             or (low and low >= budget) or (promote and (not force or promote <= force))):
         raise ValueError("adaptive scheduler settings must be nonnegative")
@@ -999,7 +1082,9 @@ def install_scheduler_budget():
                           if stats_dir else None)
             self._ekv_adaptive_budget = SchedulerBudget(
                 budget, headroom, dwell, force, low, stable, observe, promote, stats_path, cap, max_group, capture_plans,
-                trim_low_water, group_search_limit, deadline_guard_ms)
+                trim_low_water, group_search_limit, deadline_guard_ms,
+                time_cap_ms, int(initial_bandwidth_mib_s * (1 << 20)),
+                bandwidth_ewma_alpha)
 
         def exchange(value):
             if coordinator.tp_world_size == 1:
