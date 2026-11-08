@@ -25,6 +25,7 @@ from .future_residency import RESIDENCE_HINTS
 
 
 POLICIES = ("fifo", "longest", "mode-aware", "future")
+RUNTIME_HINT_MAX_MS = 86_400_000
 
 
 class ResidencyMode(str, Enum):
@@ -56,28 +57,58 @@ class RequestProfile:
     residence_hint: str = "auto"
 
     def __post_init__(self) -> None:
-        if not self.request_id:
-            raise ValueError("request_id must be non-empty")
-        if self.arrival_ms < 0:
-            raise ValueError(f"{self.request_id}: arrival_ms must be non-negative")
-        if self.prompt_tokens < 1 or self.output_tokens < 1:
-            raise ValueError(f"{self.request_id}: prompt and output must be positive")
-        if not math.isfinite(self.priority) or not 0 < self.priority <= 1e6:
+        if not isinstance(self.request_id, str) or not self.request_id:
+            raise ValueError("request_id must be a non-empty string")
+        prefix = f"{self.request_id}: " if self.request_id else ""
+        _bounded_int(
+            self.arrival_ms,
+            "arrival_ms",
+            maximum=RUNTIME_HINT_MAX_MS,
+            prefix=prefix,
+        )
+        _bounded_int(self.prompt_tokens, "prompt_tokens", minimum=1, prefix=prefix)
+        _bounded_int(
+            self.output_tokens,
+            "output_tokens",
+            minimum=1,
+            maximum=RUNTIME_HINT_MAX_MS,
+            prefix=prefix,
+        )
+        if (
+            isinstance(self.priority, bool)
+            or not isinstance(self.priority, (int, float))
+            or not math.isfinite(self.priority)
+            or not 0 < self.priority <= 1e6
+        ):
             raise ValueError(
-                f"{self.request_id}: priority must be finite and in (0, 1e6]"
+                f"{prefix}priority must be finite number in (0, 1e6]"
             )
         if not isinstance(self.kind, str) or not self.kind or len(self.kind) > 64:
             raise ValueError(
-                f"{self.request_id}: kind must be a short non-empty string"
+                f"{prefix}kind must be a short non-empty string"
             )
-        if self.deadline_ms is not None and self.deadline_ms < self.arrival_ms:
-            raise ValueError(f"{self.request_id}: deadline precedes arrival")
-        if self.shared_prefix_tokens < 0 or self.shared_prefix_tokens > self.prompt_tokens:
-            raise ValueError(f"{self.request_id}: invalid shared_prefix_tokens")
+        if self.deadline_ms is not None:
+            _bounded_int(
+                self.deadline_ms,
+                "deadline_ms",
+                maximum=RUNTIME_HINT_MAX_MS,
+                prefix=prefix,
+            )
+            if self.deadline_ms < self.arrival_ms:
+                raise ValueError(f"{prefix}deadline precedes arrival")
+        _bounded_int(self.shared_prefix_tokens, "shared_prefix_tokens", prefix=prefix)
+        if self.shared_prefix_tokens > self.prompt_tokens:
+            raise ValueError(f"{prefix}invalid shared_prefix_tokens")
+        if self.prefix_group is not None and (
+            not isinstance(self.prefix_group, str)
+            or not self.prefix_group
+            or len(self.prefix_group) > 64
+        ):
+            raise ValueError(f"{prefix}prefix_group must be a short non-empty string")
         if self.shared_prefix_tokens and not self.prefix_group:
-            raise ValueError(f"{self.request_id}: prefix_group is required for reuse")
+            raise ValueError(f"{prefix}prefix_group is required for reuse")
         if self.residence_hint not in RESIDENCE_HINTS:
-            raise ValueError(f"{self.request_id}: invalid residence_hint")
+            raise ValueError(f"{prefix}invalid residence_hint")
 
     @property
     def sequence_tokens(self) -> int:
@@ -114,19 +145,47 @@ class PlannerConfig:
             "auto_resident_output_threshold": self.auto_resident_output_threshold,
         }
         for name, value in positive_ints.items():
-            if value < 1:
-                raise ValueError(f"{name} must be positive")
-        if self.prefill_workspace_bytes_per_token < 0:
-            raise ValueError("prefill_workspace_bytes_per_token must be non-negative")
+            _bounded_int(value, name, minimum=1)
+        _bounded_int(
+            self.prefill_workspace_bytes_per_token,
+            "prefill_workspace_bytes_per_token",
+        )
         for name, value in (
             ("prefill_tokens_per_ms", self.prefill_tokens_per_ms),
             ("resident_decode_tokens_per_ms", self.resident_decode_tokens_per_ms),
             ("sparse_decode_tokens_per_ms", self.sparse_decode_tokens_per_ms),
         ):
-            if not math.isfinite(value) or value <= 0:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+            ):
                 raise ValueError(f"{name} must be a finite positive number")
-        if self.lookahead_ms < 0:
-            raise ValueError("lookahead_ms must be non-negative")
+        _bounded_int(
+            self.lookahead_ms,
+            "lookahead_ms",
+            maximum=RUNTIME_HINT_MAX_MS,
+        )
+
+
+def _bounded_int(
+    value: object,
+    name: str,
+    *,
+    minimum: int = 0,
+    maximum: int | None = None,
+    prefix: str = "",
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{prefix}{name} must be an integer")
+    if value < minimum:
+        raise ValueError(f"{prefix}{name} must be >= {minimum}")
+    if maximum is not None and value > maximum:
+        raise ValueError(
+            f"{prefix}{name} must be between {minimum} and {maximum}"
+        )
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -412,9 +471,14 @@ def _defer_for_imminent_work(
             continue
 
         if choice.deadline_ms is not None:
-            delayed_choice_finish = (
-                item.arrival_ms + future_prefill + choice_duration
+            # If both requests cannot coexist, the choice cannot restart until
+            # the future request has released its decode residency.  A pure
+            # prefill-only estimate would incorrectly claim that the current
+            # request can still meet its deadline after idling.
+            delayed_start = item.arrival_ms + (
+                future_duration if memory_blocked else future_prefill
             )
+            delayed_choice_finish = delayed_start + choice_duration
             if delayed_choice_finish > choice.deadline_ms:
                 continue
             if item.deadline_ms > choice.deadline_ms:

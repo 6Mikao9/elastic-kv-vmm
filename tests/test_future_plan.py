@@ -13,6 +13,7 @@ from adaptive_sparse.future_plan import (
     plan_rollout,
     simulate,
 )
+from adaptive_sparse.sglang_future_hook import FutureHint
 
 
 class FuturePlanTest(unittest.TestCase):
@@ -84,6 +85,41 @@ class FuturePlanTest(unittest.TestCase):
             item for item in future.admissions if item.request_id == "background"
         )
         self.assertGreaterEqual(background.start_ms, 3)
+
+    def test_idle_forecast_accounts_for_future_decode_residency(self):
+        config = PlannerConfig(
+            memory_budget_bytes=110,
+            kv_bytes_per_token=1,
+            prefill_workspace_bytes_per_token=0,
+            sparse_hot_tokens=40,
+            prefill_tokens_per_ms=5,
+            resident_decode_tokens_per_ms=1,
+            sparse_decode_tokens_per_ms=1,
+            max_active_requests=2,
+            lookahead_ms=10,
+        )
+        workload = [
+            RequestProfile(
+                "current",
+                arrival_ms=0,
+                prompt_tokens=60,
+                output_tokens=40,
+                deadline_ms=100,
+                residence_hint="resident",
+            ),
+            RequestProfile(
+                "future",
+                arrival_ms=2,
+                prompt_tokens=40,
+                output_tokens=40,
+                priority=2,
+                deadline_ms=50,
+            ),
+        ]
+        future = simulate(workload, config, "future")
+
+        self.assertEqual(future.admissions[0].request_id, "current")
+        self.assertLessEqual(future.admissions[0].finish_ms, 100)
 
     def test_prefill_workspace_can_force_bounded_hot_set(self):
         config = PlannerConfig(
@@ -273,6 +309,43 @@ class FuturePlanTest(unittest.TestCase):
                 priority=1_000_001,
             )
 
+    def test_request_fields_are_strict_runtime_compatible_types(self):
+        invalid = (
+            ({"prompt_tokens": 0}, "prompt_tokens must be >= 1"),
+            ({"arrival_ms": 0.5}, "arrival_ms must be an integer"),
+            ({"prompt_tokens": 1.5}, "prompt_tokens must be an integer"),
+            ({"output_tokens": True}, "output_tokens must be an integer"),
+            ({"shared_prefix_tokens": False}, "shared_prefix_tokens must be an integer"),
+            ({"priority": True}, "priority must be finite"),
+            ({"priority": "2"}, "priority must be finite"),
+            ({"deadline_ms": 2.5}, "deadline_ms must be an integer"),
+            ({"deadline_ms": 86_400_001}, "deadline_ms must be between"),
+        )
+        base = {
+            "request_id": "bad",
+            "arrival_ms": 0,
+            "prompt_tokens": 1,
+            "output_tokens": 1,
+        }
+        for update, message in invalid:
+            with self.subTest(update=update), self.assertRaisesRegex(ValueError, message):
+                RequestProfile(**{**base, **update})
+
+    def test_config_fields_are_strict_integer_and_number_types(self):
+        with self.assertRaisesRegex(ValueError, "memory_budget_bytes must be an integer"):
+            PlannerConfig(
+                memory_budget_bytes=1.5,
+                kv_bytes_per_token=1,
+                prefill_workspace_bytes_per_token=0,
+            )
+        with self.assertRaisesRegex(ValueError, "lookahead_ms must be an integer"):
+            PlannerConfig(
+                memory_budget_bytes=1,
+                kv_bytes_per_token=1,
+                prefill_workspace_bytes_per_token=0,
+                lookahead_ms=True,
+            )
+
     def test_rollout_plan_emits_controlled_submissions_and_runtime_hints(self):
         plan = plan_rollout(self.workload, self.config, "future")
         submissions = {item.request_id: item for item in plan.submissions}
@@ -307,6 +380,8 @@ class FuturePlanTest(unittest.TestCase):
             short.hint["deadline_after_ms"],
             max(0, 500 - short.submit_at_ms),
         )
+        for item in plan.submissions:
+            FutureHint.from_payload(item.hint)
 
     def test_rollout_plan_is_json_serializable_and_rejects_unknown_policy(self):
         payload = plan_rollout(self.workload, self.config, "future").as_dict()

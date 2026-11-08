@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# Usage: container_future_smoke.sh GPU MODEL_PATH OUTPUT_DIRECTORY
+# Usage: container_future_smoke.sh GPU MODEL_PATH OUTPUT_DIRECTORY [RUNNER_FLAGS ...]
+if (( $# < 3 )); then
+    echo "Usage: $0 GPU MODEL_PATH OUTPUT_DIRECTORY [RUNNER_FLAGS ...]" >&2
+    exit 2
+fi
 gpu=$1; model=$2; output=$3
+shift 3
 root=$(cd "$(dirname "$0")/.." && pwd)
 image=${FUTURE_SMOKE_IMAGE:-lmsysorg/sglang:dev-minimax-m31-flash}
 test -r "$model/config.json"
@@ -24,4 +29,4 @@ docker run --rm --pull=never --gpus "device=$gpu" --network none --shm-size 2g \
     -e SGLANG_JIT_CACHE_DIR=/experiment/cache/e2e/sglang-jit \
     -e CUDA_CACHE_PATH=/experiment/cache/e2e/cuda -e PYTHONDONTWRITEBYTECODE=1 \
     --entrypoint python3 "$image" scripts/run_future_smoke.py \
-    --model-path /model --output-dir "/experiment/$output"
+    --model-path /model --output-dir "/experiment/$output" "$@"
