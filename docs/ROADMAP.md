@@ -77,6 +77,17 @@ validated in deterministic CPU tests; it remains to measure whether
 control-plane idle time and prediction error are worthwhile on real serving
 workloads.
 
+The controller now also tracks the real in-flight set.  A bounded concurrency
+mode turns planned timestamps into earliest admission times, deadline ordering
+selects among already-eligible requests, and an aggregate byte ledger demotes
+only newly admitted long requests from full residency to the native HiSparse hot
+set when the live set crosses the planner budget.  Requests that cannot fit even
+their hot set wait for an actual completion unless a hard deadline requires an
+explicitly recorded overcommit.  The next evaluation should compare timeline,
+deadline ordering, static residency and live elastic residency using the same
+requests and report capacity delay, demotions, deadline misses, TTFT/TPOT and
+whole-device memory separately.
+
 ### Performance targets and next optimizations (2026-11-04)
 
 The dynamic policy has two reference targets: approach fully GPU-resident

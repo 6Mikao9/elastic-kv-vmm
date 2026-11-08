@@ -168,6 +168,20 @@ class PlannerConfig:
             maximum=RUNTIME_HINT_MAX_MS,
         )
 
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "memory_budget_bytes": self.memory_budget_bytes,
+            "kv_bytes_per_token": self.kv_bytes_per_token,
+            "prefill_workspace_bytes_per_token": self.prefill_workspace_bytes_per_token,
+            "sparse_hot_tokens": self.sparse_hot_tokens,
+            "prefill_tokens_per_ms": self.prefill_tokens_per_ms,
+            "resident_decode_tokens_per_ms": self.resident_decode_tokens_per_ms,
+            "sparse_decode_tokens_per_ms": self.sparse_decode_tokens_per_ms,
+            "max_active_requests": self.max_active_requests,
+            "lookahead_ms": self.lookahead_ms,
+            "auto_resident_output_threshold": self.auto_resident_output_threshold,
+        }
+
 
 def _bounded_int(
     value: object,
@@ -276,9 +290,10 @@ class RolloutPlan:
 
     simulation: PlanResult
     submissions: tuple[RolloutSubmission, ...]
+    planner_config: PlannerConfig | None = None
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "policy": self.simulation.policy,
             "simulation": self.simulation.as_dict(),
             "submissions": [
@@ -296,6 +311,9 @@ class RolloutPlan:
                 for item in self.submissions
             ],
         }
+        if self.planner_config is not None:
+            payload["planner_config"] = self.planner_config.as_dict()
+        return payload
 
 
 @dataclass(slots=True)
@@ -753,7 +771,7 @@ def plan_rollout(
                 deadline_ms=request.deadline_ms,
             )
         )
-    return RolloutPlan(simulation, tuple(submissions))
+    return RolloutPlan(simulation, tuple(submissions), config)
 
 
 def compare(request_path: str | Path) -> dict[str, dict[str, object]]:

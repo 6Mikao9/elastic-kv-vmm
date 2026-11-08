@@ -114,6 +114,11 @@ The known-future planner now has a live executor that consumes its
 original absolute deadline, and records planned versus actual latency and
 residency. A matching unhinted control arm can be run with `--no-hints` for
 paired real-serving measurements.
+The same executor can treat each planned timestamp as an earliest admission
+time, bound the observed in-flight set, prioritize deadline-bearing requests,
+and demote only newly admitted long requests when the live predicted KV set
+would cross the planner's aggregate byte budget. Runtime demotion and capacity
+waiting are written into every request record and the paired summary.
 The 0.5.17 API and request-transport tests pass; a real model server could not
 start on the available 5090 host because PyTorch CUDA initialization failed after
 container `nvidia-smi` succeeded. That blocker is recorded without converting it

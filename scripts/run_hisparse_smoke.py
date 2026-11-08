@@ -226,6 +226,13 @@ def main():
     parser.add_argument("--future-request-timeout-s", type=float, default=600.0)
     parser.add_argument("--future-residency-evidence-timeout-s", type=float, default=10.0)
     parser.add_argument("--future-max-parallel", type=int)
+    parser.add_argument("--future-max-inflight", type=int)
+    parser.add_argument(
+        "--future-queue-policy", choices=("timeline", "deadline"), default="timeline"
+    )
+    parser.add_argument("--future-elastic-residency-budget", action="store_true")
+    parser.add_argument("--future-forbid-deadline-overcommit", action="store_true")
+    parser.add_argument("--future-poll-interval-ms", type=float, default=10.0)
     args = parser.parse_args()
     if not (args.model_path / "config.json").is_file() or args.tp_size < 4:
         parser.error("require a local MiniMax snapshot and TP >= 4")
@@ -237,8 +244,23 @@ def main():
         parser.error("future residency evidence timeout must be nonnegative")
     if args.future_max_parallel is not None and args.future_max_parallel < 1:
         parser.error("future max parallelism must be positive")
+    if args.future_max_inflight is not None and args.future_max_inflight < 1:
+        parser.error("future max in-flight requests must be positive")
+    if args.future_poll_interval_ms <= 0:
+        parser.error("future poll interval must be positive")
     if (args.future_plan is not None or args.future_workload is not None) and args.future_no_hints and args.future_policy != "off":
         parser.error("future no-hints requires future policy off")
+    if args.future_no_hints and args.future_elastic_residency_budget:
+        parser.error("future elastic residency budget requires emitted future hints")
+    if args.future_plan is None and args.future_workload is None:
+        if args.future_max_inflight is not None:
+            parser.error("future max-inflight requires a future plan or workload")
+        if args.future_queue_policy != "timeline":
+            parser.error("future queue-policy requires a future plan or workload")
+        if args.future_elastic_residency_budget:
+            parser.error("future elastic residency budget requires a future plan or workload")
+        if args.future_forbid_deadline_overcommit:
+            parser.error("future forbid-deadline-overcommit requires a future plan or workload")
     if ((args.future_plan is not None or args.future_workload is not None)
             and not args.future_no_hints and args.future_policy == "off"):
         parser.error("future plan hints require future policy deadline; use no-hints for control")
@@ -334,6 +356,7 @@ def main():
     future_plan_mode = args.future_plan is not None or args.future_workload is not None
     planned_submissions = None
     future_plan_manifest = None
+    future_plan_config = None
     effective_future_policy = args.future_planning_policy
     if future_plan_mode:
         try:
@@ -349,12 +372,21 @@ def main():
         except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
             parser.error(f"invalid future plan or workload: {error}")
         write_json(output / "future_plan.json", future_plan_manifest)
+        raw_config = future_plan_manifest.get("planner_config")
+        if raw_config is not None:
+            from adaptive_sparse.future_plan import PlannerConfig
+
+            try:
+                future_plan_config = PlannerConfig(**raw_config)
+            except (TypeError, ValueError) as error:
+                parser.error(f"invalid future planner_config: {error}")
         if any(item.prompt_tokens + item.output_tokens > 16384 for item in planned_submissions):
             parser.error("future plan request exceeds the MiniMax context length")
     needs_planned_resident_rows = bool(
         planned_submissions
         and any(item.hint.get("residence") == "resident" for item in planned_submissions)
     )
+    require_runtime_resident_rows = needs_planned_resident_rows
     config = {"top_k": 2048, "device_buffer_size": 4096,
               "host_to_device_ratio": args.host_ratio}
     capacity = (args.logical_capacity // args.host_ratio
@@ -462,7 +494,11 @@ def main():
     if args.future_policy != "off":
         sources += ("adaptive_sparse/sglang_future_hook.py", "adaptive_sparse/kv_hints_compat.py")
     if future_plan_mode:
-        sources += ("adaptive_sparse/future_plan.py", "adaptive_sparse/rollout_executor.py")
+        sources += (
+            "adaptive_sparse/future_plan.py",
+            "adaptive_sparse/rollout_executor.py",
+            "adaptive_sparse/elastic_admission.py",
+        )
     if args.resident_limit:
         sources += resident_hint_sources(args.resident_limit)
     if args.diagnostic_captures:
@@ -522,6 +558,9 @@ def main():
         "future_plan": future_plan_manifest,
         "future_planning_policy": effective_future_policy if future_plan_mode else None,
         "future_hints_emitted": future_plan_mode and not args.future_no_hints,
+        "future_max_inflight": args.future_max_inflight,
+        "future_queue_policy": args.future_queue_policy,
+        "future_elastic_residency_budget": args.future_elastic_residency_budget,
         "sha256": {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in sources},
     })
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -537,6 +576,9 @@ def main():
                "future_policy": args.future_policy,
                "future_planning_policy": effective_future_policy if future_plan_mode else None,
                "future_hints_emitted": future_plan_mode and not args.future_no_hints,
+               "future_max_inflight": args.future_max_inflight,
+               "future_queue_policy": args.future_queue_policy,
+               "future_elastic_residency_budget": args.future_elastic_residency_budget,
                "status": "running", "probes": []}
     server = None
     step = "startup"
@@ -556,7 +598,16 @@ def main():
             write_json(output / "results.json", results)
         if future_plan_mode:
             from adaptive_sparse.rollout_executor import execute_rollout
+            from adaptive_sparse.elastic_admission import elastic_config_from_planner
             from benchmarks.client import MemorySampler, memory_summary
+
+            elastic_config = None
+            if args.future_elastic_residency_budget:
+                if future_plan_config is None:
+                    raise RuntimeError(
+                        "future elastic residency budget needs planner_config; regenerate the plan"
+                    )
+                elastic_config = elastic_config_from_planner(future_plan_config)
 
             step = "future_plan_execution"
             previous_gpu_uuid = os.environ.get("BENCH_GPU_UUID")
@@ -582,6 +633,13 @@ def main():
                         residency_evidence_timeout_s=(
                             args.future_residency_evidence_timeout_s
                         ),
+                        max_inflight=args.future_max_inflight,
+                        queue_policy=args.future_queue_policy,
+                        elastic_kv_config=elastic_config,
+                        allow_deadline_overcommit=(
+                            not args.future_forbid_deadline_overcommit
+                        ),
+                        poll_interval_ms=args.future_poll_interval_ms,
                     )
                     sampler.take()
             finally:
@@ -590,6 +648,10 @@ def main():
                 else:
                     os.environ["BENCH_GPU_UUID"] = previous_gpu_uuid
             write_json(output / "future_execution.json", planned_result)
+            require_runtime_resident_rows = any(
+                row.get("runtime_residence") == "resident"
+                for row in planned_result["requests"]
+            )
             results["future_execution"] = {
                 "summary": planned_result["summary"],
                 "residency_evidence": planned_result["residency_evidence"],
@@ -668,7 +730,7 @@ def main():
                     item["owned_pages"] == 0 and item["reclaimable_bytes"] == 0 for item in snapshots)
                 if args.resident_limit:
                     require_resident_rows = (
-                        needs_planned_resident_rows if future_plan_mode else True
+                        require_runtime_resident_rows if future_plan_mode else True
                     )
                     if require_resident_rows:
                         ready = ready and all(item.get("request_residency", {}).get(

@@ -1,8 +1,11 @@
 import json
 from pathlib import Path
 import tempfile
+import threading
+import time
 import unittest
 
+from adaptive_sparse.elastic_admission import ElasticKVConfig
 from adaptive_sparse.future_plan import (
     PlannerConfig,
     RequestProfile,
@@ -83,6 +86,133 @@ class RolloutExecutorTest(unittest.TestCase):
         self.assertEqual(envelope["actions"][0]["payload"]["residence"], "resident")
         adjusted = make_kv_hints(submission(), deadline_after_ms=17)
         self.assertEqual(adjusted["actions"][0]["payload"]["deadline_after_ms"], 17)
+        demoted = make_kv_hints(submission(), residence_override="host_backed")
+        self.assertEqual(demoted["actions"][0]["payload"]["residence"], "host_backed")
+
+    def test_runtime_budget_demotes_only_the_new_request(self):
+        base = submission()
+        first = RolloutSubmission(
+            request_id="first",
+            planned_arrival_ms=0,
+            submit_at_ms=0,
+            estimated_finish_ms=100,
+            kind=base.kind,
+            prompt_tokens=100,
+            output_tokens=100,
+            hint={
+                key: value
+                for key, value in base.hint.items()
+                if key != "deadline_after_ms"
+            }
+            | {"expected_output_tokens": 100},
+        )
+        second = RolloutSubmission(
+            request_id="second",
+            planned_arrival_ms=0,
+            submit_at_ms=0,
+            estimated_finish_ms=100,
+            kind=base.kind,
+            prompt_tokens=100,
+            output_tokens=100,
+            hint={
+                key: value
+                for key, value in base.hint.items()
+                if key != "deadline_after_ms"
+            }
+            | {"expected_output_tokens": 100},
+        )
+        first_started = threading.Event()
+        seen = []
+
+        def generate(url, spec, timeout, stream):
+            seen.append((spec["request_id"], spec["future_hint"]))
+            if spec["request_id"] == "first":
+                first_started.set()
+                time.sleep(0.03)
+            else:
+                self.assertTrue(first_started.is_set())
+            started = time.perf_counter()
+            return {
+                "_started_perf_s": started,
+                "end_to_end_s": 0.01,
+                "output_tokens": 100,
+                "ttft_s": 0.004,
+                "tpot_s": 0.0001,
+            }
+
+        result = execute_rollout(
+            "http://server/generate",
+            [first, second],
+            generator=generate,
+            elastic_kv_config=ElasticKVConfig(
+                memory_budget_bytes=600,
+                kv_bytes_per_token=2,
+                sparse_hot_tokens=64,
+            ),
+            poll_interval_ms=1,
+        )
+
+        by_id = {row["request_id"]: row for row in result["requests"]}
+        self.assertEqual(by_id["first"]["runtime_residence"], "resident")
+        self.assertEqual(by_id["second"]["runtime_residence"], "host_backed")
+        second_hint = next(
+            hint for request_id, hint in seen if request_id == "second"
+        )
+        self.assertEqual(second_hint["actions"][0]["payload"]["residence"], "host_backed")
+        self.assertEqual(result["summary"]["runtime_demotions"], 1)
+
+    def test_deadline_queue_policy_orders_contended_requests(self):
+        base = submission()
+        background = RolloutSubmission(
+            request_id="background",
+            planned_arrival_ms=0,
+            submit_at_ms=0,
+            estimated_finish_ms=50,
+            kind=base.kind,
+            prompt_tokens=32,
+            output_tokens=8,
+            hint={
+                key: value
+                for key, value in base.hint.items()
+                if key != "deadline_after_ms"
+            },
+        )
+        urgent = RolloutSubmission(
+            request_id="urgent",
+            planned_arrival_ms=0,
+            submit_at_ms=0,
+            estimated_finish_ms=50,
+            kind=base.kind,
+            prompt_tokens=32,
+            output_tokens=8,
+            hint={**base.hint, "deadline_after_ms": 200, "weight": 2.0},
+            deadline_ms=200,
+        )
+        seen = []
+
+        def generate(url, spec, timeout, stream):
+            seen.append(spec["request_id"])
+            time.sleep(0.01)
+            return {
+                "_started_perf_s": time.perf_counter(),
+                "end_to_end_s": 0.005,
+                "output_tokens": 8,
+                "ttft_s": 0.002,
+                "tpot_s": 0.0001,
+            }
+
+        result = execute_rollout(
+            "http://server/generate",
+            [background, urgent],
+            max_inflight=1,
+            queue_policy="deadline",
+            generator=generate,
+            poll_interval_ms=1,
+        )
+
+        self.assertEqual(seen, ["urgent", "background"])
+        self.assertEqual(result["requests"][0]["request_id"], "urgent")
+        self.assertGreater(result["summary"]["max_capacity_delay_ms"], 0)
 
     def test_executes_at_planned_time_and_measures_deadline(self):
         clock = FakeClock()

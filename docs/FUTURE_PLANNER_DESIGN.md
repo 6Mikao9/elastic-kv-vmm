@@ -218,6 +218,21 @@ python scripts/future_plan_compare.py \
 
 吞吐使用“最早计划到达至最晚实际完成”的 makespan，包含策略刻意引入的空转；
 另记录从最早实际提交开始的服务窗口吞吐，便于区分调度收益和请求处理速度。
+
+执行器还提供一个可选的在线准入层。`--max-inflight` 用真实的尚未完成请求数
+限制进入服务的请求；`--queue-policy deadline` 会在同一时刻已到达的竞争者中先
+选择绝对 deadline 最紧且剩余 slack 最小的请求。计划时间在这种模式下是“最早
+可提交时间”，实际容量等待会写入 `capacity_delay_ms`，不会伪装成网络提交抖动。
+
+`--elastic-residency-budget` 从计划中的 `planner_config` 恢复每 token KV 字节数、
+热 token 数和总预算。执行器维护当前在飞请求的预测字节账本：低负载且完整 KV
+能装入预算时保留 planner 选择的 resident；高负载下只把尚未提交的长请求降为
+`host_backed`，已经在飞请求不迁移。每个请求记录 `planned_residence`、
+`runtime_residence`、`elastic_admission_reason`、准入前后字节数和是否发生预算
+超限。若连热集也装不下，控制器默认等待现有请求完成；硬 deadline 已经等不起时
+才允许按配置超限提交。该账本用于控制器准入，SGLang 的原生容量检查和请求级
+驻留 broker 仍然是最终安全门。
+
 real-serving 对照必须使用不同输出目录交错运行同一请求集合：
 
 ```bash
@@ -231,7 +246,8 @@ python3 scripts/run_future_smoke.py \
   --model-path /model \
   --output-dir results/future-planning/future-hints \
   --workload benchmarks/workloads/known-future-rollout.json \
-  --planning-policy future --future-policy deadline
+  --planning-policy future --future-policy deadline \
+  --max-inflight 4 --queue-policy deadline --elastic-residency-budget
 ```
 
 对 MiniMax HiSparse 运行，额外传入 `--residency-stats-dir` 和
@@ -250,7 +266,9 @@ bash scripts/container_hisparse_smoke.sh \
   --sm80-bf16-projections --vmm-backing --resident-limit 2 \
   --resident-free-reserve 4096 --resident-hint-policy adaptive \
   --future-workload benchmarks/workloads/known-future-rollout.json \
-  --future-planning-policy future --future-policy deadline
+  --future-planning-policy future --future-policy deadline \
+  --future-max-inflight 4 --future-queue-policy deadline \
+  --future-elastic-residency-budget
 ```
 
 不带 hint 的对照使用 `--future-policy off --future-no-hints`；规划时间轴仍按同一

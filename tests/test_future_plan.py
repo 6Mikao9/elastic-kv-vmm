@@ -388,6 +388,14 @@ class FuturePlanTest(unittest.TestCase):
         rendered = json.dumps(payload, sort_keys=True)
         self.assertIn('"submissions"', rendered)
         self.assertIn('"kind": "tool"', rendered)
+        self.assertEqual(
+            payload["planner_config"]["memory_budget_bytes"],
+            self.config.memory_budget_bytes,
+        )
+        self.assertEqual(
+            payload["planner_config"]["sparse_hot_tokens"],
+            self.config.sparse_hot_tokens,
+        )
         with self.assertRaisesRegex(ValueError, "unknown planning policy"):
             plan_rollout(self.workload, self.config, "oracle")
 
@@ -434,6 +442,10 @@ class FuturePlanTest(unittest.TestCase):
             )
             payload = json.loads(output.read_text(encoding="utf-8"))
         self.assertEqual(payload["rollout"]["policy"], "future")
+        self.assertEqual(
+            payload["rollout"]["planner_config"]["kv_bytes_per_token"],
+            self.config.kv_bytes_per_token,
+        )
         self.assertEqual(
             len(payload["rollout"]["submissions"]), len(self.workload)
         )

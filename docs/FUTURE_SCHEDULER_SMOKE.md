@@ -91,6 +91,14 @@ full makespan including deliberate idle as well as over the serving window. The
 executor rejects malformed plans before sending any request and fails loudly on
 late dispatch, incomplete output, or conflicting TP residency telemetry.
 
+For live elasticity, add `--max-inflight N --queue-policy deadline` and
+`--elastic-residency-budget`. The planned timestamps then become earliest
+admission times. The controller chooses among already-eligible requests, waits
+for a real completion when even a HiSparse hot set cannot fit, and overrides the
+hint to `host_backed` for only the new request that would cross the live resident
+byte estimate. `capacity_delay_ms`, `runtime_residence`, the admission reason,
+and the pre/post-admission byte ledger are preserved in `results.json`.
+
 ## Limits
 
 - `release_after_ms` is currently a soft ordering preference. It is not a hard

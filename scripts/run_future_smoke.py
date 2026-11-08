@@ -164,6 +164,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--request-timeout-s", type=float, default=180.0)
     parser.add_argument("--residency-evidence-timeout-s", type=float, default=5.0)
     parser.add_argument("--max-parallel", type=int)
+    parser.add_argument("--max-inflight", type=int)
+    parser.add_argument(
+        "--queue-policy", choices=("timeline", "deadline"), default="timeline"
+    )
+    parser.add_argument(
+        "--elastic-residency-budget",
+        action="store_true",
+        help="demote new requests from the planner byte budget as the live set grows",
+    )
+    parser.add_argument("--forbid-deadline-overcommit", action="store_true")
+    parser.add_argument("--poll-interval-ms", type=float, default=10.0)
     args = parser.parse_args(argv)
     if not args.model_path.is_dir():
         parser.error("--model-path must be an existing directory")
@@ -177,10 +188,25 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("request timeout must be positive; timing tolerances non-negative")
     if args.max_parallel is not None and args.max_parallel < 1:
         parser.error("--max-parallel must be positive")
+    if args.max_inflight is not None and args.max_inflight < 1:
+        parser.error("--max-inflight must be positive")
+    if args.poll_interval_ms <= 0:
+        parser.error("--poll-interval-ms must be positive")
     if args.require_residency_evidence and args.residency_stats_dir is None:
         parser.error("--require-residency-evidence needs --residency-stats-dir")
+    if args.plan is None and args.workload is None:
+        if args.max_inflight is not None:
+            parser.error("--max-inflight requires --plan or --workload")
+        if args.queue_policy != "timeline":
+            parser.error("--queue-policy requires --plan or --workload")
+        if args.elastic_residency_budget:
+            parser.error("--elastic-residency-budget requires --plan or --workload")
+        if args.forbid_deadline_overcommit:
+            parser.error("--forbid-deadline-overcommit requires --plan or --workload")
     if (args.plan is not None or args.workload is not None) and args.no_hints and args.future_policy != "off":
         parser.error("--no-hints requires --future-policy off")
+    if args.no_hints and args.elastic_residency_budget:
+        parser.error("--elastic-residency-budget requires emitted future hints")
     if (args.plan is not None or args.workload is not None) and not args.no_hints and args.future_policy == "off":
         parser.error("planned hints require --future-policy deadline; use --no-hints for control")
     output = args.output_dir.resolve()
@@ -194,6 +220,7 @@ def main(argv: list[str] | None = None) -> int:
 
     planned_submissions = None
     plan_manifest = None
+    plan_config = None
     effective_planning_policy = args.planning_policy
     if args.plan is not None or args.workload is not None:
         from adaptive_sparse.future_plan import (
@@ -211,6 +238,12 @@ def main(argv: list[str] | None = None) -> int:
                 parser.error(f"invalid --plan: {error}")
             plan_manifest = plan_payload.get("rollout", plan_payload)
             effective_planning_policy = plan_manifest.get("policy", "external")
+            raw_config = plan_manifest.get("planner_config")
+            if raw_config is not None:
+                try:
+                    plan_config = PlannerConfig(**raw_config)
+                except (TypeError, ValueError) as exc:
+                    parser.error(f"invalid planner_config in --plan: {exc}")
         else:
             workload = json.loads(args.workload.read_text(encoding="utf-8"))
             if not isinstance(workload, dict):
@@ -223,6 +256,7 @@ def main(argv: list[str] | None = None) -> int:
             rollout = plan_rollout(requests, config, args.planning_policy)
             planned_submissions = rollout.submissions
             plan_manifest = rollout.as_dict()
+            plan_config = config
         (output / "plan.json").write_text(
             json.dumps(plan_manifest or {"submissions": []}, indent=2, sort_keys=True),
             encoding="utf-8",
@@ -298,6 +332,17 @@ def main(argv: list[str] | None = None) -> int:
             with MemorySampler() as sampler:
                 if planned_submissions is not None:
                     from adaptive_sparse.rollout_executor import execute_rollout
+                    from adaptive_sparse.elastic_admission import (
+                        elastic_config_from_planner,
+                    )
+
+                    elastic_config = None
+                    if args.elastic_residency_budget:
+                        if plan_config is None:
+                            raise RuntimeError(
+                                "elastic residency budget needs planner_config; regenerate the plan"
+                            )
+                        elastic_config = elastic_config_from_planner(plan_config)
 
                     planned_result = execute_rollout(
                         f"{URL}/generate",
@@ -309,6 +354,11 @@ def main(argv: list[str] | None = None) -> int:
                         residency_stats_dir=args.residency_stats_dir,
                         require_residency_evidence=args.require_residency_evidence,
                         residency_evidence_timeout_s=args.residency_evidence_timeout_s,
+                        max_inflight=args.max_inflight,
+                        queue_policy=args.queue_policy,
+                        elastic_kv_config=elastic_config,
+                        allow_deadline_overcommit=not args.forbid_deadline_overcommit,
+                        poll_interval_ms=args.poll_interval_ms,
                     )
                 else:
                     with ThreadPoolExecutor(max_workers=3) as pool:
@@ -386,6 +436,9 @@ def main(argv: list[str] | None = None) -> int:
                 "elastic_stats": elastic_stats,
                 "hint_enabled": not args.no_hints,
                 "planning_policy": effective_planning_policy,
+                "max_inflight": args.max_inflight,
+                "queue_policy": args.queue_policy,
+                "elastic_residency_budget": args.elastic_residency_budget,
             }
             result_path.write_text(
                 json.dumps(result, indent=2, sort_keys=True), encoding="utf-8"

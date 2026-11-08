@@ -360,6 +360,18 @@
     "weighted_completion_ms": 1008.4090909090909
   },
   "rollout": {
+    "planner_config": {
+      "auto_resident_output_threshold": 128,
+      "kv_bytes_per_token": 1000,
+      "lookahead_ms": 200,
+      "max_active_requests": 8,
+      "memory_budget_bytes": 8500000,
+      "prefill_tokens_per_ms": 8.0,
+      "prefill_workspace_bytes_per_token": 2,
+      "resident_decode_tokens_per_ms": 20.0,
+      "sparse_decode_tokens_per_ms": 16.0,
+      "sparse_hot_tokens": 2000
+    },
     "policy": "future",
     "simulation": {
       "admissions": [
