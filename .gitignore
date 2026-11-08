@@ -7,6 +7,8 @@ inspection/
 **/private_trace/
 SGLang052接入简报.md
 *.log
+!results/future-smoke/5090-gpu-blocker/server.log
+!results/future-smoke/5090-gpu-blocker/tests-0.5.17-r9-future-smoke.log
 *.tmp
 .env
 .env.*

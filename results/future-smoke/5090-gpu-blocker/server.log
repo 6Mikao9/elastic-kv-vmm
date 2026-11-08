@@ -1,0 +1,48 @@
+elastic-sglang configuration: {"activation_policy": "off", "chunk_mib": 2, "future_policy": "deadline", "mode": "baseline", "prefill_headroom_mib": 0, "retain_chunks": 1, "stats_path": "/experiment/results/future-smoke/5090-qwen25-3b-baseline-r3/vmm_stats.json"}
+/usr/local/lib/python3.12/dist-packages/torch/cuda/__init__.py:180: UserWarning: CUDA initialization: CUDA unknown error - this may be due to an incorrectly set up environment, e.g. changing env variable CUDA_VISIBLE_DEVICES after program start. Setting the available devices to be zero. (Triggered internally at /pytorch/c10/cuda/CUDAFunctions.cpp:119.)
+  return torch._C._cuda_getDeviceCount() > 0
+Failed to get device capability: CUDA unknown error - this may be due to an incorrectly set up environment, e.g. changing env variable CUDA_VISIBLE_DEVICES after program start. Setting the available devices to be zero..
+Failed to get device capability: CUDA unknown error - this may be due to an incorrectly set up environment, e.g. changing env variable CUDA_VISIBLE_DEVICES after program start. Setting the available devices to be zero..
+/usr/local/lib/python3.12/dist-packages/torchao/quantization/quant_api.py:1731: SyntaxWarning: invalid escape sequence '\.'
+  """Configuration class for applying different quantization configs to modules or parameters based on their fully qualified names (FQNs).
+/sgl-workspace/sglang/python/sglang/kernels/ops/attention/fla/utils.py:223: UserWarning: Triton is not supported on current platform, roll back to CPU.
+  warnings.warn(
+/sgl-workspace/sglang/python/sglang/srt/layers/quantization/awq/awq.py:52: UserWarning: Only CUDA, HIP and XPU support AWQ currently.
+  warnings.warn(f"Only CUDA, HIP and XPU support AWQ currently.")
+/sgl-workspace/sglang/python/sglang/srt/layers/quantization/gguf.py:69: UserWarning: Only CUDA, MUSA and NPU support GGUF quantization currently.
+  warnings.warn(f"Only CUDA, MUSA and NPU support GGUF quantization currently.")
+W1108 13:41:07.317000 562 torch/utils/cpp_extension.py:140] No CUDA runtime is found, using CUDA_HOME='/usr/local/cuda'
+Traceback (most recent call last):
+  File "/sgl-workspace/sglang/python/sglang/srt/utils/common.py", line 913, in get_device
+    return current_platform.get_device(device_id)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang/python/sglang/srt/platforms/device_mixin.py", line 176, in get_device
+    raise NotImplementedError
+NotImplementedError
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/experiment/elastic_kv/launch.py", line 101, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "/experiment/elastic_kv/launch.py", line 96, in main
+    launch_server(prepare_server_args(sglang_argv))
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang/python/sglang/srt/server_args.py", line 9380, in prepare_server_args
+    return ServerArgs.from_cli_args(raw_args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang/python/sglang/srt/server_args.py", line 8470, in from_cli_args
+    return cls(**{attr: getattr(args, attr) for attr in attrs})
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<string>", line 461, in __init__
+  File "/sgl-workspace/sglang/python/sglang/srt/server_args.py", line 3492, in __post_init__
+    self._handle_missing_default_values()
+  File "/sgl-workspace/sglang/python/sglang/srt/server_args.py", line 4066, in _handle_missing_default_values
+    self.device = get_device()
+                  ^^^^^^^^^^^^
+  File "/sgl-workspace/sglang/python/sglang/srt/utils/common.py", line 915, in get_device
+    raise RuntimeError(
+RuntimeError: No accelerator (CUDA, XPU, HPU, NPU, MUSA, MPS) or platform plugin is available.

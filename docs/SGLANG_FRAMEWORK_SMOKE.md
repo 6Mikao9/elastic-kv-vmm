@@ -56,11 +56,12 @@ Python 动态属性不会进入 msgpack。适配器在 worker 启动前重新生
 
 同一镜像内全量结果为 167 passed、2 skipped；跳过项都要求 CUDA device。
 随后尝试在 5090 GPU0 启动 `Qwen2.5-3B`。服务已越过请求 transport 并进入 SGLang
-启动流程，但 GPU0/1/3 的 Docker 容器均报 `CUDA unknown error`，最终在
+启动流程。GPU0、GPU1、GPU3 的容器都能执行 `nvidia-smi` 并看到 2 MiB 空闲显存，
+但 PyTorch 在 `torch.cuda` 延迟初始化时对三张卡都报 `CUDA unknown error`，最终在
 `ServerArgs._handle_missing_default_values()` 报 `No accelerator`。宿主
 `nvidia-container-cli info` 同时报 `nvml error: unknown error`，而 GPU2 在宿主
 NVML 中本身为 `Unknown Error`。因此没有生成 serving 延迟或显存结果，也没有把
-启动失败记成算法收益。带 SHA256 的服务日志与环境摘要保存在
+启动失败记成算法收益。机器可读的三卡尝试、原始日志哈希和服务错误摘录保存在
 [`results/future-smoke/5090-gpu-blocker`](../results/future-smoke/5090-gpu-blocker/)。
 
 恢复 GPU runtime 后，先复跑 baseline，再以相同模型和输出目录版本运行 VMM：

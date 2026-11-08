@@ -1,0 +1,12 @@
+Command:
+  python3 -m pytest -q tests
+
+Image:
+  lmsysorg/sglang:latest (SGLang 0.5.17)
+
+Result:
+  167 passed, 2 skipped, 18 warnings, 41 subtests passed in 20.36s
+
+The skipped tests are the two tests that require a CUDA device. The original
+full pytest output has SHA256
+cedf3741d53c460f278e59562260e84e46a3cb8004f847345c77093897eac7bc.

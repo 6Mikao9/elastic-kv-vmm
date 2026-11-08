@@ -1,0 +1,14 @@
+The launcher printed its selected configuration and entered SGLang startup.
+PyTorch then reported:
+
+  CUDA initialization: CUDA unknown error
+  Failed to get device capability: CUDA unknown error
+
+SGLang failed while resolving the device in ServerArgs:
+
+  RuntimeError: No accelerator (CUDA, XPU, HPU, NPU, MUSA, MPS) or
+  platform plugin is available.
+
+The request transport and launcher boundary were reached before this device
+initialization failure. The original full server output has SHA256
+2f6133be38150e5733d815c12ca5d3be9d0dc7be11a8dc3622d15079be410ea6.

@@ -19,6 +19,26 @@
     "sglang_launcher_entered": true,
     "accelerator_initialized": false
   },
+  "attempts": [
+    {
+      "gpu_index": 0,
+      "container_nvidia_smi": "ok: NVIDIA GeForce RTX 5090, 2 MiB",
+      "torch_cuda_available": false,
+      "torch_error": "CUDA unknown error while lazy-initializing torch.cuda"
+    },
+    {
+      "gpu_index": 1,
+      "container_nvidia_smi": "ok: NVIDIA GeForce RTX 5090, 2 MiB",
+      "torch_cuda_available": false,
+      "torch_error": "CUDA unknown error while lazy-initializing torch.cuda"
+    },
+    {
+      "gpu_index": 3,
+      "container_nvidia_smi": "ok: NVIDIA GeForce RTX 5090, 2 MiB",
+      "torch_cuda_available": false,
+      "torch_error": "CUDA unknown error while lazy-initializing torch.cuda"
+    }
+  ],
   "error": {
     "type": "RuntimeError",
     "message": "No accelerator (CUDA, XPU, HPU, NPU, MUSA, MPS) or platform plugin is available.",
@@ -26,6 +46,6 @@
     "host_runtime_probe": "nvidia-container-cli: detection error: nvml error: unknown error",
     "gpu2_host_nvml": "0000:A1:00.0: Unknown Error"
   },
-  "claim_boundary": "No latency, throughput, or memory-saving result was produced by this failed startup.",
+  "claim_boundary": "The selected GPUs pass container nvidia-smi but fail PyTorch CUDA initialization. No latency, throughput, or memory-saving result was produced.",
   "server_log_sha256": "2f6133be38150e5733d815c12ca5d3be9d0dc7be11a8dc3622d15079be410ea6"
 }
