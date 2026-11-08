@@ -27,6 +27,7 @@ docker run --rm --pull=never --gpus "device=$gpu" --network none --shm-size 2g \
     --mount "type=bind,src=$model,dst=/model,readonly" \
     --mount "type=bind,src=$root,dst=/experiment" --workdir /experiment \
     -e USER=experiment -e LOGNAME=experiment \
+    -e "BENCH_GPU_UUID=${gpu_uuid// /}" \
     -e HOME=/experiment/cache/e2e/home \
     -e HF_HOME=/experiment/cache/e2e/hf -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
     -e XDG_CACHE_HOME=/experiment/cache/e2e/xdg -e TORCH_HOME=/experiment/cache/e2e/torch \

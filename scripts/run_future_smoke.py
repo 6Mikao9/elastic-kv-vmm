@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -22,11 +21,6 @@ HOST = "127.0.0.1"
 PORT = 31180
 URL = f"http://{HOST}:{PORT}"
 ROOT = Path(__file__).resolve().parents[1]
-
-
-def prompt_ids(key: str, count: int) -> list[int]:
-    raw = hashlib.shake_256(key.encode()).digest(count * 2)
-    return [256 + int.from_bytes(raw[i : i + 2], "little") % 7936 for i in range(0, len(raw), 2)]
 
 
 def hint(rid: str, *, output_tokens: int, deadline_ms: int | None = None) -> dict:
@@ -88,39 +82,39 @@ def wait_for_health(server: subprocess.Popen) -> None:
 
 def generate(name: str, prompt: int, output: int, deadline_ms: int | None) -> dict:
     rid = f"future-smoke/{name}"
-    body = {
-        "rid": rid,
-        "input_ids": prompt_ids(rid, prompt),
-        "sampling_params": {
-            "temperature": 0,
-            "max_new_tokens": output,
-            "ignore_eos": True,
-        },
-        "stream": False,
-        "kv_hints": hint(rid, output_tokens=output, deadline_ms=deadline_ms),
-    }
-    started = time.perf_counter()
-    request = urllib.request.Request(
+    from benchmarks.client import generate as generate_request
+
+    record = generate_request(
         f"{URL}/generate",
-        data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
+        {
+            "request_id": rid,
+            "input_tokens": prompt,
+            "requested_output_tokens": output,
+            "future_hint": hint(
+                rid, output_tokens=output, deadline_ms=deadline_ms
+            ),
+        },
+        timeout=180,
+        stream=True,
     )
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(request, timeout=180) as response:
-        payload = json.load(response)
-    finish = time.perf_counter()
-    meta = payload.get("meta_info")
-    count = meta.get("completion_tokens") if isinstance(meta, dict) else None
-    if response.status != 200 or count != output:
-        raise RuntimeError(f"{name}: invalid response status={response.status}, tokens={count!r}")
+    started = record.pop("_started_perf_s")
+    elapsed = record["end_to_end_s"]
+    if record["output_tokens"] != output:
+        raise RuntimeError(
+            f"{name}: invalid response tokens={record['output_tokens']!r}"
+        )
     return {
         "name": name,
         "started_s": started,
-        "finished_s": finish,
-        "elapsed_s": finish - started,
+        "finished_s": started + elapsed,
+        "elapsed_s": elapsed,
+        "ttft_s": record["ttft_s"],
+        "tpot_s": record["tpot_s"],
         "prompt_tokens": prompt,
-        "output_tokens": count,
+        "output_tokens": record["output_tokens"],
+        "request_output_tokens_per_s": record[
+            "request_output_tokens_per_s"
+        ],
         "deadline_ms": deadline_ms,
     }
 
@@ -217,13 +211,18 @@ def main(argv: list[str] | None = None) -> int:
                 start_new_session=True,
             )
             wait_for_health(server)
-            with ThreadPoolExecutor(max_workers=3) as pool:
-                initial = pool.submit(generate, "initial", 256, 256, None)
-                time.sleep(0.1)
-                slow = pool.submit(generate, "slow", 4096, 64, None)
-                time.sleep(0.03)
-                urgent = pool.submit(generate, "urgent", 128, 8, 3000)
-                rows = [item.result() for item in (initial, slow, urgent)]
+            from benchmarks.client import MemorySampler, memory_summary
+
+            with MemorySampler() as sampler:
+                with ThreadPoolExecutor(max_workers=3) as pool:
+                    initial = pool.submit(generate, "initial", 256, 256, None)
+                    time.sleep(0.1)
+                    slow = pool.submit(generate, "slow", 4096, 64, None)
+                    time.sleep(0.03)
+                    urgent = pool.submit(generate, "urgent", 128, 8, 3000)
+                    rows = [item.result() for item in (initial, slow, urgent)]
+                sampler.take()
+            nvml = memory_summary(sampler.samples)
         deadline = time.monotonic() + 2
         while not stats_path.exists() and time.monotonic() < deadline:
             time.sleep(0.05)
@@ -238,6 +237,8 @@ def main(argv: list[str] | None = None) -> int:
             else None
         )
         by_name = {row["name"]: row for row in rows}
+        run_started = min(row["started_s"] for row in rows)
+        run_finished = max(row["finished_s"] for row in rows)
         checks = {"requests_completed": len(rows) == 3}
         if args.future_policy != "off":
             checks.update(
@@ -274,6 +275,19 @@ def main(argv: list[str] | None = None) -> int:
             "status": "passed" if all(checks.values()) else "failed",
             "checks": checks,
             "requests": rows,
+            "efficiency": {
+                "wall_s": run_finished - run_started,
+                "output_tokens_per_s": sum(
+                    row["output_tokens"] for row in rows
+                ) / (run_finished - run_started),
+                "ttft_s": {
+                    row["name"]: row["ttft_s"] for row in rows
+                },
+                "tpot_s": {
+                    row["name"]: row["tpot_s"] for row in rows
+                },
+            },
+            "whole_gpu_nvml": nvml,
             "future_stats": hook_stats,
             "elastic_mode": args.elastic_mode,
             "elastic_stats": elastic_stats,

@@ -313,7 +313,7 @@ class MemorySampler:
     def take(self):
         with self.lock:
             stats = None
-            if self.stats_path:
+            if self.stats_path and os.path.exists(self.stats_path):
                 with open(self.stats_path, encoding="utf-8") as source:
                     raw = json.load(source)
                 if not isinstance(raw, dict) or type(raw.get("backed_bytes")) is not int:
