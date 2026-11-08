@@ -643,6 +643,20 @@ def start_server(launch_spec, log_path):
         )
 
 
+def stop_servers(servers):
+    errors = []
+    for server in reversed(servers):
+        try:
+            run_case.stop_server(server)
+        except Exception as exc:
+            errors.append({
+                "pid": getattr(server, "pid", None),
+                "error_type": type(exc).__name__,
+                "message": safe_error_message(exc),
+            })
+    return errors
+
+
 def scenario_order(repeat):
     order = ("a-hot", "b-hot", "both-active")
     return order if repeat % 2 else ("b-hot", "a-hot", "both-active")
@@ -1177,8 +1191,16 @@ def main():
     finally:
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         try:
-            for server in reversed(servers):
-                run_case.stop_server(server)
+            cleanup_errors = stop_servers(servers)
+            if cleanup_errors:
+                results["status"] = "failed"
+                results["violations"].extend({
+                    "kind": "server_cleanup_failure", **error
+                } for error in cleanup_errors)
+                results["configuration"]["broker"]["sqlite_final"] = sqlite_state(
+                    broker_path
+                )
+                write_json(result_path, results)
         finally:
             signal.signal(signal.SIGTERM, previous_handler)
 

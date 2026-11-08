@@ -154,6 +154,9 @@ at the share boundary while preserving atomic mapping failure semantics.
   the logical phase-demand/broker-capacity ratio; chunk alignment and observed
   lease peaks remain authoritative. Per-instance arrival delays are applied
   after the common barrier and the measured dispatch skew is retained.
+- Server teardown is attempted for every process in reverse launch order; any
+  cleanup exception is appended to `violations` and changes the final status to
+  `failed` before the result is rewritten.
 - Still open before a GPU acceptance claim: multi-stage transition schedules, a
-  real-broker runner integration test, cleanup-failure persistence,
-  and the paired isolated/shared/observe/enforce GPU matrix itself.
+  real-broker runner integration test, and the paired
+  isolated/shared/observe/enforce GPU matrix itself.

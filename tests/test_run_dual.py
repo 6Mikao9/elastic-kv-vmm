@@ -22,6 +22,7 @@ from scripts.run_dual import (
     server_launch_spec,
     source_hashes,
     source_manifest,
+    stop_servers,
     summarize_phase,
     validate_broker_options,
     wait_for_broker_owners,
@@ -351,6 +352,23 @@ class DualBrokerRunnerTest(unittest.TestCase):
                 Path("broker.sqlite"), ("tenant-a", "tenant-b"), timeout=1
             )
         self.assertEqual(set(snapshot["owners"]), {"a", "b"})
+
+    def test_server_cleanup_is_reverse_order_and_error_is_retained(self):
+        calls = []
+
+        def fake_stop(server):
+            calls.append(server.pid)
+            if server.pid == 2:
+                raise RuntimeError("teardown failed")
+
+        servers = [
+            type("Server", (), {"pid": pid})() for pid in (1, 2, 3)
+        ]
+        with patch("scripts.run_dual.run_case.stop_server", side_effect=fake_stop):
+            errors = stop_servers(servers)
+        self.assertEqual(calls, [3, 2, 1])
+        self.assertEqual(errors[0]["pid"], 2)
+        self.assertEqual(errors[0]["error_type"], "RuntimeError")
 
     def test_dense_kv_geometry_uses_gqa_head_count(self):
         with tempfile.TemporaryDirectory() as directory:

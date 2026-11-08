@@ -100,6 +100,8 @@ bash scripts/container_dual.sh 0 /path/to/huggingface/hub v2 \
 计时相位之外还执行固定提示长度和输出长度的非流式正确性矩阵，完整 token IDs
 保存在 `correctness.json`，baseline 与 VMM arm 必须按相同的 prompt/output hash
 逐项一致。
+服务关闭按逆序逐个执行；任一 teardown 异常都会写入 `violations` 并把最终
+`status` 改为 `failed`，避免留下虚假的 complete 结果。
 
 ## 3. Arm 矩阵
 
