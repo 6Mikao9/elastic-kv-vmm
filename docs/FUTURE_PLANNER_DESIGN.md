@@ -381,6 +381,38 @@ python3 scripts/run_future_smoke.py \
 `planned_residence` 与 `actual_residence`，并要求各 TP rank 对实际模式一致。
 只有这一证据存在时，才能把“计划让哪些请求驻留”与端到端性能一起分析。
 
+### 4.2 已知请求类型画像
+
+同一模型下的 tool call、chat turn 和长 rollout 往往有不同的 prefill 吞吐、
+decode 吞吐、HiSparse 热集、prefill workspace 和自动驻留阈值。`PlannerConfig`
+因此允许通过已有 `kind` 字段配置可选覆盖；未配置的字段继承实例全局值：
+
+```json
+{
+  "kind_profiles": {
+    "tool": {
+      "prefill_tokens_per_ms": 12.0,
+      "resident_decode_tokens_per_ms": 24.0,
+      "sparse_decode_tokens_per_ms": 18.0,
+      "sparse_hot_tokens": 1024,
+      "prefill_workspace_bytes_per_token": 1536,
+      "auto_resident_output_threshold": 64
+    }
+  }
+}
+```
+
+离线规划器用同一画像计算准入、运行时间、workspace 峰值和 future contention；
+在线 `ElasticKVConfig` 从 `planner_config` 恢复这些覆盖，因此计划层与执行层不会
+各自解释一套预算。`plan_rollout()` 仍使用原有 `kind` transport 字段，并在
+`elastic.future` action version 3 中写入该请求、该最终驻留模式对应的
+`prefill_tokens_per_s` 与 `decode_tokens_per_s`。运行时优先级固定为：请求显式速率
+hint、请求类型画像、全局在线校准值或估计器默认值。
+
+该能力只改变预算估计和排序输入，不绕过 SGLang 原生 `PrefillAdder`、物理容量或
+请求级驻留 broker。真实收益仍需在相同权重、trace、TP 配置和独占 GPU 条件下，
+比较无画像、离线画像与在线校准画像。
+
 `run_hisparse_smoke.py` 也已接入同一个执行器。计划模式会自动读取
 `vmm_stats/tp-*.json`，并在 VMM 和请求驻留同时启用时要求完整的逐请求、逐 rank
 证据后方可完成：

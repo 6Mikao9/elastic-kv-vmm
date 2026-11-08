@@ -20,12 +20,15 @@ def submission(
     deadline_after_ms=None,
     prefix_group=None,
     shared_prefix_tokens=0,
+    kind="rollout",
+    prefill_tokens_per_s=None,
+    decode_tokens_per_s=None,
 ):
     hint = {
         "release_after_ms": 0,
         "expected_output_tokens": output,
         "weight": weight,
-        "kind": "rollout",
+        "kind": kind,
         "residence": residence,
     }
     if deadline_after_ms is not None:
@@ -33,12 +36,16 @@ def submission(
     if prefix_group is not None:
         hint["prefix_group"] = prefix_group
         hint["shared_prefix_tokens"] = shared_prefix_tokens
+    if prefill_tokens_per_s is not None:
+        hint["prefill_tokens_per_s"] = prefill_tokens_per_s
+    if decode_tokens_per_s is not None:
+        hint["decode_tokens_per_s"] = decode_tokens_per_s
     return RolloutSubmission(
         request_id=request_id,
         planned_arrival_ms=0,
         submit_at_ms=submit_at_ms,
         estimated_finish_ms=estimated_finish_ms,
-        kind="rollout",
+        kind=kind,
         prompt_tokens=prompt,
         output_tokens=output,
         hint=hint,
@@ -609,6 +616,130 @@ class ElasticAdmissionTest(unittest.TestCase):
                         sparse_hot_tokens=64,
                         prefill_workspace_bytes_per_token=value,
                     )
+
+    def test_kind_profile_changes_hot_set_workspace_and_auto_threshold(self):
+        config = ElasticKVConfig(
+            memory_budget_bytes=2_000,
+            kv_bytes_per_token=2,
+            sparse_hot_tokens=64,
+            auto_resident_output_tokens=128,
+            kind_profiles={
+                "tool": {
+                    "sparse_hot_tokens": 50,
+                    "prefill_workspace_bytes_per_token": 3,
+                    "auto_resident_output_threshold": 32,
+                }
+            },
+        )
+
+        decision = decide_elastic_admission(
+            submission(
+                "tool",
+                prompt=20,
+                output=40,
+                residence="auto",
+                kind="tool",
+            ),
+            active_bytes=0,
+            config=config,
+        )
+
+        self.assertEqual(config.sparse_hot_tokens_for("unknown"), 64)
+        self.assertEqual(decision.chosen_residence, "resident")
+        self.assertEqual(decision.reason, "auto-long")
+        self.assertEqual(decision.prefill_workspace_bytes, 60)
+
+        sparse = decide_elastic_admission(
+            submission(
+                "tool-sparse",
+                prompt=20,
+                output=60,
+                kind="tool",
+                residence="host_backed",
+            ),
+            active_bytes=0,
+            config=config,
+        )
+        self.assertEqual(sparse.sparse_bytes, 100)
+
+    def test_kind_profile_feeds_duration_after_hint_and_before_global_rate(self):
+        config = ElasticKVConfig(
+            memory_budget_bytes=10_000,
+            kv_bytes_per_token=2,
+            sparse_hot_tokens=64,
+            kind_profiles={
+                "tool": {
+                    "prefill_tokens_per_ms": 1,
+                    "resident_decode_tokens_per_ms": 2,
+                }
+            },
+        )
+        request = submission(
+            "tool", prompt=100, output=100, kind="tool", residence="resident"
+        )
+
+        profile_decision = decide_elastic_admission(
+            request,
+            active_bytes=0,
+            config=config,
+            prefill_tokens_per_s=100_000,
+            decode_tokens_per_s=100_000,
+        )
+        explicit = submission(
+            "explicit",
+            prompt=100,
+            output=100,
+            kind="tool",
+            residence="resident",
+            prefill_tokens_per_s=10_000,
+            decode_tokens_per_s=20_000,
+        )
+        hint_decision = decide_elastic_admission(
+            explicit, active_bytes=0, config=config
+        )
+
+        self.assertEqual(profile_decision.service_time_current_duration_ms, 150)
+        self.assertTrue(profile_decision.service_time_feedback_applied)
+        self.assertEqual(hint_decision.service_time_current_duration_ms, 15)
+
+    def test_kind_profiles_survive_live_planner_projection(self):
+        planner = PlannerConfig(
+            memory_budget_bytes=1_000,
+            kv_bytes_per_token=2,
+            prefill_workspace_bytes_per_token=0,
+            sparse_hot_tokens=64,
+            kind_profiles={
+                "tool": {
+                    "sparse_hot_tokens": 48,
+                    "prefill_workspace_bytes_per_token": 4,
+                    "prefill_tokens_per_ms": 3,
+                }
+            },
+        )
+
+        live = elastic_config_from_planner(planner)
+
+        self.assertEqual(live.kind_profiles, planner.kind_profiles)
+        self.assertEqual(live.sparse_hot_tokens_for("tool"), 48)
+        self.assertEqual(live.prefill_workspace_rate("tool"), 4)
+        self.assertEqual(live.prefill_rate_tokens_per_s("tool"), 3000)
+
+    def test_invalid_live_kind_profiles_are_rejected(self):
+        common = {
+            "memory_budget_bytes": 1_000,
+            "kv_bytes_per_token": 2,
+            "sparse_hot_tokens": 64,
+        }
+        invalid = (
+            ({"tool": {"sparse_hot_tokens": 0}}, "sparse_hot_tokens"),
+            ({"tool": {"sparse_decode_tokens_per_ms": -1}}, "positive"),
+            ((('tool', {}), ('tool', {})), "duplicate kind profile"),
+        )
+        for profiles, message in invalid:
+            with self.subTest(profiles=profiles), self.assertRaisesRegex(
+                ValueError, message
+            ):
+                ElasticKVConfig(**common, kind_profiles=profiles)
 
     def test_new_prefill_field_preserves_legacy_positional_argument_order(self):
         config = ElasticKVConfig(1_000, 2, 64, 128, 5, 3)

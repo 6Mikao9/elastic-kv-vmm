@@ -9,10 +9,15 @@ only new requests when active KV would cross the configured budget.
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Iterable
 
-from .future_plan import PlannerConfig, RolloutSubmission
+from .future_plan import (
+    KindServiceProfile,
+    PlannerConfig,
+    RolloutSubmission,
+    normalize_kind_profiles,
+)
 from .service_time import estimate_service_duration_ms
 from .sglang_future_hook import FutureHint
 
@@ -28,6 +33,10 @@ class ElasticKVConfig:
     lookahead_ms: int = 0
     max_future_reservations: int = 4
     prefill_workspace_bytes_per_token: int = 0
+    kind_profiles: (
+        tuple[tuple[str, KindServiceProfile], ...]
+        | Mapping[str, KindServiceProfile | Mapping[str, object]]
+    ) = ()
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -53,6 +62,44 @@ class ElasticKVConfig:
             raise ValueError(
                 "prefill_workspace_bytes_per_token must be a nonnegative integer"
             )
+        object.__setattr__(
+            self, "kind_profiles", normalize_kind_profiles(self.kind_profiles)
+        )
+
+    def profile_for(self, kind: str) -> KindServiceProfile:
+        for candidate, profile in self.kind_profiles:
+            if candidate == kind:
+                return profile
+        return KindServiceProfile()
+
+    def sparse_hot_tokens_for(self, kind: str) -> int:
+        override = self.profile_for(kind).sparse_hot_tokens
+        return self.sparse_hot_tokens if override is None else override
+
+    def prefill_workspace_rate(self, kind: str) -> int:
+        override = self.profile_for(kind).prefill_workspace_bytes_per_token
+        if override is None:
+            return self.prefill_workspace_bytes_per_token
+        return override
+
+    def auto_resident_threshold(self, kind: str) -> int:
+        override = self.profile_for(kind).auto_resident_output_threshold
+        return self.auto_resident_output_tokens if override is None else override
+
+    def prefill_rate_tokens_per_s(self, kind: str) -> float | None:
+        override = self.profile_for(kind).prefill_tokens_per_ms
+        return None if override is None else override * 1000.0
+
+    def decode_rate_tokens_per_s(
+        self, kind: str, residence: str
+    ) -> float | None:
+        profile = self.profile_for(kind)
+        override = (
+            profile.resident_decode_tokens_per_ms
+            if residence == "resident"
+            else profile.sparse_decode_tokens_per_ms
+        )
+        return None if override is None else override * 1000.0
 
     def hold_bytes(self, submission: RolloutSubmission, residence: str) -> int:
         """Return the predicted per-rank KV bytes for one placement."""
@@ -61,12 +108,15 @@ class ElasticKVConfig:
         held_tokens = (
             sequence_tokens
             if residence == "resident"
-            else min(sequence_tokens, self.sparse_hot_tokens)
+            else min(sequence_tokens, self.sparse_hot_tokens_for(submission.kind))
         )
         return held_tokens * self.kv_bytes_per_token
 
     def prefill_workspace_bytes(self, submission: RolloutSubmission) -> int:
-        return submission.prompt_tokens * self.prefill_workspace_bytes_per_token
+        return (
+            submission.prompt_tokens
+            * self.prefill_workspace_rate(submission.kind)
+        )
 
 
 def elastic_config_from_planner(config: PlannerConfig) -> ElasticKVConfig:
@@ -79,6 +129,7 @@ def elastic_config_from_planner(config: PlannerConfig) -> ElasticKVConfig:
         prefill_workspace_bytes_per_token=config.prefill_workspace_bytes_per_token,
         auto_resident_output_tokens=config.auto_resident_output_threshold,
         lookahead_ms=config.lookahead_ms,
+        kind_profiles=config.kind_profiles,
     )
 
 
@@ -149,10 +200,12 @@ def _preferred_residence(
     sequence_tokens = submission.prompt_tokens + submission.output_tokens
     if hint.residence == "host_backed":
         return "host_backed", "planned-host-backed"
-    if sequence_tokens <= config.sparse_hot_tokens:
+    if sequence_tokens <= config.sparse_hot_tokens_for(submission.kind):
         return "host_backed", "fits-native-hot-set"
     if hint.residence == "auto":
-        if submission.output_tokens >= config.auto_resident_output_tokens:
+        if submission.output_tokens >= config.auto_resident_threshold(
+            submission.kind
+        ):
             return "resident", "auto-long"
         return "host_backed", "auto-short"
     return "resident", "planned-resident"
@@ -165,6 +218,8 @@ def _predicted_duration_ms(
     fallback_ms: float,
     prefill_tokens_per_s: float | None,
     decode_tokens_per_s: float | None,
+    config: ElasticKVConfig,
+    residence: str,
 ) -> float:
     return estimate_service_duration_ms(
         prompt_tokens=submission.prompt_tokens,
@@ -173,12 +228,20 @@ def _predicted_duration_ms(
         prefill_tokens_per_s=(
             hint.prefill_tokens_per_s
             if hint.prefill_tokens_per_s is not None
-            else prefill_tokens_per_s
+            else (
+                config.prefill_rate_tokens_per_s(submission.kind)
+                or prefill_tokens_per_s
+            )
         ),
         decode_tokens_per_s=(
             hint.decode_tokens_per_s
             if hint.decode_tokens_per_s is not None
-            else decode_tokens_per_s
+            else (
+                config.decode_rate_tokens_per_s(
+                    submission.kind, residence
+                )
+                or decode_tokens_per_s
+            )
         ),
     )
 
@@ -234,6 +297,7 @@ def _future_reservation(
         has_higher_weight = future_hint.weight > current_hint.weight
         if not has_deadline and not has_higher_weight:
             continue
+        placement, _ = _preferred_residence(future, config)
         predicted_duration_ms = _predicted_duration_ms(
             future,
             future_hint,
@@ -242,12 +306,22 @@ def _future_reservation(
             ),
             prefill_tokens_per_s=prefill_tokens_per_s,
             decode_tokens_per_s=decode_tokens_per_s,
+            config=config,
+            residence=placement,
+        )
+        profile = config.profile_for(future.kind)
+        profile_residence_rate = (
+            profile.resident_decode_tokens_per_ms
+            if placement == "resident"
+            else profile.sparse_decode_tokens_per_ms
         )
         if (
             future_hint.prefill_tokens_per_s is not None
             or future_hint.decode_tokens_per_s is not None
             or prefill_tokens_per_s is not None
             or decode_tokens_per_s is not None
+            or profile.prefill_tokens_per_ms is not None
+            or profile_residence_rate is not None
         ):
             calibrated_future_requests += 1
         deadline_needs_protection = has_deadline
@@ -264,7 +338,6 @@ def _future_reservation(
             # that is already infeasible even when started immediately, should
             # not demote unrelated work. The weight signal remains independent.
             continue
-        placement, _ = _preferred_residence(future, config)
         start_ms = max(now_ms, future.submit_at_ms)
         # A queued request may have crossed its original estimated finish
         # before it was admitted. Preserve its predicted remaining service time
@@ -380,12 +453,22 @@ def decide_elastic_admission(
         fallback_ms=static_duration_ms,
         prefill_tokens_per_s=prefill_tokens_per_s,
         decode_tokens_per_s=decode_tokens_per_s,
+        config=config,
+        residence=chosen,
+    )
+    profile = config.profile_for(submission.kind)
+    profile_residence_rate = (
+        profile.resident_decode_tokens_per_ms
+        if chosen == "resident"
+        else profile.sparse_decode_tokens_per_ms
     )
     feedback_applied = bool(
         hint.prefill_tokens_per_s is not None
         or hint.decode_tokens_per_s is not None
         or prefill_tokens_per_s is not None
         or decode_tokens_per_s is not None
+        or profile.prefill_tokens_per_ms is not None
+        or profile_residence_rate is not None
     )
     (
         future_kv_bytes,

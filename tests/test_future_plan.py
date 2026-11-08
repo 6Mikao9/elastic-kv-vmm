@@ -6,6 +6,7 @@ import unittest
 from dataclasses import replace
 
 from adaptive_sparse.future_plan import (
+    KindServiceProfile,
     PlanResult,
     PlannerConfig,
     RequestProfile,
@@ -487,6 +488,90 @@ class FuturePlanTest(unittest.TestCase):
                 prefill_workspace_bytes_per_token=0,
                 lookahead_ms=True,
             )
+
+    def test_kind_profiles_drive_resources_timing_and_round_trip(self):
+        config = replace(
+            self.config,
+            kind_profiles={
+                "tool": {
+                    "prefill_tokens_per_ms": 4,
+                    "sparse_decode_tokens_per_ms": 4,
+                    "sparse_hot_tokens": 100,
+                    "prefill_workspace_bytes_per_token": 3,
+                    "auto_resident_output_threshold": 64,
+                }
+            },
+        )
+        restored = PlannerConfig(**config.as_dict())
+        request = RequestProfile(
+            "tool-request",
+            arrival_ms=0,
+            prompt_tokens=100,
+            output_tokens=100,
+            kind="tool",
+            residence_hint="host_backed",
+        )
+
+        result = simulate((request,), restored, "fifo")
+        admission = result.admissions[0]
+
+        self.assertEqual(restored.kind_profiles, config.kind_profiles)
+        self.assertEqual(restored.prefill_rate("tool"), 4)
+        self.assertEqual(
+            restored.decode_rate("tool", ResidencyMode.HI_SPARSE), 4
+        )
+        self.assertEqual(restored.sparse_hot_tokens_for("tool"), 100)
+        self.assertEqual(restored.prefill_workspace_rate("tool"), 3)
+        self.assertEqual(restored.auto_resident_threshold("tool"), 64)
+        self.assertEqual(restored.profile_for("unknown"), KindServiceProfile())
+        self.assertEqual(admission.mode, ResidencyMode.HI_SPARSE)
+        self.assertEqual(admission.resident_kv_bytes, 100_000)
+        self.assertEqual(admission.prefill_workspace_bytes, 300)
+        self.assertEqual(admission.finish_ms - admission.start_ms, 50)
+
+    def test_rollout_hint_uses_selected_kind_and_residency_rates(self):
+        config = replace(
+            self.config,
+            kind_profiles={
+                "tool": {
+                    "prefill_tokens_per_ms": 4,
+                    "sparse_decode_tokens_per_ms": 3,
+                }
+            },
+        )
+        request = RequestProfile(
+            "tool-request",
+            arrival_ms=0,
+            prompt_tokens=10,
+            output_tokens=200,
+            kind="tool",
+            residence_hint="host_backed",
+        )
+
+        hint = plan_rollout((request,), config, "fifo").submissions[0].hint
+
+        self.assertEqual(hint["residence"], "host_backed")
+        self.assertEqual(hint["prefill_tokens_per_s"], 4000)
+        self.assertEqual(hint["decode_tokens_per_s"], 3000)
+
+    def test_invalid_kind_profiles_are_rejected(self):
+        common = {
+            "memory_budget_bytes": 1,
+            "kv_bytes_per_token": 1,
+            "prefill_workspace_bytes_per_token": 0,
+        }
+        invalid = (
+            ({"tool": {"sparse_hot_tokens": 0}}, "sparse_hot_tokens"),
+            ({"tool": {"prefill_tokens_per_ms": math.inf}}, "finite positive"),
+            ({"": {}}, "short non-empty"),
+            ((('tool', {}), ('tool', {})), "duplicate kind profile"),
+            ((('tool', 1),), "must be an object"),
+        )
+        for profiles, message in invalid:
+            with self.subTest(profiles=profiles), self.assertRaisesRegex(
+                ValueError, message
+            ):
+                PlannerConfig(**common, kind_profiles=profiles)
 
     def test_rollout_plan_emits_controlled_submissions_and_runtime_hints(self):
         plan = plan_rollout(self.workload, self.config, "future")

@@ -14,12 +14,12 @@ boundary and must validate the resulting reservation against physical backing.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
 import json
 import math
 from pathlib import Path
-from typing import Iterable, Mapping, Sequence
 
 from .future_residency import RESIDENCE_HINTS
 
@@ -120,6 +120,108 @@ class RequestProfile:
 
 
 @dataclass(frozen=True, slots=True)
+class KindServiceProfile:
+    """Optional resource and speed overrides for one known request kind.
+
+    Missing values inherit :class:`PlannerConfig`.  A controlled rollout may
+    know that a tool call, chat turn and long generation have different prefill,
+    decode, hot-set and workspace costs even when they use the same model.
+    Keeping the overrides keyed by the existing ``kind`` hint avoids growing the
+    request transport with deployment-specific schema fields.
+    """
+
+    prefill_tokens_per_ms: float | None = None
+    resident_decode_tokens_per_ms: float | None = None
+    sparse_decode_tokens_per_ms: float | None = None
+    sparse_hot_tokens: int | None = None
+    prefill_workspace_bytes_per_token: int | None = None
+    auto_resident_output_threshold: int | None = None
+
+    def __post_init__(self) -> None:
+        for name in (
+            "prefill_tokens_per_ms",
+            "resident_decode_tokens_per_ms",
+            "sparse_decode_tokens_per_ms",
+        ):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise ValueError(f"{name} must be a finite positive number or None")
+        for name, minimum in (
+            ("sparse_hot_tokens", 1),
+            ("prefill_workspace_bytes_per_token", 0),
+            ("auto_resident_output_threshold", 1),
+        ):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            _bounded_int(value, name, minimum=minimum)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            key: value
+            for key, value in (
+                ("prefill_tokens_per_ms", self.prefill_tokens_per_ms),
+                (
+                    "resident_decode_tokens_per_ms",
+                    self.resident_decode_tokens_per_ms,
+                ),
+                (
+                    "sparse_decode_tokens_per_ms",
+                    self.sparse_decode_tokens_per_ms,
+                ),
+                ("sparse_hot_tokens", self.sparse_hot_tokens),
+                (
+                    "prefill_workspace_bytes_per_token",
+                    self.prefill_workspace_bytes_per_token,
+                ),
+                (
+                    "auto_resident_output_threshold",
+                    self.auto_resident_output_threshold,
+                ),
+            )
+            if value is not None
+        }
+
+
+def normalize_kind_profiles(
+    value: object,
+) -> tuple[tuple[str, KindServiceProfile], ...]:
+    """Validate and canonicalize JSON or Python request-kind profiles."""
+
+    raw_profiles: Iterable[tuple[str, object]]
+    if isinstance(value, Mapping):
+        raw_profiles = value.items()
+    elif isinstance(value, (tuple, list)):
+        raw_profiles = value
+    else:
+        raise ValueError("kind_profiles must be a mapping or pair sequence")
+    profiles: dict[str, KindServiceProfile] = {}
+    for item in raw_profiles:
+        if not isinstance(item, (tuple, list)) or len(item) != 2:
+            raise ValueError("kind_profiles entries must be key/profile pairs")
+        kind, raw_profile = item
+        if not isinstance(kind, str) or not kind or len(kind) > 64:
+            raise ValueError("kind_profiles keys must be short non-empty strings")
+        if kind in profiles:
+            raise ValueError(f"duplicate kind profile: {kind!r}")
+        if isinstance(raw_profile, KindServiceProfile):
+            profile = raw_profile
+        elif isinstance(raw_profile, Mapping):
+            profile = KindServiceProfile(**dict(raw_profile))
+        else:
+            raise ValueError(f"kind profile for {kind!r} must be an object")
+        profiles[kind] = profile
+    return tuple(sorted(profiles.items()))
+
+
+@dataclass(frozen=True, slots=True)
 class PlannerConfig:
     """Conservative per-instance resource model.
 
@@ -140,6 +242,10 @@ class PlannerConfig:
     lookahead_ms: int = 0
     auto_resident_output_threshold: int = 1
     oracle_max_expansions: int = 100_000
+    kind_profiles: (
+        tuple[tuple[str, KindServiceProfile], ...]
+        | Mapping[str, KindServiceProfile | Mapping[str, object]]
+    ) = ()
 
     def __post_init__(self) -> None:
         positive_ints = {
@@ -173,6 +279,45 @@ class PlannerConfig:
             "lookahead_ms",
             maximum=RUNTIME_HINT_MAX_MS,
         )
+        object.__setattr__(
+            self, "kind_profiles", normalize_kind_profiles(self.kind_profiles)
+        )
+
+    def profile_for(self, kind: str) -> KindServiceProfile:
+        """Return explicit kind overrides, or an all-inherited profile."""
+
+        for candidate, profile in self.kind_profiles:
+            if candidate == kind:
+                return profile
+        return KindServiceProfile()
+
+    def prefill_rate(self, kind: str) -> float:
+        override = self.profile_for(kind).prefill_tokens_per_ms
+        return self.prefill_tokens_per_ms if override is None else override
+
+    def decode_rate(self, kind: str, mode: ResidencyMode) -> float:
+        profile = self.profile_for(kind)
+        if mode is ResidencyMode.RESIDENT:
+            override = profile.resident_decode_tokens_per_ms
+            return self.resident_decode_tokens_per_ms if override is None else override
+        override = profile.sparse_decode_tokens_per_ms
+        return self.sparse_decode_tokens_per_ms if override is None else override
+
+    def sparse_hot_tokens_for(self, kind: str) -> int:
+        override = self.profile_for(kind).sparse_hot_tokens
+        return self.sparse_hot_tokens if override is None else override
+
+    def prefill_workspace_rate(self, kind: str) -> int:
+        override = self.profile_for(kind).prefill_workspace_bytes_per_token
+        if override is None:
+            return self.prefill_workspace_bytes_per_token
+        return override
+
+    def auto_resident_threshold(self, kind: str) -> int:
+        override = self.profile_for(kind).auto_resident_output_threshold
+        if override is None:
+            return self.auto_resident_output_threshold
+        return override
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -187,6 +332,10 @@ class PlannerConfig:
             "lookahead_ms": self.lookahead_ms,
             "auto_resident_output_threshold": self.auto_resident_output_threshold,
             "oracle_max_expansions": self.oracle_max_expansions,
+            "kind_profiles": {
+                kind: profile.as_dict()
+                for kind, profile in self.kind_profiles
+            },
         }
 
 
@@ -355,7 +504,7 @@ def _ceil_duration(tokens: int, rate: float) -> int:
 def _hold_bytes(request: RequestProfile, mode: ResidencyMode, config: PlannerConfig) -> int:
     tokens = request.sequence_tokens
     if mode is ResidencyMode.HI_SPARSE:
-        tokens = min(tokens, config.sparse_hot_tokens)
+        tokens = min(tokens, config.sparse_hot_tokens_for(request.kind))
     return tokens * config.kv_bytes_per_token
 
 
@@ -402,13 +551,13 @@ def _active_placements(
 
 
 def _duration_ms(request: RequestProfile, mode: ResidencyMode, config: PlannerConfig) -> int:
-    prefill = _ceil_duration(request.prompt_tokens, config.prefill_tokens_per_ms)
-    decode_rate = (
-        config.resident_decode_tokens_per_ms
-        if mode is ResidencyMode.RESIDENT
-        else config.sparse_decode_tokens_per_ms
+    prefill = _ceil_duration(
+        request.prompt_tokens, config.prefill_rate(request.kind)
     )
-    return prefill + _ceil_duration(request.output_tokens, decode_rate)
+    decode = _ceil_duration(
+        request.output_tokens, config.decode_rate(request.kind, mode)
+    )
+    return prefill + decode
 
 
 def _urgency(request: RequestProfile, now_ms: int, config: PlannerConfig) -> float:
@@ -454,7 +603,10 @@ def _future_contention(
         if not valuable:
             continue
         required = _hold_bytes(item, ResidencyMode.HI_SPARSE, config)
-        required += item.prompt_tokens * config.prefill_workspace_bytes_per_token
+        required += (
+            item.prompt_tokens
+            * config.prefill_workspace_rate(item.kind)
+        )
         future_need += required
         if spend + future_need > config.memory_budget_bytes:
             displaced += 1
@@ -471,10 +623,12 @@ def _feasible_mode(
 ) -> tuple[ResidencyMode, str] | None:
     if len(active) + len(extra_placements) > config.max_active_requests:
         return None
-    workspace = request.prompt_tokens * config.prefill_workspace_bytes_per_token
+    workspace = request.prompt_tokens * config.prefill_workspace_rate(
+        request.kind
+    )
     native_hold = _hold_bytes(request, ResidencyMode.HI_SPARSE, config)
     placements = (*_active_placements(active), *extra_placements)
-    if request.sequence_tokens <= config.sparse_hot_tokens:
+    if request.sequence_tokens <= config.sparse_hot_tokens_for(request.kind):
         active_bytes, _ = _placement_memory(placements, config)
         if active_bytes + workspace + native_hold <= config.memory_budget_bytes:
             return ResidencyMode.HI_SPARSE, "fits-native-hot-set"
@@ -483,7 +637,7 @@ def _feasible_mode(
         order = (ResidencyMode.RESIDENT, ResidencyMode.HI_SPARSE)
     elif request.residence_hint == "host_backed":
         order = (ResidencyMode.HI_SPARSE,)
-    elif request.output_tokens < config.auto_resident_output_threshold:
+    elif request.output_tokens < config.auto_resident_threshold(request.kind):
         order = (ResidencyMode.HI_SPARSE,)
     else:
         order = (preferred, ResidencyMode.HI_SPARSE if preferred is ResidencyMode.RESIDENT else ResidencyMode.RESIDENT)
@@ -500,7 +654,7 @@ def _feasible_mode(
                 )
             elif request.residence_hint == "host_backed":
                 reason = "hint-requires-bounded-hot-set"
-            elif request.output_tokens < config.auto_resident_output_threshold:
+            elif request.output_tokens < config.auto_resident_threshold(request.kind):
                 reason = "hint-short-auto"
             else:
                 reason = "fits-resident" if mode is ResidencyMode.RESIDENT else "fits-bounded-hot-set"
@@ -525,7 +679,9 @@ def _defer_for_imminent_work(
     choice can tolerate being placed behind that work.
     """
 
-    current_prefill = _ceil_duration(choice.prompt_tokens, config.prefill_tokens_per_ms)
+    current_prefill = _ceil_duration(
+        choice.prompt_tokens, config.prefill_rate(choice.kind)
+    )
     choice_duration = _duration_ms(choice, mode, config)
     for item in future:
         if item.arrival_ms > now_ms + config.lookahead_ms:
@@ -537,7 +693,9 @@ def _defer_for_imminent_work(
             continue
         future_mode = standalone[0]
         future_duration = _duration_ms(item, future_mode, config)
-        future_prefill = _ceil_duration(item.prompt_tokens, config.prefill_tokens_per_ms)
+        future_prefill = _ceil_duration(
+            item.prompt_tokens, config.prefill_rate(item.kind)
+        )
         blocked_start = max(item.arrival_ms, now_ms + current_prefill)
         delayed_finish = blocked_start + future_duration
 
@@ -634,7 +792,9 @@ def _select(
         if first is None:
             continue
         modes: list[tuple[ResidencyMode, str]] = [first]
-        workspace = choice.prompt_tokens * config.prefill_workspace_bytes_per_token
+        workspace = choice.prompt_tokens * config.prefill_workspace_rate(
+            choice.kind
+        )
         sparse_memory, _ = _placement_memory(
             (
                 *_active_placements(active),
@@ -643,7 +803,8 @@ def _select(
             config,
         )
         if (choice.residence_hint == "auto"
-                and choice.output_tokens >= config.auto_resident_output_threshold
+                and choice.output_tokens
+                >= config.auto_resident_threshold(choice.kind)
                 and first[0] is ResidencyMode.RESIDENT
                 and sparse_memory + workspace <= config.memory_budget_bytes):
             modes.append((ResidencyMode.HI_SPARSE, "lookahead-protects-imminent-demand"))
@@ -657,7 +818,10 @@ def _select(
             # decode slowdown remains an explicit cost in the simulator.
             score = 100.0 * choice.priority + 60.0 * urgency - 20.0 * displaced
             if mode is ResidencyMode.HI_SPARSE:
-                slowdown = config.resident_decode_tokens_per_ms / config.sparse_decode_tokens_per_ms
+                slowdown = (
+                    config.decode_rate(choice.kind, ResidencyMode.RESIDENT)
+                    / config.decode_rate(choice.kind, ResidencyMode.HI_SPARSE)
+                )
                 score -= 25.0 * max(0.0, slowdown - 1.0)
             # Prefer waiting when even a bounded placement would displace a
             # sufficiently more valuable request that is about to arrive.
@@ -730,8 +894,12 @@ def _oracle_admission_child(
 ) -> _OracleState:
     active = _normalize_active(state.active, state.now_ms)
     hold = _hold_bytes(request, mode, config)
-    workspace = request.prompt_tokens * config.prefill_workspace_bytes_per_token
-    prefill = _ceil_duration(request.prompt_tokens, config.prefill_tokens_per_ms)
+    workspace = request.prompt_tokens * config.prefill_workspace_rate(
+        request.kind
+    )
+    prefill = _ceil_duration(
+        request.prompt_tokens, config.prefill_rate(request.kind)
+    )
     aggregate, shared_credit = _placement_memory(
         (
             *_active_placements(active),
@@ -1077,10 +1245,14 @@ def _simulate_greedy(
         selected = _select(policy, unstarted, active, now_ms, config)
         if selected is not None:
             request, mode, reason = selected
-            workspace = request.prompt_tokens * config.prefill_workspace_bytes_per_token
+            workspace = request.prompt_tokens * config.prefill_workspace_rate(
+                request.kind
+            )
             hold = _hold_bytes(request, mode, config)
             duration = _duration_ms(request, mode, config)
-            prefill = _ceil_duration(request.prompt_tokens, config.prefill_tokens_per_ms)
+            prefill = _ceil_duration(
+                request.prompt_tokens, config.prefill_rate(request.kind)
+            )
             admission = Admission(
                 request_id=request.request_id,
                 arrival_ms=request.arrival_ms,
@@ -1171,6 +1343,12 @@ def plan_rollout(
                 "resident"
                 if admission.mode is ResidencyMode.RESIDENT
                 else "host_backed"
+            ),
+            "prefill_tokens_per_s": (
+                config.prefill_rate(request.kind) * 1000.0
+            ),
+            "decode_tokens_per_s": (
+                config.decode_rate(request.kind, admission.mode) * 1000.0
             ),
         }
         if request.deadline_ms is not None:
