@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import os
 import sys
 import unittest
 from unittest.mock import patch
@@ -109,6 +110,18 @@ class SGLangFutureHookTest(unittest.TestCase):
         )
         self.assertEqual([item.request_id for item in ordered], ["old", "new"])
 
+    def test_deadline_accepts_compatibility_receive_time(self):
+        first = request("first", 100, 1.0, {"deadline_after_ms": 1000})
+        second = request("second", 100, 1.0, {"deadline_after_ms": 1000})
+        first.time_stats = None
+        second.time_stats = None
+        first._ekv_scheduler_recv_time = 1.0
+        second._ekv_scheduler_recv_time = 0.9
+        ordered = order_requests(
+            [first, second], now_s=1.1, prefill_tokens_per_s=1000, decode_tokens_per_s=1000
+        )
+        self.assertEqual([item.request_id for item in ordered], ["second", "first"])
+
     def test_native_priority_tier_is_never_crossed(self):
         high = request("high", 100, 1.0, {"deadline_after_ms": 5000})
         low = request("low", 10, 1.0, {"deadline_after_ms": 0})
@@ -116,6 +129,25 @@ class SGLangFutureHookTest(unittest.TestCase):
         low.priority = 0
         ordered = order_requests([high, low], now_s=1.1, priority_sign=-1)
         self.assertEqual([item.request_id for item in ordered], ["high", "low"])
+
+    def test_native_priority_tier_reorders_inside_equal_priority(self):
+        slow = request("slow", 1000, 1.0, {"expected_output_tokens": 7000})
+        urgent = request(
+            "urgent",
+            100,
+            1.0,
+            {"expected_output_tokens": 400, "deadline_after_ms": 500},
+        )
+        slow.priority = 4
+        urgent.priority = 4
+        ordered = order_requests(
+            [slow, urgent],
+            now_s=1.01,
+            prefill_tokens_per_s=1000,
+            decode_tokens_per_s=2000,
+            priority_sign=-1,
+        )
+        self.assertEqual([item.request_id for item in ordered], ["urgent", "slow"])
 
     def test_off_policy_does_not_import_sglang(self):
         with patch.dict("os.environ", {"EKV_FUTURE_POLICY": "off"}), patch.dict(
@@ -139,7 +171,6 @@ class SGLangFutureHookTest(unittest.TestCase):
             "sglang": SimpleNamespace(__path__=[]),
             "sglang.srt": SimpleNamespace(__path__=[]),
             "sglang.srt.managers": SimpleNamespace(__path__=[]),
-            "sglang.srt.managers.kv_hints": SimpleNamespace(),
             "sglang.srt.managers.schedule_policy": SimpleNamespace(
                 SchedulePolicy=SchedulePolicy
             ),
@@ -151,9 +182,9 @@ class SGLangFutureHookTest(unittest.TestCase):
             1.0,
             {"expected_output_tokens": 400, "deadline_after_ms": 500},
         )
-        with patch.dict(sys.modules, modules), patch.dict(
-            "os.environ", {"EKV_FUTURE_POLICY": "deadline"}
-        ):
+        with patch.dict(sys.modules, modules), patch(
+            "adaptive_sparse.kv_hints_compat.install"
+        ), patch.dict("os.environ", {"EKV_FUTURE_POLICY": "deadline"}):
             hook._installed = False
             hook.install()
             queue = [short, long]
@@ -161,6 +192,30 @@ class SGLangFutureHookTest(unittest.TestCase):
         hook._installed = False
         self.assertEqual(calls, ["native"])
         self.assertEqual([item.request_id for item in queue], ["short", "long"])
+
+    def test_installer_preserves_native_kv_hints_transport(self):
+        class SchedulePolicy:
+            def calc_priority(self, waiting_queue, *args, **kwargs):
+                return None
+
+        modules = {
+            "sglang": SimpleNamespace(__path__=[]),
+            "sglang.srt": SimpleNamespace(__path__=[]),
+            "sglang.srt.managers": SimpleNamespace(__path__=[]),
+            "sglang.srt.managers.kv_hints": SimpleNamespace(),
+            "sglang.srt.managers.schedule_policy": SimpleNamespace(
+                SchedulePolicy=SchedulePolicy
+            ),
+        }
+        with patch.dict(sys.modules, modules), patch(
+            "adaptive_sparse.kv_hints_compat.install"
+        ) as compat_install, patch.dict(
+            "os.environ", {"EKV_FUTURE_POLICY": "deadline"}
+        ):
+            hook._installed = False
+            hook.install()
+        hook._installed = False
+        compat_install.assert_not_called()
 
     def test_stats_are_published_atomically(self):
         import tempfile
@@ -172,7 +227,7 @@ class SGLangFutureHookTest(unittest.TestCase):
             with patch.dict("os.environ", {"EKV_FUTURE_STATS_PATH": str(path)}):
                 hook._publish_stats(force=True, now_s=10.0)
             self.assertEqual(json.loads(path.read_text()), snapshot_stats())
-            self.assertFalse(path.with_suffix(".json.tmp").exists())
+            self.assertFalse(path.with_name(f"{path.name}.{os.getpid()}.tmp").exists())
 
 
 if __name__ == "__main__":

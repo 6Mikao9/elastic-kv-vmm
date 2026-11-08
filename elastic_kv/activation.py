@@ -101,7 +101,10 @@ def install_activation_hooks():
         return
     _POLICY, _HEADROOM, _CUDA = policy, headroom << 20, cuda
     original_prepare = ScheduleBatch.prepare_for_extend
-    original_forward = ModelRunner.forward_extend
+    forward_name = (
+        "forward_extend" if hasattr(ModelRunner, "forward_extend") else "forward"
+    )
+    original_forward = getattr(ModelRunner, forward_name)
 
     @wraps(original_prepare)
     def prepare(self, *args, **kwargs):
@@ -141,5 +144,5 @@ def install_activation_hooks():
         return result
 
     ScheduleBatch.prepare_for_extend = prepare
-    ModelRunner.forward_extend = forward
+    setattr(ModelRunner, forward_name, forward)
     ModelRunner._ekv_activation_hooks = True

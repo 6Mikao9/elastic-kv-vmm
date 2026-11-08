@@ -5,10 +5,10 @@ experimental memory policy before importing SGLang or touching CUDA, then
 installs the pinned SGLang 0.5.2 adapter and passes all remaining arguments to
 SGLang unchanged.
 
-`--elastic-mode baseline` deliberately skips the pinned VMM monkeypatch. This
-keeps a native baseline available and allows the separate future-ordering hook
-to run on newer SGLang revisions that expose `kv_hints`. Non-baseline modes
-still require the pinned 0.5.2 dense-MHA adapter.
+`--elastic-mode baseline` deliberately skips the VMM monkeypatch. This keeps a
+native baseline available. The separate future-ordering hook uses native
+`kv_hints` when present and installs the guarded 0.5.2 transport compatibility
+otherwise, so it can be combined with the dense-MHA VMM modes.
 
 ```bash
 python -m elastic_kv --elastic-dry-run \
@@ -40,7 +40,7 @@ SGLang or touch CUDA.
 | `--elastic-retain-chunks` | `1` | at least the sink chunk |
 | `--elastic-activation-policy` | `off` | requires `v5` unless `off` |
 | `--elastic-prefill-headroom-mib` | `0` | nonnegative integer |
-| `--elastic-future-policy` | `off` | `deadline` only on SGLang revisions with `kv_hints` |
+| `--elastic-future-policy` | `off` | `deadline`; native `kv_hints` or the built-in 0.5.2 compatibility path |
 | `--elastic-stats-path` | unset | atomic JSON telemetry destination |
 
 The CLI currently launches the guarded dense-MHA scope documented in

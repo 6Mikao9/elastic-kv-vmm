@@ -88,6 +88,29 @@ def specifications(workload, repeat, warmup=False):
     ]
 
 
+def future_hint(request_id, output_tokens):
+    """Return the versioned future metadata consumed by ElasticKV scheduling."""
+    return {
+        "protocol_version": "1",
+        "message_id": request_id,
+        "actions": [
+            {
+                "action_id": f"{request_id}:future",
+                "action_type": "elastic.future",
+                "action_version": "1",
+                "payload": {
+                    "release_after_ms": 0,
+                    "deadline_after_ms": None,
+                    "expected_output_tokens": output_tokens,
+                    "residence": "auto",
+                    "weight": 1.0,
+                    "kind": "rollout",
+                },
+            }
+        ],
+    }
+
+
 def payload_for(spec, stream):
     body = {
         "input_ids": prompt_ids(spec["request_id"], spec["input_tokens"]),
@@ -97,6 +120,8 @@ def payload_for(spec, stream):
         },
         "stream": stream, "return_logprob": not stream,
     }
+    if spec.get("future_hint") is not None:
+        body["kv_hints"] = spec["future_hint"]
     if not stream:
         body.update(logprob_start_len=-1, top_logprobs_num=0,
                     return_text_in_logprobs=False)

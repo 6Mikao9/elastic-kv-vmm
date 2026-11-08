@@ -1,10 +1,9 @@
 """Opt-in SGLang ordering hook for controlled, known-future rollouts.
 
-This targets the newer SGLang ``kv_hints`` request envelope.  It only reorders
-the waiting queue after SGLang's native policy has run; ``PrefillAdder`` and all
-native memory, grammar, LoRA, and request-slot checks remain authoritative.
-The hook is disabled by default and is not part of the pinned SGLang 0.5.2
-dense adapter path.
+This uses SGLang's native ``kv_hints`` envelope when available and a narrow
+transport shim on 0.5.2. It only reorders the waiting queue after SGLang's
+native policy has run; ``PrefillAdder`` and all native memory, grammar, LoRA,
+and request-slot checks remain authoritative. The hook is disabled by default.
 """
 
 from __future__ import annotations
@@ -117,6 +116,8 @@ def _request_age_ms(request: Any, now_s: float) -> float:
     received = getattr(stats, "scheduler_recv_time", None)
     if received in (None, 0.0):
         received = getattr(stats, "wait_queue_entry_time", None)
+    if received in (None, 0.0):
+        received = getattr(request, "_ekv_scheduler_recv_time", None)
     if not isinstance(received, (int, float)) or not math.isfinite(received) or received <= 0:
         raise ValueError("request scheduler receive time is unavailable")
     return max(0.0, (now_s - float(received)) * 1000.0)
@@ -212,7 +213,7 @@ def order_requests(
         if all(item[0] for item in group):
             continue
         group.sort(key=lambda item: item[:-1])
-    result = [item[-1] for item in decorated]
+    result = [item[-1] for group in groups for item in group]
     if result != queue:
         _stats["reordered_ticks"] += 1
     return result
@@ -274,7 +275,10 @@ def _publish_stats(*, force: bool = False, now_s: float | None = None) -> None:
     try:
         target = Path(path).expanduser()
         target.parent.mkdir(parents=True, exist_ok=True)
-        temp = target.with_suffix(target.suffix + ".tmp")
+        # Scheduler workers publish the same aggregate telemetry path. A
+        # process-unique temporary file prevents one rank from replacing or
+        # deleting another rank's in-flight snapshot before os.replace().
+        temp = target.with_name(f"{target.name}.{os.getpid()}.tmp")
         import json
 
         temp.write_text(json.dumps(snapshot_stats(), sort_keys=True), encoding="utf-8")
@@ -295,12 +299,21 @@ def install() -> None:
     if policy == "off":
         return
     try:
-        import sglang.srt.managers.kv_hints  # noqa: F401
-        from sglang.srt.managers.schedule_policy import SchedulePolicy
-    except ImportError as exc:
-        raise RuntimeError(
-            "future scheduling requires an SGLang revision that supports kv_hints"
-        ) from exc
+        # Do not replace the native transport on revisions that already expose
+        # it (including development images used by the real scheduler smoke).
+        import importlib
+        import sys
+
+        if "sglang.srt.managers.kv_hints" not in sys.modules:
+            importlib.import_module("sglang.srt.managers.kv_hints")
+    except (ImportError, AttributeError):
+        # SGLang 0.5.2 predates kv_hints. Install the transport before
+        # http_server imports its request dataclass and before workers start.
+        from adaptive_sparse import kv_hints_compat
+
+        kv_hints_compat.install()
+
+    from sglang.srt.managers.schedule_policy import SchedulePolicy
 
     original = SchedulePolicy.calc_priority
     if getattr(original, "_elastic_future_hook", False):

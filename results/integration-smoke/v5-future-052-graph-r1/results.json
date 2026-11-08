@@ -1,0 +1,81 @@
+{
+  "checks": {
+    "fallback_safe": true,
+    "hint_queues_planned": true,
+    "hook_ticks": true,
+    "queue_reordered": true,
+    "requests_completed": true,
+    "urgent_finishes_before_slow": true,
+    "vmm_active": true
+  },
+  "elastic_mode": "v5",
+  "elastic_stats": {
+    "actual_graph_replay_calls": 325,
+    "alloc_calls": 330,
+    "backed_bytes": 587202560,
+    "chunk_bytes": 2097152,
+    "contiguous_id_view_calls": 330,
+    "ensure_calls": 3,
+    "ensure_chunks": 280,
+    "ensure_ns": 18524170,
+    "fragmented_alloc_calls": 0,
+    "free_calls": 4,
+    "graph_capture_calls": 1,
+    "hook_ns": 26710251,
+    "id_upload_calls": 0,
+    "index_d2h_ns": 158238,
+    "interval_alloc_calls": 330,
+    "layout": "layer_contiguous_shared_arena",
+    "live_tokens": 0,
+    "logical_capacity_bytes": 3758211072,
+    "mode": "v5",
+    "peak_backed_bytes": 587202560,
+    "reclaim_calls": 0,
+    "reclaim_chunks": 0,
+    "reclaim_ns": 0,
+    "reclaim_sync_ns": 0,
+    "reserved_bytes": 3875536896,
+    "retain_chunks": 8
+  },
+  "future_stats": {
+    "fallback_exception": 0,
+    "fallback_invalid_hint": 0,
+    "fallback_missing_hint": 1,
+    "queue_requests": 2,
+    "released_requests": 2,
+    "reordered_ticks": 1,
+    "telemetry_errors": 0,
+    "ticks": 3,
+    "unreleased_requests": 0
+  },
+  "requests": [
+    {
+      "deadline_ms": null,
+      "elapsed_s": 1.336485586129129,
+      "finished_s": 4030621.508562116,
+      "name": "initial",
+      "output_tokens": 256,
+      "prompt_tokens": 256,
+      "started_s": 4030620.17207653
+    },
+    {
+      "deadline_ms": null,
+      "elapsed_s": 1.573081027250737,
+      "finished_s": 4030621.849870934,
+      "name": "slow",
+      "output_tokens": 64,
+      "prompt_tokens": 4096,
+      "started_s": 4030620.276789907
+    },
+    {
+      "deadline_ms": 3000,
+      "elapsed_s": 1.2390082678757608,
+      "finished_s": 4030621.547680337,
+      "name": "urgent",
+      "output_tokens": 8,
+      "prompt_tokens": 128,
+      "started_s": 4030620.308672069
+    }
+  ],
+  "status": "passed"
+}

@@ -1,8 +1,9 @@
 """Opt-in dense-MHA adapter; no attention kernel or model weights are changed.
 
-Supported: SGLang 0.5.2, TP=1, page_size=1, Triton attention, eager or
-guarded decode CUDA Graph (baseline/V4/V5),
-no overlap, no radix cache, no speculative decoding or disaggregation.
+Supports the SGLang 0.5.2 compatibility surface and the newer memory-pool API
+where the pool/allocator live below ``sglang.srt.mem_cache`` and pool creation is
+owned by ``KVCacheConfigurator``.  Scope remains TP=1, page_size=1, Triton
+attention, dense MHA, no overlap/radix/speculation/PD.
 """
 import json
 import logging
@@ -22,6 +23,26 @@ VALID_MODES = ("baseline", "v0", "v1", "v2", "v3", "v4", "v5")
 HOST_FREE_MODES = ("v2", "v3", "v4")
 CONTROLLERS = []
 _installed = False
+
+
+def _free_group_active(allocator):
+    """Normalize the old boolean and new ``None/list`` free-group APIs."""
+    if hasattr(allocator, "is_not_in_free_group"):
+        return not allocator.is_not_in_free_group
+    if hasattr(allocator, "free_group"):
+        return allocator.free_group is not None
+    raise AttributeError("allocator has no free-group state")
+
+
+def _queue_free_group(allocator, free_index):
+    """Defer a free using the allocator's owned-copy convention when present."""
+    copy = getattr(allocator, "_copy_for_free_group", None)
+    allocator.free_group.append(copy(free_index) if copy else free_index)
+
+
+def _replace_if_present(module, name, replacement):
+    if hasattr(module, name):
+        setattr(module, name, replacement)
 
 
 class PlaneProjection:
@@ -222,15 +243,51 @@ def install():
     if MODE not in VALID_MODES:
         raise ValueError(f"unknown EKV_MODE={MODE}")
     import sglang
-    if sglang.__version__ != "0.5.2":
-        raise RuntimeError("This adapter is pinned to SGLang 0.5.2")
     import sglang.srt.model_executor.model_runner as runner
-    original_pool = runner.MHATokenToKVPool
-    original_allocator = runner.TokenToKVPoolAllocator
-    original_init = runner.ModelRunner.init_memory_pool
+
+    # The current SGLang layout imports these classes in mem_cache and builds
+    # pools through KVCacheConfigurator.  Resolve by capability instead of an
+    # exact package version so development builds and future releases with the
+    # same API can use the adapter.
+    modern = not hasattr(runner.ModelRunner, "init_memory_pool")
+    configurator_module = None
+    if modern:
+        try:
+            from sglang.srt.mem_cache import memory_pool
+            from sglang.srt.mem_cache import kv_cache_configurator as configurator_module
+            from sglang.srt.mem_cache.allocator import token as token_allocator_module
+        except ImportError as exc:
+            raise RuntimeError(
+                "Unsupported SGLang memory-pool layout: expected either the "
+                "0.5.2 model_runner symbols or the newer KVCacheConfigurator API"
+            ) from exc
+        if not hasattr(memory_pool, "MHATokenToKVPool") or not hasattr(
+            token_allocator_module, "TokenToKVPoolAllocator"
+        ):
+            raise RuntimeError(
+                "Unsupported newer SGLang API: MHA pool or token allocator is missing"
+            )
+        original_pool = memory_pool.MHATokenToKVPool
+        original_allocator = token_allocator_module.TokenToKVPoolAllocator
+        original_init = None
+    else:
+        if not hasattr(runner, "MHATokenToKVPool") or not hasattr(
+            runner, "TokenToKVPoolAllocator"
+        ):
+            raise RuntimeError(
+                "Unsupported SGLang 0.5.2 API: model_runner memory-pool symbols are missing"
+            )
+        original_pool = runner.MHATokenToKVPool
+        original_allocator = runner.TokenToKVPoolAllocator
+        original_init = runner.ModelRunner.init_memory_pool
 
     class ElasticPool(original_pool):
         def _create_buffers(self):
+            # VMM planes below expose NHD slot rows. Newer SGLang revisions can
+            # enable HND from an environment knob that is not represented in
+            # ServerArgs, so pin the buffer metadata to the layout we build.
+            self.use_hnd = False
+            self.kv_cache_layout = "nhd"
             chunk = int(os.environ.get("EKV_CHUNK_MIB", "2")) << 20
             slots = self.size + self.page_size
             elements = self.head_num * self.head_dim
@@ -376,13 +433,13 @@ def install():
         def free(self, free_index):
             if MODE == "baseline":
                 result = super().free(free_index)
-                if self.is_not_in_free_group:
+                if not _free_group_active(self):
                     self.ctrl.publish(force=True)
                 return result
             if not free_index.numel():
                 return super().free(free_index)
-            if not self.is_not_in_free_group:
-                self.free_group.append(free_index)
+            if _free_group_active(self):
+                _queue_free_group(self, free_index)
                 return
             start = time.perf_counter_ns()
             copy_start = time.perf_counter_ns()
@@ -413,23 +470,89 @@ def install():
                 raise RuntimeError("allocator snapshots/speculative decoding are not supported")
             return super().restore_state(state)
 
-    def guarded_init(self, *args, **kwargs):
-        a = self.server_args
+    def validate_server_args(a, *, is_hybrid=False, use_mla_backend=False):
         graph_safe = a.disable_cuda_graph or MODE in ("baseline", "v4", "v5")
+        backends = (a.attention_backend, a.prefill_attention_backend,
+                    a.decode_attention_backend)
         required = (a.page_size == 1, a.attention_backend == "triton", graph_safe,
                     a.disable_overlap_schedule, a.disable_radix_cache, a.tp_size == 1,
                     a.pp_size == 1, a.dp_size == 1, not a.enable_two_batch_overlap,
-                    a.prefill_attention_backend in (None, "triton"),
-                    a.decode_attention_backend in (None, "triton"),
+                    all(backend in (None, "triton") for backend in backends),
                     a.disaggregation_mode == "null", not a.enable_memory_saver,
-                    not a.speculative_algorithm, not a.enable_hierarchical_cache)
-        if not all(required) or self.is_hybrid or self.is_hybrid_gdn or self.use_mla_backend:
+                    not a.speculative_algorithm, not a.enable_hierarchical_cache,
+                    not getattr(a, "enable_page_major_kv_layout", False),
+                    getattr(a, "dcp_size", 1) == 1)
+        if not all(required) or is_hybrid or use_mla_backend:
             raise RuntimeError("Require dense MHA, TP1, Triton, supported Graph mode, no overlap/cache/spec/PD")
+
+    def validate_mha_geometry(model_config):
+        head_dim = getattr(model_config, "head_dim", None)
+        v_head_dim = getattr(model_config, "v_head_dim", head_dim)
+        if head_dim is not None and v_head_dim != head_dim:
+            raise RuntimeError(
+                "Elastic KV requires symmetric K/V head dimensions in this prototype"
+            )
+
+    def guarded_init(self, *args, **kwargs):
+        validate_server_args(
+            self.server_args,
+            is_hybrid=self.is_hybrid or self.is_hybrid_gdn,
+            use_mla_backend=self.use_mla_backend,
+        )
+        validate_mha_geometry(self.model_config)
         original_init(self, *args, **kwargs)
 
-    runner.MHATokenToKVPool = original_pool if MODE == "baseline" else ElasticPool
-    runner.TokenToKVPoolAllocator = ObservedAllocator
-    runner.ModelRunner.init_memory_pool = guarded_init
+    if modern:
+        original_configure = configurator_module.KVCacheConfigurator.configure
+
+        def guarded_configure(self, *args, **kwargs):
+            validate_server_args(
+                self.server_args,
+                is_hybrid=(
+                    getattr(self, "is_hybrid_swa", False)
+                    or getattr(self, "mambaish_config", None) is not None
+                    or getattr(self, "hybrid_gdn_config", None) is not None
+                    or getattr(self, "hybrid_kda_config", None) is not None
+                ),
+                use_mla_backend=self.use_mla_backend,
+            )
+            validate_mha_geometry(self.model_config)
+            bf16 = getattr(torch, "bfloat16", None)
+            if bf16 is not None and getattr(self, "kv_cache_dtype", None) != bf16:
+                raise RuntimeError("Elastic KV currently requires BF16 KV cache")
+            if getattr(self, "is_draft_worker", False):
+                raise RuntimeError("Elastic KV does not support draft workers")
+            if getattr(self, "kv_shard_rank", None) is not None:
+                raise RuntimeError("Elastic KV does not support KV sharding")
+            if getattr(self, "post_capture_kv_active", False):
+                raise RuntimeError(
+                    "Elastic KV cannot be combined with SGLang post-capture KV sizing"
+                )
+            return original_configure(self, *args, **kwargs)
+
+        pool_type = original_pool if MODE == "baseline" else ElasticPool
+        _replace_if_present(memory_pool, "MHATokenToKVPool", pool_type)
+        _replace_if_present(
+            configurator_module, "MHATokenToKVPool", pool_type
+        )
+        if hasattr(configurator_module, "_KV_POOL_BASE_FOR_KIND"):
+            configurator_module._KV_POOL_BASE_FOR_KIND["mha"] = pool_type
+
+        import sglang.srt.mem_cache.allocator as allocator_package
+        _replace_if_present(
+            token_allocator_module, "TokenToKVPoolAllocator", ObservedAllocator
+        )
+        _replace_if_present(
+            allocator_package, "TokenToKVPoolAllocator", ObservedAllocator
+        )
+        _replace_if_present(
+            configurator_module, "TokenToKVPoolAllocator", ObservedAllocator
+        )
+        configurator_module.KVCacheConfigurator.configure = guarded_configure
+    else:
+        runner.MHATokenToKVPool = original_pool if MODE == "baseline" else ElasticPool
+        runner.TokenToKVPoolAllocator = ObservedAllocator
+        runner.ModelRunner.init_memory_pool = guarded_init
     from .graph_support import install_graph_hooks
     install_graph_hooks()
     if MODE != "v5" and os.environ.get("EKV_ACTIVATION_POLICY", "off") != "off":

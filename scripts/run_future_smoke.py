@@ -129,6 +129,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument(
+        "--elastic-mode",
+        choices=("baseline", "v0", "v1", "v2", "v3", "v4", "v5"),
+        default="baseline",
+    )
+    parser.add_argument("--elastic-chunk-mib", type=int, default=2)
+    parser.add_argument("--elastic-retain-chunks", type=int, default=1)
+    parser.add_argument("--disable-cuda-graph", action="store_true")
+    parser.add_argument(
+        "--future-policy", choices=("off", "deadline"), default="deadline"
+    )
     args = parser.parse_args(argv)
     if not args.model_path.is_dir():
         parser.error("--model-path must be an existing directory")
@@ -138,19 +149,31 @@ def main(argv: list[str] | None = None) -> int:
     output.mkdir(parents=True)
     log_path = output / "server.log"
     stats_path = output / "future_stats.json"
+    vmm_stats_path = output / "vmm_stats.json"
     result_path = output / "results.json"
 
     env = dict(os.environ)
     env.update(
-        EKV_MODE="baseline",
-        EKV_FUTURE_POLICY="deadline",
+        EKV_MODE=args.elastic_mode,
+        EKV_CHUNK_MIB=str(args.elastic_chunk_mib),
+        EKV_RETAIN_CHUNKS=str(args.elastic_retain_chunks),
+        EKV_FUTURE_POLICY=args.future_policy,
         EKV_FUTURE_STATS_PATH=str(stats_path),
+        EKV_STATS_PATH=str(vmm_stats_path),
         PYTHONUNBUFFERED="1",
     )
     server_command = [
         sys.executable,
         "-m",
         "elastic_kv.launch",
+        "--elastic-mode",
+        args.elastic_mode,
+        "--elastic-chunk-mib",
+        str(args.elastic_chunk_mib),
+        "--elastic-retain-chunks",
+        str(args.elastic_retain_chunks),
+        "--elastic-future-policy",
+        args.future_policy,
         "--model-path",
         str(args.model_path.resolve()),
         "--host",
@@ -177,6 +200,8 @@ def main(argv: list[str] | None = None) -> int:
         "fcfs",
         "--skip-server-warmup",
     ]
+    if args.disable_cuda_graph:
+        server_command.append("--disable-cuda-graph")
     server = None
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as address:
@@ -202,30 +227,56 @@ def main(argv: list[str] | None = None) -> int:
         deadline = time.monotonic() + 2
         while not stats_path.exists() and time.monotonic() < deadline:
             time.sleep(0.05)
-        hook_stats = json.loads(stats_path.read_text()) if stats_path.exists() else None
+        hook_stats = (
+            json.loads(stats_path.read_text())
+            if args.future_policy != "off" and stats_path.exists()
+            else None
+        )
+        elastic_stats = (
+            json.loads(vmm_stats_path.read_text())
+            if args.elastic_mode != "baseline" and vmm_stats_path.exists()
+            else None
+        )
         by_name = {row["name"]: row for row in rows}
-        checks = {
-            "hook_ticks": bool(hook_stats and hook_stats.get("ticks", 0) > 0),
-            "hint_queues_planned": bool(
-                hook_stats
-                and hook_stats.get("released_requests", 0)
-                + hook_stats.get("unreleased_requests", 0)
-                > 0
-            ),
-            "fallback_safe": bool(
-                hook_stats
-                and hook_stats.get("fallback_exception", 0) == 0
-                and hook_stats.get("fallback_invalid_hint", 0) == 0
-                and hook_stats.get("telemetry_errors", 0) == 0
-            ),
-            "queue_reordered": bool(hook_stats and hook_stats.get("reordered_ticks", 0) > 0),
-            "urgent_finishes_before_slow": by_name["urgent"]["finished_s"] < by_name["slow"]["finished_s"],
-        }
+        checks = {"requests_completed": len(rows) == 3}
+        if args.future_policy != "off":
+            checks.update(
+                {
+                    "urgent_finishes_before_slow": by_name["urgent"]["finished_s"]
+                    < by_name["slow"]["finished_s"],
+                    "hook_ticks": bool(hook_stats and hook_stats.get("ticks", 0) > 0),
+                    "hint_queues_planned": bool(
+                        hook_stats
+                        and hook_stats.get("released_requests", 0)
+                        + hook_stats.get("unreleased_requests", 0)
+                        > 0
+                    ),
+                    "fallback_safe": bool(
+                        hook_stats
+                        and hook_stats.get("fallback_exception", 0) == 0
+                        and hook_stats.get("fallback_invalid_hint", 0) == 0
+                        and hook_stats.get("telemetry_errors", 0) == 0
+                    ),
+                    "queue_reordered": bool(
+                        hook_stats and hook_stats.get("reordered_ticks", 0) > 0
+                    ),
+                }
+            )
+        if args.elastic_mode != "baseline":
+            checks["vmm_active"] = bool(
+                elastic_stats
+                and elastic_stats.get("mode") == args.elastic_mode
+                and elastic_stats.get("backed_bytes", 0) > 0
+                and elastic_stats.get("backed_bytes", 0)
+                < elastic_stats.get("logical_capacity_bytes", 0)
+            )
         result = {
             "status": "passed" if all(checks.values()) else "failed",
             "checks": checks,
             "requests": rows,
             "future_stats": hook_stats,
+            "elastic_mode": args.elastic_mode,
+            "elastic_stats": elastic_stats,
         }
         result_path.write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
         print(json.dumps({"status": result["status"], "checks": checks, "stats": hook_stats}))

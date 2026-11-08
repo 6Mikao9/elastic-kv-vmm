@@ -1,5 +1,6 @@
 from contextlib import nullcontext
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -7,6 +8,53 @@ from elastic_kv import activation
 
 
 class ActivationTest(unittest.TestCase):
+    def tearDown(self):
+        # install_activation_hooks() changes process-wide SGLang hooks and
+        # module state. Prevent a telemetry test from enabling pressure probes
+        # in unrelated residency tests that immediately follow it.
+        activation._POLICY = "off"
+        activation._HEADROOM = 0
+        activation._CUDA = None
+
+    def test_installs_on_newer_forward_method(self):
+        cuda = Mock()
+        torch = ModuleType("torch")
+        torch.cuda = cuda
+
+        class ScheduleBatch:
+            def prepare_for_extend(self):
+                return "prepared"
+
+        class ModelRunner:
+            def forward(self, *args, **kwargs):
+                return "forwarded"
+
+        modules = {
+            "torch": torch,
+            "sglang": ModuleType("sglang"),
+            "sglang.srt": ModuleType("sglang.srt"),
+            "sglang.srt.managers": ModuleType("sglang.srt.managers"),
+            "sglang.srt.managers.schedule_batch": SimpleNamespace(
+                ScheduleBatch=ScheduleBatch
+            ),
+            "sglang.srt.model_executor": ModuleType(
+                "sglang.srt.model_executor"
+            ),
+            "sglang.srt.model_executor.model_runner": SimpleNamespace(
+                ModelRunner=ModelRunner
+            ),
+        }
+        original_forward = ModelRunner.forward
+        with patch.dict(sys.modules, modules), patch.dict(
+            "os.environ", {"EKV_ACTIVATION_POLICY": "telemetry"}
+        ):
+            activation.install_activation_hooks()
+
+        self.assertIsNot(ModelRunner.forward, original_forward)
+        self.assertIs(ModelRunner.forward.__wrapped__, original_forward)
+        self.assertFalse(hasattr(ModelRunner, "forward_extend"))
+        self.assertTrue(ModelRunner._ekv_activation_hooks)
+
     def test_prefill_protects_live_and_prospective_chunks_and_resamples(self):
         class Arena:
             mapped_chunks = {0, 1, 2, 3}

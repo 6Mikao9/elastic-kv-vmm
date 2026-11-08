@@ -77,7 +77,15 @@ checked-in output is in
   change that preserves every native `PrefillAdder` check.
 - The hook computes remaining slack from SGLang's scheduler receive time and
   never crosses the engine's native priority tier.
-- This revision does not have the project's VMM adapter. Conversely, the VMM
-  adapter's tested SGLang 0.5.2 revision does not expose `kv_hints`.
+- SGLang 0.5.2 uses the guarded compatibility transport described in
+  [the compatibility boundary](KV_HINTS_COMPAT.md). The V5 eager and CUDA Graph
+  integration smokes both exercised VMM backing and future queue planning in
+  the same serving process. Their checked-in summaries are in
+  `results/integration-smoke/v5-future-052-eager-r3/` and
+  `results/integration-smoke/v5-future-052-graph-r1/`; these validate the
+  integration and scheduling path, not a throughput improvement.
+- The four-A100 MiniMax run additionally combined native HiSparse,
+  request-level residency, VMM backing, automatic joint demotion and future
+  ordering. See [the integration report](MINIMAX_FUTURE_INTEGRATION.md).
 - Non-streaming requests were used, so this smoke says nothing about TTFT, TPOT,
   throughput, KV residency migration or end-to-end HiSparse performance.

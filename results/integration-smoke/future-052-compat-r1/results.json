@@ -1,0 +1,50 @@
+{
+  "checks": {
+    "fallback_safe": true,
+    "hint_queues_planned": true,
+    "hook_ticks": true,
+    "queue_reordered": true,
+    "urgent_finishes_before_slow": true
+  },
+  "future_stats": {
+    "fallback_exception": 0,
+    "fallback_invalid_hint": 0,
+    "fallback_missing_hint": 2,
+    "queue_requests": 2,
+    "released_requests": 2,
+    "reordered_ticks": 1,
+    "telemetry_errors": 0,
+    "ticks": 4,
+    "unreleased_requests": 0
+  },
+  "requests": [
+    {
+      "deadline_ms": null,
+      "elapsed_s": 1.7292594746686518,
+      "finished_s": 4030261.804784069,
+      "name": "initial",
+      "output_tokens": 256,
+      "prompt_tokens": 256,
+      "started_s": 4030260.075524594
+    },
+    {
+      "deadline_ms": null,
+      "elapsed_s": 1.9503886098973453,
+      "finished_s": 4030262.131155261,
+      "name": "slow",
+      "output_tokens": 64,
+      "prompt_tokens": 4096,
+      "started_s": 4030260.180766651
+    },
+    {
+      "deadline_ms": 3000,
+      "elapsed_s": 1.6332463077269495,
+      "finished_s": 4030261.845762131,
+      "name": "urgent",
+      "output_tokens": 8,
+      "prompt_tokens": 128,
+      "started_s": 4030260.212515823
+    }
+  ],
+  "status": "passed"
+}

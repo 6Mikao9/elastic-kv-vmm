@@ -1,1 +1,1 @@
-"""Experimental elastic KV backing for SGLang 0.5.2."""
+"""Experimental elastic KV backing for old and current SGLang memory-pool APIs."""

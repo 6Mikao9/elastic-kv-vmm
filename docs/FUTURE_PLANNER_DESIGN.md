@@ -7,9 +7,12 @@ GPU 结果出来前，不把规划收益写成已证实的性能收益。
 当前实现状态：`adaptive_sparse/future_plan.py` 已提供不依赖 SGLang/CUDA 的
 确定性事件模拟，比较 `fifo`、`longest`、`mode-aware` 和 `future` 四种策略；
 `adaptive_sparse/sglang_future_hook.py` 已实现默认关闭的 scheduler 排序 hook。
-该 hook 只在支持 `kv_hints` 的 SGLang revision 上启用，并保持 `PrefillAdder`
-为最终准入权威。它尚未在带 `kv_hints` 的上游 revision 上完成真实服务 A/B，
-也不能把离线结果当成服务端吞吐或延迟结论。
+在带原生 `kv_hints` 的 SGLang revision 上它直接复用上游传输；在 0.5.2 上则
+由 `adaptive_sparse/kv_hints_compat.py` 在 HTTP 请求类、tokenizer 和 scheduler
+之间补上字段传递。两条路径都保持 `PrefillAdder` 为最终准入权威。原生传输路径
+已完成一次真实 scheduler smoke；0.5.2 兼容路径也已在真实 A100 的 V5 eager
+和 CUDA Graph 服务中通过 VMM+future 集成 smoke。当前证据只证明链路和回退行为，
+尚不能当成服务端吞吐或延迟收益。
 
 ## 1. 要解决的问题
 

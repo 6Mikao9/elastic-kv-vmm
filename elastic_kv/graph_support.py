@@ -3,7 +3,14 @@ from functools import wraps
 
 
 def install_graph_hooks():
-    from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+    try:
+        from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+    except ImportError:
+        # Newer SGLang moved decode graphs under model_executor.runner and its
+        # graph buffer registry already uses token/request slot zero for padded
+        # rows.  The permanent backing for slot zero is handled by Residency, so
+        # no extra request row or replay hook is needed here.
+        return
 
     from sglang.srt.model_executor import model_runner
 

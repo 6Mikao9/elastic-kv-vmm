@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "elastic-kv-vmm"
 version = "0.1.0"
-description = "Demand-backed CUDA VMM KV storage for a pinned SGLang server"
+description = "Demand-backed CUDA VMM KV storage for SGLang"
 requires-python = ">=3.10"
 license = "Apache-2.0"
 

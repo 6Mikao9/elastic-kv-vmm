@@ -1,22 +1,31 @@
 # Integration map
 
-The opt-in SGLang 0.5.2 adapter installs at process startup and keeps the
-attention interface and logical token slot IDs. The supported path is dense
-MHA with Triton, page size 1 and TP/PP/DP size 1. It disables overlap, radix
-and hierarchical caching, speculative decoding and prefill/decode
-disaggregation.
+The opt-in SGLang adapter installs at process startup and keeps the attention
+interface and logical token slot IDs. It supports the measured SGLang 0.5.2
+surface and the newer `KVCacheConfigurator` / `mem_cache` surface, provided the
+latter exposes the same MHA pool and token allocator contracts. The supported
+path remains dense MHA with Triton, page size 1 and TP/PP/DP size 1, with
+overlap, radix and hierarchical caching, speculative decoding and
+prefill/decode disaggregation disabled.
+
+The newer path replaces the pool and allocator at every import site used by the
+configurator, wraps `KVCacheConfigurator.configure()` for the same startup
+guards, and handles the allocator API's `None`/list free-group representation.
+Its automated checks use representative newer API modules; a real GPU serving
+run on that revision remains necessary. SGLang's built-in post-capture sizing
+must remain off because it owns a different backing lifecycle.
 
 | Layer | Source | Integration |
 |---|---|---|
 | Physical memory | [elastic_vmm.cpp](../native/elastic_vmm.cpp), [backing.py](../elastic_kv/backing.py) | Reserve stable virtual addresses, map and zero newly committed CUDA chunks, then unmap and release unused physical handles. CuPy/DLPack exposes those addresses as PyTorch tensors. |
-| Pool construction | [adapter.py](../elastic_kv/adapter.py) | Hook `ModelRunner.init_memory_pool` and `MHATokenToKVPool._create_buffers` to provide demand-backed K/V planes. |
+| Pool construction | [adapter.py](../elastic_kv/adapter.py) | On 0.5.2, hook `ModelRunner.init_memory_pool`; on the newer API, replace the MHA class and allocator at their `mem_cache` import sites and wrap `KVCacheConfigurator.configure()`. Both routes replace `MHATokenToKVPool._create_buffers` to provide demand-backed K/V planes. |
 | Slot allocation | [adapter.py](../elastic_kv/adapter.py) | V5 tracks free ID ranges on the host, favors low IDs and admits ranges before writes. Contiguous allocations use slices of a persistent GPU ID tensor. Fragmented allocations return the selected IDs through the existing allocator interface. |
 | Residency | [adapter.py](../elastic_kv/adapter.py) | V5 defers ordinary reclaim until the pool drains, synchronizes before unmapping and can retain a configurable low-ID chunk reserve with `EKV_RETAIN_CHUNKS`. Logical capacity remains fixed. |
 | Startup | [launch.py](../elastic_kv/launch.py), [adapter.py](../elastic_kv/adapter.py) | Install hooks in the server process tree and reject unsupported configurations. |
 
 ## Decode CUDA Graph
 
-The SGLang baseline, V4 and V5 paths support decode CUDA Graph in the
+The measured SGLang 0.5.2 baseline, V4 and V5 paths support decode CUDA Graph in the
 guarded configuration. Graphs keep the same virtual K/V addresses through
 mapping and reclaim cycles. Slot zero remains backed. Capture starts from
 an idle pool, with request indices pointing at an extra request table row
@@ -26,12 +35,15 @@ the adapter resets the request-index tail to that row before the upstream
 metadata update. The upstream runner resets padded write positions to slot
 zero and copies real request indices and write positions into the prefix.
 This prevents a smaller batch from inheriting stale indices into a reclaimed
-range. See [graph_support.py](../elastic_kv/graph_support.py).
+range. Newer SGLang graph runners use slot zero for padded request and write
+indices, which is already the permanently backed sink, so the legacy extra-row
+hook is skipped. See [graph_support.py](../elastic_kv/graph_support.py).
 
 ## Prefill activation pressure
 
 The optional V5 hooks mark `ScheduleBatch.prepare_for_extend` as prefill
-context and instrument `ModelRunner.forward_extend` to sample CUDA memory
+context and instrument `ModelRunner.forward_extend` (or the newer unified
+`ModelRunner.forward`) to sample CUDA memory
 around prefill. Before committing new KV chunks, the adapter compares free
 device memory with the pending backing bytes plus a configured prefill
 headroom target. `EKV_ACTIVATION_POLICY` selects `off`, `telemetry`,
