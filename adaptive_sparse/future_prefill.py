@@ -282,7 +282,14 @@ def _interval_peak(entries, byte_field, finish_field, *, shared_prefix=False):
             groups = {}
             for request_id in active:
                 entry = by_id[request_id]
-                if entry.prefix_group and entry.shared_prefix_bytes > 0:
+                # HiSparse Top-K sets are request-specific and are not
+                # guaranteed to contain the shared prefix.  Only resident
+                # members carry the full prefix and may share that deduction.
+                if (
+                    entry.residence == "resident"
+                    and entry.prefix_group
+                    and entry.shared_prefix_bytes > 0
+                ):
                     groups.setdefault(entry.prefix_group, []).append(
                         entry.shared_prefix_bytes
                     )

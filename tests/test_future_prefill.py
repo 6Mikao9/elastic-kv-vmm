@@ -248,6 +248,73 @@ class FuturePrefillPlanTest(unittest.TestCase):
         self.assertEqual(sum(entry.kv_bytes for entry in plan.entries), 450)
         self.assertEqual(plan.kv_bytes, 430)
 
+    def test_host_backed_members_do_not_receive_shared_prefix_credit(self):
+        plan = plan_future_prefill(
+            [
+                request(
+                    request_id,
+                    prompt=10,
+                    expected_output_tokens=20,
+                    residence="host_backed",
+                    prefill_tokens_per_s=1_000,
+                    decode_tokens_per_s=1_000,
+                    prefix_group="group",
+                    shared_prefix_tokens=4,
+                )
+                for request_id in ("a", "b")
+            ],
+            now_s=1.0,
+            kv_bytes_per_token=10,
+            config=self.config(),
+        )
+
+        self.assertEqual([entry.kv_bytes for entry in plan.entries], [80, 80])
+        self.assertEqual(plan.kv_bytes, 160)
+
+    def test_shared_prefix_credit_only_counts_resident_members(self):
+        plan = plan_future_prefill(
+            [
+                request(
+                    "resident-a",
+                    prompt=10,
+                    expected_output_tokens=5,
+                    residence="resident",
+                    prefill_tokens_per_s=1_000,
+                    decode_tokens_per_s=1_000,
+                    prefix_group="group",
+                    shared_prefix_tokens=4,
+                ),
+                request(
+                    "resident-b",
+                    prompt=10,
+                    expected_output_tokens=5,
+                    residence="resident",
+                    prefill_tokens_per_s=1_000,
+                    decode_tokens_per_s=1_000,
+                    prefix_group="group",
+                    shared_prefix_tokens=4,
+                ),
+                request(
+                    "host-backed",
+                    prompt=10,
+                    expected_output_tokens=20,
+                    residence="host_backed",
+                    prefill_tokens_per_s=1_000,
+                    decode_tokens_per_s=1_000,
+                    prefix_group="group",
+                    shared_prefix_tokens=4,
+                ),
+            ],
+            now_s=1.0,
+            kv_bytes_per_token=10,
+            config=self.config(),
+        )
+
+        self.assertEqual(
+            [entry.kv_bytes for entry in plan.entries], [150, 150, 80]
+        )
+        self.assertEqual(plan.kv_bytes, 340)
+
     def test_missing_and_invalid_hints_do_not_change_reservation(self):
         no_hint = request("none")
         no_hint.kv_hints = NS(actions=[])

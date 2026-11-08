@@ -1,13 +1,13 @@
 # 已知未来规划器缺口审计
 
 审计日期：2026-11-09
-代码基线：`feature/sglang-framework`，`9419a78776addb2035fcba4c5ce44fc9f1daefff`
+代码基线：`feature/sglang-framework`，`dfd9a7d`
 
 ## 结论
 
 离线规划、hint 校验、请求排序和 CPU 增长账本的边界基本清楚，222 项相关
 CPU 测试全部通过。2026-11-09 的加固把调度钩子改为 fail-open、补齐全空闲
-TTL tick、修正多 plane 量纲并在预算动作后预热；相关 CPU 回归随后扩展到 418
+TTL tick、修正多 plane 量纲并在预算动作后预热；相关 CPU 回归随后扩展到 420
 项（含 131 个子测试）。其中一项使用真实 SGLang 0.5.17 `Scheduler` 类安装
 包装层，并注入 VMM 预热异常，验证原生 prefill 仍能接管。`enforce` 仍是显式
 opt-in，且真实 serving A/B 尚缺，
@@ -132,7 +132,9 @@ Scheduler wrapper
 - 加固后需求按 `slot_bytes *` 全部 arena 的 plane 数换算逻辑槽；物理字节遥测
   单独记录 requested、candidate 和 mapped bytes。
 - SGLang 0.5.17 真实 scheduler wrapper 异常注入回归通过；完整容器套件为
-  `418 passed, 2 skipped, 131 subtests passed`。
+  `420 passed, 2 skipped, 131 subtests passed`。
+- 共享前缀抵扣只作用于明确 `resident` 的成员；`host_backed` 请求的 hot set
+  不保证包含共享前缀，因此新增回归禁止对其做乐观抵扣。
 - CUDA hit/miss 和同 trace serving A/B 仍未运行；本审计只
   确认代码契约、CPU 策略与资源记账，不把 CPU 证据外推成真实服务收益或正确性
   结论。
