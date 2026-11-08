@@ -38,6 +38,22 @@
     "The future policy uses a lower synthetic peak because fewer requests retain full KV.",
     "Longest makespan is smaller than the future policy's makespan, so deadline protection is a tradeoff rather than a universal throughput win."
   ],
+  "validation": {
+    "image": "lmsysorg/sglang:latest",
+    "image_id": "sha256:1cc022f1ddc29b84449b588a872c0e9cab2fc1268a36ef5449fe6956ef774f2a",
+    "sglang_version": "0.5.17",
+    "tests_ran": 166,
+    "tests_passed": 163,
+    "tests_skipped": 3,
+    "tests_failed": 0,
+    "skip_reason": "CUDA device required",
+    "network": "none",
+    "gpu_requested": false,
+    "remote_source": "/home/liuyuntao/experiments/elastic-kv-vmm-5090-20261108/src-r8-controlled-rollout",
+    "remote_source_bytes": 149711657,
+    "remote_log": "/home/liuyuntao/experiments/elastic-kv-vmm-5090-20261108/tests-0.5.17-r8-controlled-rollout.log",
+    "remote_log_sha256": "8f1bcc8405d200a507b756debe2bed192b90c7fcaae72cbda6abe9cbd4858f40"
+  },
   "not_claimed": [
     "GPU throughput or latency improvement",
     "prediction accuracy on an online rollout generator",
