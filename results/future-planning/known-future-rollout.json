@@ -453,6 +453,7 @@
     },
     "submissions": [
       {
+        "deadline_ms": 500,
         "estimated_finish_ms": 92,
         "hint": {
           "deadline_after_ms": 480,
@@ -463,11 +464,14 @@
           "weight": 2.0
         },
         "kind": "tool",
+        "output_tokens": 128,
         "planned_arrival_ms": 20,
+        "prompt_tokens": 512,
         "request_id": "tool-0",
         "submit_at_ms": 20
       },
       {
+        "deadline_ms": 650,
         "estimated_finish_ms": 186,
         "hint": {
           "deadline_after_ms": 566,
@@ -478,11 +482,14 @@
           "weight": 2.0
         },
         "kind": "tool",
+        "output_tokens": 96,
         "planned_arrival_ms": 60,
+        "prompt_tokens": 768,
         "request_id": "tool-1",
         "submit_at_ms": 84
       },
       {
+        "deadline_ms": null,
         "estimated_finish_ms": 443,
         "hint": {
           "expected_output_tokens": 128,
@@ -492,11 +499,14 @@
           "weight": 1.5
         },
         "kind": "rollout",
+        "output_tokens": 128,
         "planned_arrival_ms": 100,
+        "prompt_tokens": 2048,
         "request_id": "rollout-short",
         "submit_at_ms": 180
       },
       {
+        "deadline_ms": 900,
         "estimated_finish_ms": 526,
         "hint": {
           "deadline_after_ms": 464,
@@ -507,11 +517,14 @@
           "weight": 2.0
         },
         "kind": "tool",
+        "output_tokens": 160,
         "planned_arrival_ms": 260,
+        "prompt_tokens": 640,
         "request_id": "tool-2",
         "submit_at_ms": 436
       },
       {
+        "deadline_ms": null,
         "estimated_finish_ms": 1412,
         "hint": {
           "expected_output_tokens": 2048,
@@ -521,11 +534,14 @@
           "weight": 1.5
         },
         "kind": "rollout",
+        "output_tokens": 2048,
         "planned_arrival_ms": 360,
+        "prompt_tokens": 6144,
         "request_id": "rollout-long",
         "submit_at_ms": 516
       },
       {
+        "deadline_ms": null,
         "estimated_finish_ms": 1988,
         "hint": {
           "expected_output_tokens": 3072,
@@ -535,11 +551,14 @@
           "weight": 1.0
         },
         "kind": "background",
+        "output_tokens": 3072,
         "planned_arrival_ms": 0,
+        "prompt_tokens": 4096,
         "request_id": "background-long",
         "submit_at_ms": 1284
       },
       {
+        "deadline_ms": null,
         "estimated_finish_ms": 1956,
         "hint": {
           "expected_output_tokens": 512,
@@ -549,7 +568,9 @@
           "weight": 1.0
         },
         "kind": "chat",
+        "output_tokens": 512,
         "planned_arrival_ms": 180,
+        "prompt_tokens": 1024,
         "request_id": "chat-0",
         "submit_at_ms": 1796
       }

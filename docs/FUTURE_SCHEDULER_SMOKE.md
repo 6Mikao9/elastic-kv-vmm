@@ -70,6 +70,27 @@ mounts the model read-only, and refuses to overwrite an existing result. Raw
 checked-in output is in
 [`results/future-scheduler-smoke/`](../results/future-scheduler-smoke/).
 
+The controlled-rollout executor can instead consume a known-future workload or
+an already emitted plan. Each run is still isolated in a fresh output directory:
+
+```bash
+bash scripts/container_future_smoke.sh \
+  2 /path/to/model results/future-planning/future-hints \
+  --workload benchmarks/workloads/known-future-rollout.json \
+  --planning-policy future --future-policy deadline
+
+bash scripts/container_future_smoke.sh \
+  2 /path/to/model results/future-planning/fifo-no-hints \
+  --workload benchmarks/workloads/known-future-rollout.json \
+  --planning-policy fifo --future-policy off --no-hints
+```
+
+`results.json` separates planned and actual submit/finish times, records deadline
+hit/miss against the original absolute deadline, and reports throughput over the
+full makespan including deliberate idle as well as over the serving window. The
+executor rejects malformed plans before sending any request and fails loudly on
+late dispatch, incomplete output, or conflicting TP residency telemetry.
+
 ## Limits
 
 - `release_after_ms` is currently a soft ordering preference. It is not a hard

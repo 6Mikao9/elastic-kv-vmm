@@ -68,9 +68,14 @@ output length, relative deadline and selected resident/host-backed mode, so a
 rollout controller can feed the existing SGLang hint transport without
 bypassing native admission.  The planner may deliberately idle a short interval
 when starting a long prefill now would make an imminent hard-deadline request
-miss.  This behavior is validated in the deterministic harness; it remains to
-measure whether control-plane idle time and prediction error are worthwhile on
-real serving workloads.
+miss. The live executor now consumes this schedule, adjusts relative deadlines
+against the original absolute deadline, rejects inconsistent plans before
+dispatch, and records actual submit/finish, deadline outcomes, TTFT, TPOT, full
+makespan throughput and per-TP residency evidence. A matching `--no-hints`
+control arm makes paired real-serving measurement possible. This behavior is
+validated in deterministic CPU tests; it remains to measure whether
+control-plane idle time and prediction error are worthwhile on real serving
+workloads.
 
 ### Performance targets and next optimizations (2026-11-04)
 

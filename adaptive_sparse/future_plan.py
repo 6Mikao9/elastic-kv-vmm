@@ -258,7 +258,10 @@ class RolloutSubmission:
     submit_at_ms: int
     estimated_finish_ms: int
     kind: str
+    prompt_tokens: int
+    output_tokens: int
     hint: dict[str, object]
+    deadline_ms: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -285,7 +288,10 @@ class RolloutPlan:
                     "submit_at_ms": item.submit_at_ms,
                     "estimated_finish_ms": item.estimated_finish_ms,
                     "kind": item.kind,
+                    "prompt_tokens": item.prompt_tokens,
+                    "output_tokens": item.output_tokens,
                     "hint": item.hint,
+                    "deadline_ms": item.deadline_ms,
                 }
                 for item in self.submissions
             ],
@@ -741,7 +747,10 @@ def plan_rollout(
                 submit_at_ms=admission.start_ms,
                 estimated_finish_ms=admission.finish_ms,
                 kind=request.kind,
+                prompt_tokens=request.prompt_tokens,
+                output_tokens=request.output_tokens,
                 hint=hint,
+                deadline_ms=request.deadline_ms,
             )
         )
     return RolloutPlan(simulation, tuple(submissions))

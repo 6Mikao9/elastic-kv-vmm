@@ -1,7 +1,9 @@
 """Static mixed residency for the pinned MiniMax eager HiSparse runtime."""
+from collections import OrderedDict
 import hashlib
 import os
 from pathlib import Path
+import time
 
 import torch
 
@@ -12,6 +14,46 @@ from .residency_broker import (
     page_aligned_slots,
     remaining_output_tokens,
 )
+
+
+_REQUEST_DECISION_LIMIT = 4096
+
+
+def remember_request_decision(
+    stats: dict[str, object],
+    request_id: object,
+    *,
+    actual_residence: str,
+    reason: str,
+    requested_residence: str | None,
+    expected_output_tokens: int | None,
+    sequence_tokens: int,
+    native_buffer_tokens: int,
+    slots_available: bool,
+    tp_world_size: int,
+) -> None:
+    """Keep bounded, rank-local evidence for the executor to reconcile."""
+
+    if not isinstance(request_id, str) or not request_id:
+        return
+    decisions = stats.get("requests")
+    if not isinstance(decisions, OrderedDict):
+        decisions = OrderedDict()
+        stats["requests"] = decisions
+    decisions.pop(request_id, None)
+    decisions[request_id] = {
+        "actual_residence": actual_residence,
+        "reason": reason,
+        "requested_residence": requested_residence,
+        "expected_output_tokens": expected_output_tokens,
+        "sequence_tokens": sequence_tokens,
+        "native_buffer_tokens": native_buffer_tokens,
+        "slots_available": slots_available,
+        "tp_world_size": tp_world_size,
+        "timestamp_monotonic_ns": time.monotonic_ns(),
+    }
+    while len(decisions) > _REQUEST_DECISION_LIMIT:
+        decisions.popitem(last=False)
 
 
 def install_request_residency():
@@ -131,7 +173,8 @@ def install_request_residency():
                                      "future_hint_missing": 0, "future_hint_invalid": 0,
                                      "future_decision_reasons": {},
                                      "broker_dry_run_declines": 0,
-                                     "resident_broker_mode": broker_mode}
+                                     "resident_broker_mode": broker_mode,
+                                     "requests": OrderedDict()}
 
     def publish_broker_stats(self):
         snapshot = self._ekv_residency_broker.snapshot()
@@ -204,18 +247,34 @@ def install_request_residency():
                 req.kv.req_pool_idx, req.kv.kv_committed_len
             )
 
+        residence = expected = None
+        claim = True
+        decline_reason = None
+        claim_reason = None
+        slots_available = len(self._ekv_resident) < limit
+
+        def record_decision(actual_residence, reason):
+            remember_request_decision(
+                stats,
+                getattr(req, "rid", None),
+                actual_residence=actual_residence,
+                reason=reason,
+                requested_residence=residence,
+                expected_output_tokens=expected,
+                sequence_tokens=req.kv.kv_allocated_len,
+                native_buffer_tokens=self.device_buffer_size,
+                slots_available=slots_available,
+                tp_world_size=self.tp_world_size,
+            )
+
         def adopt_native(reason=None):
             stats["native_admissions"] += 1
             if reason is not None:
                 reasons = stats["future_decision_reasons"]
                 reasons[reason] = reasons.get(reason, 0) + 1
+            record_decision("host_backed", reason or "native")
             publish_broker_stats(self)
             original_stage(self, req)
-
-        slots_available = len(self._ekv_resident) < limit
-        claim = True
-        decline_reason = None
-        residence = expected = None
         if hint_policy == "adaptive":
             try:
                 hint = _extract_hint(req)
@@ -237,6 +296,7 @@ def install_request_residency():
                 minimum_hint_output_tokens=minimum_hint_tokens,
             )
             claim = decision.claim
+            claim_reason = decision.reason
             if not claim:
                 decline_reason = decision.reason
         elif not slots_available or req.kv.kv_allocated_len <= self.device_buffer_size:
@@ -295,6 +355,7 @@ def install_request_residency():
                 )
             if not broker_admit.item():
                 if broker_mode == "enforce":
+                    decline_reason = "broker-insufficient-growth-headroom"
                     adopt_native("broker-insufficient-growth-headroom")
                     return
                 stats["broker_dry_run_declines"] += 1
@@ -306,6 +367,10 @@ def install_request_residency():
         event.record()
         self._ekv_resident.add(req.kv.req_pool_idx)
         stats["resident_admissions"] += 1
+        record_decision(
+            "resident",
+            claim_reason or ("resident-slot" if hint_policy == "off" else "resident-claim"),
+        )
         req.hisparse_staging = True
         # Preserve native queue order, TP readiness and scheduler admission.
         self.ack_staging_queue.append(coordinator.HiSparseAct(event, event, req))

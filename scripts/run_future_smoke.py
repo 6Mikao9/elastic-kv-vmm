@@ -134,9 +134,55 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--future-policy", choices=("off", "deadline"), default="deadline"
     )
+    parser.add_argument(
+        "--plan",
+        type=Path,
+        help="execute an existing future_plan JSON rollout",
+    )
+    parser.add_argument(
+        "--workload",
+        type=Path,
+        help="plan and execute a known-future workload JSON",
+    )
+    parser.add_argument(
+        "--planning-policy",
+        choices=("fifo", "longest", "mode-aware", "future"),
+        default="future",
+    )
+    parser.add_argument(
+        "--no-hints",
+        action="store_true",
+        help="execute the timestamps as an unhinted control arm",
+    )
+    parser.add_argument(
+        "--residency-stats-dir",
+        type=Path,
+        help="read per-request, per-TP residency evidence after the rollout",
+    )
+    parser.add_argument("--require-residency-evidence", action="store_true")
+    parser.add_argument("--start-tolerance-ms", type=float, default=100.0)
+    parser.add_argument("--request-timeout-s", type=float, default=180.0)
+    parser.add_argument("--residency-evidence-timeout-s", type=float, default=5.0)
+    parser.add_argument("--max-parallel", type=int)
     args = parser.parse_args(argv)
     if not args.model_path.is_dir():
         parser.error("--model-path must be an existing directory")
+    if args.plan is not None and args.workload is not None:
+        parser.error("--plan and --workload are mutually exclusive")
+    if (
+        args.start_tolerance_ms < 0
+        or args.request_timeout_s <= 0
+        or args.residency_evidence_timeout_s < 0
+    ):
+        parser.error("request timeout must be positive; timing tolerances non-negative")
+    if args.max_parallel is not None and args.max_parallel < 1:
+        parser.error("--max-parallel must be positive")
+    if args.require_residency_evidence and args.residency_stats_dir is None:
+        parser.error("--require-residency-evidence needs --residency-stats-dir")
+    if (args.plan is not None or args.workload is not None) and args.no_hints and args.future_policy != "off":
+        parser.error("--no-hints requires --future-policy off")
+    if (args.plan is not None or args.workload is not None) and not args.no_hints and args.future_policy == "off":
+        parser.error("planned hints require --future-policy deadline; use --no-hints for control")
     output = args.output_dir.resolve()
     if output.exists():
         parser.error(f"output already exists: {output}")
@@ -145,6 +191,42 @@ def main(argv: list[str] | None = None) -> int:
     stats_path = output / "future_stats.json"
     vmm_stats_path = output / "vmm_stats.json"
     result_path = output / "results.json"
+
+    planned_submissions = None
+    plan_manifest = None
+    effective_planning_policy = args.planning_policy
+    if args.plan is not None or args.workload is not None:
+        from adaptive_sparse.future_plan import (
+            PlannerConfig,
+            RequestProfile,
+            plan_rollout,
+        )
+        from adaptive_sparse.rollout_executor import load_plan
+
+        if args.plan is not None:
+            try:
+                planned_submissions = load_plan(args.plan)
+                plan_payload = json.loads(args.plan.read_text(encoding="utf-8"))
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                parser.error(f"invalid --plan: {error}")
+            plan_manifest = plan_payload.get("rollout", plan_payload)
+            effective_planning_policy = plan_manifest.get("policy", "external")
+        else:
+            workload = json.loads(args.workload.read_text(encoding="utf-8"))
+            if not isinstance(workload, dict):
+                parser.error("--workload must contain a JSON object")
+            try:
+                config = PlannerConfig(**workload["config"])
+                requests = [RequestProfile(**item) for item in workload["requests"]]
+            except (KeyError, TypeError, ValueError) as exc:
+                parser.error(f"invalid --workload: {exc}")
+            rollout = plan_rollout(requests, config, args.planning_policy)
+            planned_submissions = rollout.submissions
+            plan_manifest = rollout.as_dict()
+        (output / "plan.json").write_text(
+            json.dumps(plan_manifest or {"submissions": []}, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
 
     env = dict(os.environ)
     env.update(
@@ -214,13 +296,28 @@ def main(argv: list[str] | None = None) -> int:
             from benchmarks.client import MemorySampler, memory_summary
 
             with MemorySampler() as sampler:
-                with ThreadPoolExecutor(max_workers=3) as pool:
-                    initial = pool.submit(generate, "initial", 256, 256, None)
-                    time.sleep(0.1)
-                    slow = pool.submit(generate, "slow", 4096, 64, None)
-                    time.sleep(0.03)
-                    urgent = pool.submit(generate, "urgent", 128, 8, 3000)
-                    rows = [item.result() for item in (initial, slow, urgent)]
+                if planned_submissions is not None:
+                    from adaptive_sparse.rollout_executor import execute_rollout
+
+                    planned_result = execute_rollout(
+                        f"{URL}/generate",
+                        planned_submissions,
+                        timeout_s=args.request_timeout_s,
+                        emit_hints=not args.no_hints,
+                        max_parallel=args.max_parallel,
+                        max_submit_lateness_ms=args.start_tolerance_ms,
+                        residency_stats_dir=args.residency_stats_dir,
+                        require_residency_evidence=args.require_residency_evidence,
+                        residency_evidence_timeout_s=args.residency_evidence_timeout_s,
+                    )
+                else:
+                    with ThreadPoolExecutor(max_workers=3) as pool:
+                        initial = pool.submit(generate, "initial", 256, 256, None)
+                        time.sleep(0.1)
+                        slow = pool.submit(generate, "slow", 4096, 64, None)
+                        time.sleep(0.03)
+                        urgent = pool.submit(generate, "urgent", 128, 8, 3000)
+                        rows = [item.result() for item in (initial, slow, urgent)]
                 sampler.take()
             nvml = memory_summary(sampler.samples)
         deadline = time.monotonic() + 2
@@ -236,6 +333,75 @@ def main(argv: list[str] | None = None) -> int:
             if args.elastic_mode != "baseline" and vmm_stats_path.exists()
             else None
         )
+        if planned_submissions is not None:
+            checks = {
+                "requests_completed": planned_result["summary"]["completed"],
+                "submit_timing_within_tolerance": (
+                    planned_result["summary"]["max_submit_lateness_ms"]
+                    <= args.start_tolerance_ms
+                ),
+            }
+            if args.future_policy != "off" and not args.no_hints:
+                checks.update(
+                    {
+                        "hook_ticks": bool(hook_stats and hook_stats.get("ticks", 0) > 0),
+                        "hint_queues_planned": bool(
+                            hook_stats
+                            and hook_stats.get("released_requests", 0)
+                            + hook_stats.get("unreleased_requests", 0)
+                            > 0
+                        ),
+                        "fallback_safe": bool(
+                            hook_stats
+                            and hook_stats.get("fallback_exception", 0) == 0
+                            and hook_stats.get("fallback_invalid_hint", 0) == 0
+                            and hook_stats.get("telemetry_errors", 0) == 0
+                        ),
+                    }
+                )
+            if args.require_residency_evidence:
+                checks["residency_evidence"] = bool(
+                    planned_result["residency_evidence"]
+                    and planned_result["residency_evidence"].get("available")
+                )
+            if args.elastic_mode != "baseline":
+                checks["vmm_active"] = bool(
+                    elastic_stats
+                    and elastic_stats.get("mode") == args.elastic_mode
+                    and elastic_stats.get("backed_bytes", 0) > 0
+                    and elastic_stats.get("backed_bytes", 0)
+                    < elastic_stats.get("logical_capacity_bytes", 0)
+                )
+            result = {
+                "status": "passed" if all(checks.values()) else "failed",
+                "checks": checks,
+                "request_count": len(planned_submissions),
+                "requests": planned_result["requests"],
+                "plan_summary": planned_result["summary"],
+                "residency_evidence": planned_result["residency_evidence"],
+                "efficiency": planned_result["summary"]["efficiency"],
+                "whole_gpu_nvml": nvml,
+                "future_stats": hook_stats,
+                "elastic_mode": args.elastic_mode,
+                "elastic_stats": elastic_stats,
+                "hint_enabled": not args.no_hints,
+                "planning_policy": effective_planning_policy,
+            }
+            result_path.write_text(
+                json.dumps(result, indent=2, sort_keys=True), encoding="utf-8"
+            )
+            print(
+                json.dumps(
+                    {
+                        "status": result["status"],
+                        "checks": checks,
+                        "summary": planned_result["summary"],
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 0 if result["status"] == "passed" else 1
+
         by_name = {row["name"]: row for row in rows}
         run_started = min(row["started_s"] for row in rows)
         run_finished = max(row["finished_s"] for row in rows)

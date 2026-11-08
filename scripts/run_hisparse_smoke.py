@@ -135,6 +135,28 @@ def resident_hint_sources(resident_limit):
     )
 
 
+def load_future_submissions(plan_path, workload_path, policy):
+    """Load or construct one executable rollout for the MiniMax runner."""
+
+    from adaptive_sparse.future_plan import (
+        PlannerConfig,
+        RequestProfile,
+        plan_rollout,
+    )
+    from adaptive_sparse.rollout_executor import load_plan
+
+    if plan_path is not None:
+        submissions = load_plan(plan_path)
+        payload = json.loads(Path(plan_path).read_text(encoding="utf-8"))
+        manifest = payload.get("rollout", payload)
+        return submissions, manifest, manifest.get("policy", "external")
+    workload = json.loads(Path(workload_path).read_text(encoding="utf-8"))
+    config = PlannerConfig(**workload["config"])
+    requests = [RequestProfile(**item) for item in workload["requests"]]
+    rollout = plan_rollout(requests, config, policy)
+    return rollout.submissions, rollout.as_dict(), policy
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", type=Path, required=True)
@@ -192,9 +214,34 @@ def main():
     parser.add_argument("--adaptive-trim-low-water", action="store_true")
     parser.add_argument("--chunk-aware-retention", action="store_true")
     parser.add_argument("--future-policy", choices=("off", "deadline"), default="off")
+    parser.add_argument("--future-plan", type=Path,
+                        help="execute a known-future rollout plan")
+    parser.add_argument("--future-workload", type=Path,
+                        help="plan and execute a known-future workload")
+    parser.add_argument("--future-planning-policy",
+                        choices=("fifo", "longest", "mode-aware", "future"),
+                        default="future")
+    parser.add_argument("--future-no-hints", action="store_true")
+    parser.add_argument("--future-start-tolerance-ms", type=float, default=100.0)
+    parser.add_argument("--future-request-timeout-s", type=float, default=600.0)
+    parser.add_argument("--future-residency-evidence-timeout-s", type=float, default=10.0)
+    parser.add_argument("--future-max-parallel", type=int)
     args = parser.parse_args()
     if not (args.model_path / "config.json").is_file() or args.tp_size < 4:
         parser.error("require a local MiniMax snapshot and TP >= 4")
+    if args.future_plan is not None and args.future_workload is not None:
+        parser.error("future plan and workload are mutually exclusive")
+    if args.future_start_tolerance_ms < 0 or args.future_request_timeout_s <= 0:
+        parser.error("future timing tolerance must be nonnegative and timeout positive")
+    if args.future_residency_evidence_timeout_s < 0:
+        parser.error("future residency evidence timeout must be nonnegative")
+    if args.future_max_parallel is not None and args.future_max_parallel < 1:
+        parser.error("future max parallelism must be positive")
+    if (args.future_plan is not None or args.future_workload is not None) and args.future_no_hints and args.future_policy != "off":
+        parser.error("future no-hints requires future policy off")
+    if ((args.future_plan is not None or args.future_workload is not None)
+            and not args.future_no_hints and args.future_policy == "off"):
+        parser.error("future plan hints require future policy deadline; use no-hints for control")
     if (args.host_ratio < 1 or args.logical_capacity <= 0
             or args.logical_capacity % (args.host_ratio * 128)
             or not 0 < args.mem_fraction_static < 1):
@@ -284,6 +331,30 @@ def main():
             parser.error("workloads require enabled benchmark and known names")
     output = args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=False)
+    future_plan_mode = args.future_plan is not None or args.future_workload is not None
+    planned_submissions = None
+    future_plan_manifest = None
+    effective_future_policy = args.future_planning_policy
+    if future_plan_mode:
+        try:
+            (
+                planned_submissions,
+                future_plan_manifest,
+                effective_future_policy,
+            ) = load_future_submissions(
+                args.future_plan,
+                args.future_workload,
+                args.future_planning_policy,
+            )
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
+            parser.error(f"invalid future plan or workload: {error}")
+        write_json(output / "future_plan.json", future_plan_manifest)
+        if any(item.prompt_tokens + item.output_tokens > 16384 for item in planned_submissions):
+            parser.error("future plan request exceeds the MiniMax context length")
+    needs_planned_resident_rows = bool(
+        planned_submissions
+        and any(item.hint.get("residence") == "resident" for item in planned_submissions)
+    )
     config = {"top_k": 2048, "device_buffer_size": 4096,
               "host_to_device_ratio": args.host_ratio}
     capacity = (args.logical_capacity // args.host_ratio
@@ -390,6 +461,8 @@ def main():
                     "elastic_kv/backing.py", "native/elastic_vmm.cpp", "native/libelastic_vmm.so")
     if args.future_policy != "off":
         sources += ("adaptive_sparse/sglang_future_hook.py", "adaptive_sparse/kv_hints_compat.py")
+    if future_plan_mode:
+        sources += ("adaptive_sparse/future_plan.py", "adaptive_sparse/rollout_executor.py")
     if args.resident_limit:
         sources += resident_hint_sources(args.resident_limit)
     if args.diagnostic_captures:
@@ -446,6 +519,9 @@ def main():
         "adaptive_settings": adaptive_settings if adaptive else None,
         "chunk_aware_retention": args.chunk_aware_retention,
         "future_policy": args.future_policy,
+        "future_plan": future_plan_manifest,
+        "future_planning_policy": effective_future_policy if future_plan_mode else None,
+        "future_hints_emitted": future_plan_mode and not args.future_no_hints,
         "sha256": {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in sources},
     })
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -459,6 +535,8 @@ def main():
                    args.resident_broker, args.resident_broker_lookahead_tokens
                ),
                "future_policy": args.future_policy,
+               "future_planning_policy": effective_future_policy if future_plan_mode else None,
+               "future_hints_emitted": future_plan_mode and not args.future_no_hints,
                "status": "running", "probes": []}
     server = None
     step = "startup"
@@ -475,6 +553,49 @@ def main():
         for length in (128, 8192):
             step = f"probe_{length}"
             results["probes"].append(probe(opener, length))
+            write_json(output / "results.json", results)
+        if future_plan_mode:
+            from adaptive_sparse.rollout_executor import execute_rollout
+            from benchmarks.client import MemorySampler, memory_summary
+
+            step = "future_plan_execution"
+            previous_gpu_uuid = os.environ.get("BENCH_GPU_UUID")
+            if gpu_uuids:
+                os.environ["BENCH_GPU_UUID"] = gpu_uuids[0]
+            try:
+                with MemorySampler() as sampler:
+                    planned_result = execute_rollout(
+                        URL + "/generate",
+                        planned_submissions,
+                        timeout_s=args.future_request_timeout_s,
+                        emit_hints=not args.future_no_hints,
+                        max_parallel=args.future_max_parallel,
+                        max_submit_lateness_ms=args.future_start_tolerance_ms,
+                        residency_stats_dir=(
+                            output / "vmm_stats"
+                            if args.vmm_backing and args.resident_limit
+                            else None
+                        ),
+                        require_residency_evidence=bool(
+                            args.vmm_backing and args.resident_limit
+                        ),
+                        residency_evidence_timeout_s=(
+                            args.future_residency_evidence_timeout_s
+                        ),
+                    )
+                    sampler.take()
+            finally:
+                if previous_gpu_uuid is None:
+                    os.environ.pop("BENCH_GPU_UUID", None)
+                else:
+                    os.environ["BENCH_GPU_UUID"] = previous_gpu_uuid
+            write_json(output / "future_execution.json", planned_result)
+            results["future_execution"] = {
+                "summary": planned_result["summary"],
+                "residency_evidence": planned_result["residency_evidence"],
+                "rank0_whole_gpu_nvml": memory_summary(sampler.samples),
+            }
+            results["future_requests"] = planned_result["requests"]
             write_json(output / "results.json", results)
         if args.diagnostic_captures:
             from benchmarks.hisparse_correctness import main as diagnose
@@ -546,8 +667,12 @@ def main():
                 ready = len(snapshots) == args.tp_size and all(
                     item["owned_pages"] == 0 and item["reclaimable_bytes"] == 0 for item in snapshots)
                 if args.resident_limit:
-                    ready = ready and all(item.get("request_residency", {}).get(
-                        "resident_layer_rows", 0) > 0 for item in snapshots)
+                    require_resident_rows = (
+                        needs_planned_resident_rows if future_plan_mode else True
+                    )
+                    if require_resident_rows:
+                        ready = ready and all(item.get("request_residency", {}).get(
+                            "resident_layer_rows", 0) > 0 for item in snapshots)
                     if args.validation_rounds:
                         ready = ready and all(item.get("request_residency", {}).get(
                             "mixed_decode_batches", 0) > 0 for item in snapshots)

@@ -1,6 +1,9 @@
 import argparse
 from contextlib import redirect_stderr
 from io import StringIO
+import json
+from pathlib import Path
+import tempfile
 import unittest
 
 from scripts.run_hisparse_smoke import (
@@ -9,12 +12,52 @@ from scripts.run_hisparse_smoke import (
     resident_hint_environment,
     resident_hint_manifest,
     resident_hint_sources,
+    load_future_submissions,
     validate_resident_hint_options,
     validate_resident_broker_options,
 )
 
 
 class ResidentHintRunnerOptionsTest(unittest.TestCase):
+    def test_future_workload_and_emitted_plan_are_executable(self):
+        workload = {
+            "config": {
+                "memory_budget_bytes": 1_000_000,
+                "kv_bytes_per_token": 100,
+                "prefill_workspace_bytes_per_token": 1,
+            },
+            "requests": [
+                {
+                    "request_id": "tool-0",
+                    "arrival_ms": 10,
+                    "prompt_tokens": 128,
+                    "output_tokens": 16,
+                    "kind": "tool",
+                    "deadline_ms": 500,
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workload_path = root / "workload.json"
+            workload_path.write_text(json.dumps(workload), encoding="utf-8")
+            submissions, manifest, policy = load_future_submissions(
+                None, workload_path, "future"
+            )
+            plan_path = root / "plan.json"
+            plan_path.write_text(
+                json.dumps({"rollout": manifest}), encoding="utf-8"
+            )
+            loaded, loaded_manifest, loaded_policy = load_future_submissions(
+                plan_path, None, "fifo"
+            )
+
+        self.assertEqual(policy, "future")
+        self.assertEqual(loaded_policy, "future")
+        self.assertEqual(submissions, loaded)
+        self.assertEqual(manifest, loaded_manifest)
+        self.assertEqual(loaded[0].deadline_ms, 500)
+
     def test_environment_manifest_and_sources_are_consistent(self):
         self.assertEqual(
             resident_hint_environment("adaptive", 128, 2),

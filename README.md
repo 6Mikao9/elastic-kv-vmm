@@ -109,6 +109,11 @@ their own implementation. The VMM adapter and future-ordering hook can therefore
 share one process without changing sampling or attention behavior. See [the
 compatibility boundary](docs/KV_HINTS_COMPAT.md), [scheduler integration
 design](docs/FUTURE_PLANNER_DESIGN.md), and [smoke script](scripts/container_future_smoke.sh).
+The known-future planner now has a live executor that consumes its
+`submit_at_ms` schedule, fails on malformed or late submissions, preserves the
+original absolute deadline, and records planned versus actual latency and
+residency. A matching unhinted control arm can be run with `--no-hints` for
+paired real-serving measurements.
 The 0.5.17 API and request-transport tests pass; a real model server could not
 start on the available 5090 host because PyTorch CUDA initialization failed after
 container `nvidia-smi` succeeded. That blocker is recorded without converting it

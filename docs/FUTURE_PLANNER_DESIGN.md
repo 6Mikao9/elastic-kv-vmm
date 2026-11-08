@@ -202,6 +202,60 @@ python scripts/future_plan_compare.py \
   --output results/future-planning/known-future-rollout.json
 ```
 
+`adaptive_sparse/rollout_executor.py` 是这个计划与真实 SGLang HTTP 服务之间的
+执行边界。它按 `submit_at_ms` 单调唤醒，发送确定性的 tokenized prompt，并把
+同一份计划任务包成 `kv_hints`。每条执行记录同时保存计划/实际提交与完成时间、
+提交抖动、deadline 目标、deadline 命中、TTFT、TPOT 和输出 token 数。计划中的
+`deadline_ms` 保留原始绝对期限；每次实际发送前，runtime hint 的
+`deadline_after_ms` 会按本次真实提交时刻重新计算，避免传输抖动悄悄延长期限。
+
+执行器在发出任何 HTTP 请求之前拒绝以下不一致：重复 ID、到达时间晚于提交时间、
+预估完成早于提交、hint 的 `kind` 或输出长度与 submission 不同、控制器填充了
+非零 `release_after_ms`、相对 deadline 与原始绝对 deadline 不一致，以及
+`max_parallel=0`。实际请求启动超过允许抖动、响应 token 数不足或 TP rank 对同一
+请求的驻留结论不一致，都会使整轮实验失败。应用 deadline miss 则作为结果保留，
+不会伪装成传输失败。
+
+吞吐使用“最早计划到达至最晚实际完成”的 makespan，包含策略刻意引入的空转；
+另记录从最早实际提交开始的服务窗口吞吐，便于区分调度收益和请求处理速度。
+real-serving 对照必须使用不同输出目录交错运行同一请求集合：
+
+```bash
+python3 scripts/run_future_smoke.py \
+  --model-path /model \
+  --output-dir results/future-planning/fifo-no-hints \
+  --workload benchmarks/workloads/known-future-rollout.json \
+  --planning-policy fifo --future-policy off --no-hints
+
+python3 scripts/run_future_smoke.py \
+  --model-path /model \
+  --output-dir results/future-planning/future-hints \
+  --workload benchmarks/workloads/known-future-rollout.json \
+  --planning-policy future --future-policy deadline
+```
+
+对 MiniMax HiSparse 运行，额外传入 `--residency-stats-dir` 和
+`--require-residency-evidence`。执行器会读取所有 `tp-*.json`，逐个请求核对
+`planned_residence` 与 `actual_residence`，并要求各 TP rank 对实际模式一致。
+只有这一证据存在时，才能把“计划让哪些请求驻留”与端到端性能一起分析。
+
+`run_hisparse_smoke.py` 也已接入同一个执行器。计划模式会自动读取
+`vmm_stats/tp-*.json`，并在 VMM 和请求驻留同时启用时要求完整的逐请求、逐 rank
+证据后方可完成：
+
+```bash
+bash scripts/container_hisparse_smoke.sh \
+  0,2,3,4 /path/to/MiniMax-M3.1-Flash native \
+  results/hisparse-plan/future-hints \
+  --sm80-bf16-projections --vmm-backing --resident-limit 2 \
+  --resident-free-reserve 4096 --resident-hint-policy adaptive \
+  --future-workload benchmarks/workloads/known-future-rollout.json \
+  --future-planning-policy future --future-policy deadline
+```
+
+不带 hint 的对照使用 `--future-policy off --future-no-hints`；规划时间轴仍按同一
+workload 生成，但服务端执行原生排队。两次运行必须写到不同目录。
+
 当有限 horizon 内的高价值请求即将到来、当前长 prefill 会让它错过硬期限，而
 短暂空转能保住期限时，`future` 策略允许 idle 到该请求到达。这里控制的是
 orchestrator 的真实提交时刻；runtime hook 中的 `release_after_ms` 仍只是软排序
