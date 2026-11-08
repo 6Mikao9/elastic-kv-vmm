@@ -13,7 +13,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import wraps
-import math
 import time
 from types import ModuleType
 from typing import Any, Mapping, Optional

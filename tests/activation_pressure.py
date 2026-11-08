@@ -31,7 +31,7 @@ def run(policy, report):
         raise RuntimeError("Expose exactly one isolated GPU to this fixture")
     cuda.set_device(0)
     pynvml.nvmlInit()
-    backing = ballast = raw = cached = None
+    backing = ballast = raw = None
     try:
         uuid = os.environ.get("BENCH_GPU_UUID") or getattr(cuda.get_device_properties(0), "uuid", None)
         if uuid is None:
@@ -56,7 +56,7 @@ def run(policy, report):
         raw[CHUNK].fill_(29)
         cuda.synchronize(0)
         cached = torch.empty(GIB, dtype=torch.uint8, device="cuda:0")
-        cached = None
+        del cached
         free = sample("warm_and_cached")
         # Leave a little room for allocator rounding, with one bounded allocation.
         ballast_bytes = (free - GIB - 32 * MIB) // CHUNK * CHUNK
@@ -109,7 +109,7 @@ def run(policy, report):
         report["backing_metrics"] = backing.metrics
         sample("after_ensure")
     finally:
-        raw = cached = ballast = None
+        del raw, ballast
         try:
             if backing is not None:
                 backing.close()

@@ -133,7 +133,7 @@ def main():
             json.dump(report, stream, indent=2)
         print(json.dumps(report, indent=2))
     finally:
-        rows = raw = view = expected = output = table = offsets = None
+        rows = raw = view = expected = output = table = offsets = None  # noqa: F841
         arena.close()
 
 
