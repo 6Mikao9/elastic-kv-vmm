@@ -29,7 +29,12 @@ from .elastic_admission import (
     decide_elastic_admission,
 )
 from .future_plan import RolloutPlan, RolloutSubmission
-from .sglang_future_hook import ACTION_VERSION, FutureHint
+from .service_time import ServiceTimeEstimator
+from .sglang_future_hook import (
+    ACTION_VERSION,
+    LEGACY_ACTION_VERSION,
+    FutureHint,
+)
 
 
 class RolloutExecutionError(RuntimeError):
@@ -68,6 +73,8 @@ def make_kv_hints(
     deadline_after_ms: int | None = None,
     residence_override: str | None = None,
     clock_now_s: float | None = None,
+    prefill_tokens_per_s: float | None = None,
+    decode_tokens_per_s: float | None = None,
 ) -> dict[str, object]:
     """Wrap a planner payload in the SGLang versioned hint envelope."""
 
@@ -92,6 +99,21 @@ def make_kv_hints(
                 f"invalid runtime residence override: {residence_override!r}"
             )
         payload["residence"] = residence_override
+    if prefill_tokens_per_s is not None:
+        payload["prefill_tokens_per_s"] = prefill_tokens_per_s
+    if decode_tokens_per_s is not None:
+        payload["decode_tokens_per_s"] = decode_tokens_per_s
+    # Revalidate the complete payload after runtime overrides.  A malformed
+    # feedback value must fail before any request reaches the server.
+    try:
+        FutureHint.from_payload(payload)
+    except (TypeError, ValueError) as exc:
+        raise RolloutExecutionError(f"invalid runtime service-time hint: {exc}") from exc
+    action_version = (
+        ACTION_VERSION
+        if prefill_tokens_per_s is not None or decode_tokens_per_s is not None
+        else LEGACY_ACTION_VERSION
+    )
     request_id = submission.request_id
     return {
         "protocol_version": "1",
@@ -100,7 +122,7 @@ def make_kv_hints(
             {
                 "action_id": f"{request_id}:future",
                 "action_type": "elastic.future",
-                "action_version": ACTION_VERSION,
+                "action_version": action_version,
                 "payload": payload,
             }
         ],
@@ -386,6 +408,8 @@ class _PendingRequest:
     dispatch_lateness_ms: float
     capacity_delay_ms: float
     admission: ElasticAdmissionDecision | None
+    prefill_tokens_per_s_hint: float | None = None
+    decode_tokens_per_s_hint: float | None = None
 
     @property
     def hold_bytes(self) -> int:
@@ -535,6 +559,7 @@ def _execute_managed_rollout(
     clock: ReplayClock,
     generate: Callable[[str, dict[str, object], float, bool], dict[str, object]],
     poll_interval_s: float,
+    service_time_estimator: ServiceTimeEstimator | None = None,
 ) -> tuple[list[dict[str, object]], list[str]]:
     """Dispatch through an observed in-flight set and aggregate byte budget."""
 
@@ -563,18 +588,33 @@ def _execute_managed_rollout(
             pending.remove(item)
             try:
                 record = item.future.result()
-                rows.append(
-                    _measure_result(
-                        item.submission,
-                        record,
-                        origin=origin,
-                        dispatch_lateness_ms=item.dispatch_lateness_ms,
-                        capacity_delay_ms=item.capacity_delay_ms,
-                        admission=item.admission,
-                        max_submit_lateness_ms=max_submit_lateness_ms,
-                        strict_submit_timing=False,
-                    )
+                row = _measure_result(
+                    item.submission,
+                    record,
+                    origin=origin,
+                    dispatch_lateness_ms=item.dispatch_lateness_ms,
+                    capacity_delay_ms=item.capacity_delay_ms,
+                    admission=item.admission,
+                    max_submit_lateness_ms=max_submit_lateness_ms,
+                    strict_submit_timing=False,
                 )
+                row["service_time_prefill_tokens_per_s_hint"] = (
+                    item.prefill_tokens_per_s_hint
+                )
+                row["service_time_decode_tokens_per_s_hint"] = (
+                    item.decode_tokens_per_s_hint
+                )
+                if service_time_estimator is not None:
+                    try:
+                        service_time_estimator.observe(
+                            prompt_tokens=item.submission.prompt_tokens,
+                            output_tokens=item.submission.output_tokens,
+                            ttft_s=float(record["ttft_s"]),
+                            tpot_s=float(record["tpot_s"]),
+                        )
+                    except (TypeError, ValueError):
+                        service_time_estimator.record_rejected_sample()
+                rows.append(row)
             except Exception as exc:
                 failures.append(
                     f"{item.submission.request_id}: {type(exc).__name__}: {exc}"
@@ -630,6 +670,11 @@ def _execute_managed_rollout(
             dispatch_ms = (clock.now() - origin) * 1000.0
             dispatch_lateness_ms = dispatch_ms - submission.submit_at_ms
             capacity_delay_ms = max(0.0, dispatch_lateness_ms)
+            feedback_rates = (
+                {}
+                if service_time_estimator is None
+                else service_time_estimator.rates()
+            )
             spec: dict[str, object] = {
                 "request_id": submission.request_id,
                 "input_tokens": submission.prompt_tokens,
@@ -658,6 +703,12 @@ def _execute_managed_rollout(
                         == FutureHint.from_payload(dict(submission.hint)).residence
                         else admission.chosen_residence
                     ),
+                    prefill_tokens_per_s=feedback_rates.get(
+                        "prefill_tokens_per_s"
+                    ),
+                    decode_tokens_per_s=feedback_rates.get(
+                        "decode_tokens_per_s"
+                    ),
                 )
             queue.remove(submission)
             future = pool.submit(generate, url, spec, timeout_s, stream)
@@ -668,6 +719,12 @@ def _execute_managed_rollout(
                     dispatch_lateness_ms=dispatch_lateness_ms,
                     capacity_delay_ms=capacity_delay_ms,
                     admission=admission,
+                    prefill_tokens_per_s_hint=feedback_rates.get(
+                        "prefill_tokens_per_s"
+                    ),
+                    decode_tokens_per_s_hint=feedback_rates.get(
+                        "decode_tokens_per_s"
+                    ),
                 )
             )
         harvest()
@@ -796,6 +853,7 @@ def execute_rollout(
     elastic_kv_config: ElasticKVConfig | None = None,
     allow_deadline_overcommit: bool = True,
     poll_interval_ms: float = 10.0,
+    service_time_estimator: ServiceTimeEstimator | None = None,
 ) -> dict[str, object]:
     """Run every planned request and return measured, JSON-safe evidence."""
 
@@ -822,7 +880,8 @@ def execute_rollout(
     if poll_interval_ms <= 0 or not math.isfinite(poll_interval_ms):
         raise ValueError("poll_interval_ms must be finite and positive")
     managed = (
-        max_inflight is not None
+        service_time_estimator is not None
+        or max_inflight is not None
         or queue_policy != "timeline"
         or elastic_kv_config is not None
     )
@@ -842,10 +901,11 @@ def execute_rollout(
             clock=replay_clock,
             generate=generate,
             poll_interval_s=poll_interval_ms / 1000.0,
+            service_time_estimator=service_time_estimator,
         )
         if failures:
             raise RolloutExecutionError("; ".join(failures))
-        return _finalize_rollout(
+        result = _finalize_rollout(
             rows,
             submissions,
             clock=replay_clock,
@@ -853,6 +913,11 @@ def execute_rollout(
             require_residency_evidence=require_residency_evidence,
             residency_evidence_timeout_s=residency_evidence_timeout_s,
         )
+        if service_time_estimator is not None:
+            result["summary"]["service_time_estimator"] = (
+                service_time_estimator.snapshot().as_dict()
+            )
+        return result
     origin = replay_clock.now()
     pending = []
     with ThreadPoolExecutor(max_workers=worker_count) as pool:

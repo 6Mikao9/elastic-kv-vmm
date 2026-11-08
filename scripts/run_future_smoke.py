@@ -4,17 +4,16 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
 import json
 import os
-from pathlib import Path
 import socket
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
-
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = 31180
@@ -154,6 +153,12 @@ def main(argv: list[str] | None = None) -> int:
         help="execute the timestamps as an unhinted control arm",
     )
     parser.add_argument(
+        "--service-time-feedback",
+        action="store_true",
+        help="update later v3 hints from completed requests' TTFT and TPOT",
+    )
+    parser.add_argument("--service-time-ewma-alpha", type=float, default=0.2)
+    parser.add_argument(
         "--residency-stats-dir",
         type=Path,
         help="read per-request, per-TP residency evidence after the rollout",
@@ -206,6 +211,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--no-hints requires --future-policy off")
     if args.no_hints and args.elastic_residency_budget:
         parser.error("--elastic-residency-budget requires emitted future hints")
+    if args.service_time_feedback and (args.plan is None and args.workload is None):
+        parser.error("--service-time-feedback requires --plan or --workload")
+    if args.service_time_feedback and args.no_hints:
+        parser.error("--service-time-feedback requires emitted future hints")
+    if not 0 < args.service_time_ewma_alpha <= 1:
+        parser.error("--service-time-ewma-alpha must be in (0, 1]")
     if (args.plan is not None or args.workload is not None) and not args.no_hints and args.future_policy == "off":
         parser.error("planned hints require --future-policy deadline; use --no-hints for control")
     output = args.output_dir.resolve()
@@ -330,10 +341,11 @@ def main(argv: list[str] | None = None) -> int:
 
             with MemorySampler() as sampler:
                 if planned_submissions is not None:
-                    from adaptive_sparse.rollout_executor import execute_rollout
                     from adaptive_sparse.elastic_admission import (
                         elastic_config_from_planner,
                     )
+                    from adaptive_sparse.rollout_executor import execute_rollout
+                    from adaptive_sparse.service_time import ServiceTimeEstimator
 
                     elastic_config = None
                     if args.elastic_residency_budget:
@@ -358,6 +370,11 @@ def main(argv: list[str] | None = None) -> int:
                         elastic_kv_config=elastic_config,
                         allow_deadline_overcommit=not args.forbid_deadline_overcommit,
                         poll_interval_ms=args.poll_interval_ms,
+                        service_time_estimator=(
+                            ServiceTimeEstimator(alpha=args.service_time_ewma_alpha)
+                            if args.service_time_feedback
+                            else None
+                        ),
                     )
                 else:
                     with ThreadPoolExecutor(max_workers=3) as pool:
@@ -434,6 +451,8 @@ def main(argv: list[str] | None = None) -> int:
                 "elastic_mode": args.elastic_mode,
                 "elastic_stats": elastic_stats,
                 "hint_enabled": not args.no_hints,
+                "service_time_feedback": args.service_time_feedback,
+                "service_time_ewma_alpha": args.service_time_ewma_alpha,
                 "planning_policy": effective_planning_policy,
                 "max_inflight": args.max_inflight,
                 "queue_policy": args.queue_policy,

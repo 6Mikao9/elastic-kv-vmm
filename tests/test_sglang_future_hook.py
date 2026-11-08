@@ -135,6 +135,55 @@ class SGLangFutureHookTest(unittest.TestCase):
                 {"prefix_group": "group", "shared_prefix_tokens": True}
             )
 
+    def test_v3_measured_rates_override_defaults_per_request(self):
+        slow = request(
+            "slow",
+            100,
+            1.0,
+            {
+                "expected_output_tokens": 100,
+                "prefill_tokens_per_s": 100,
+                "decode_tokens_per_s": 100,
+            },
+            version="3",
+        )
+        fast = request(
+            "fast",
+            100,
+            1.0,
+            {
+                "expected_output_tokens": 100,
+                "prefill_tokens_per_s": 10_000,
+                "decode_tokens_per_s": 10_000,
+            },
+            version="3",
+        )
+
+        ordered = order_requests(
+            [slow, fast],
+            now_s=1.01,
+            prefill_tokens_per_s=1,
+            decode_tokens_per_s=1,
+        )
+
+        self.assertEqual([item.request_id for item in ordered], ["fast", "slow"])
+
+    def test_service_rates_are_rejected_from_older_action_versions(self):
+        legacy = request(
+            "legacy",
+            100,
+            1.0,
+            {"prefill_tokens_per_s": 100, "decode_tokens_per_s": 100},
+            version="2",
+        )
+        with self.assertRaisesRegex(ValueError, "version 3"):
+            hook._extract_hint(legacy)
+
+    def test_service_rates_require_finite_positive_values(self):
+        for value in (0, -1, True, float("inf")):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                hook.FutureHint.from_payload({"prefill_tokens_per_s": value})
+
     def test_deadline_reorders_after_native_priority(self):
         long = request(
             "long",

@@ -60,6 +60,13 @@ latency. Version 1 remains accepted for relative-only hints. The executor and
 server must share a host for the current clock-domain guarantee; cross-host use
 requires a calibrated wall-clock protocol.
 
+Action version 3 adds optional `prefill_tokens_per_s` and
+`decode_tokens_per_s` fields. The rollout executor emits version 2 until the
+closed-loop estimator has a valid completion sample, then emits version 3 for
+later requests. Both rates must be finite and within the bounded service-rate
+range. Older action versions remain accepted, but carrying either rate in a
+version 1 or 2 action is rejected so old and new semantics cannot be confused.
+
 `residence` accepts `auto`, `resident` or `host_backed`. It is inert unless the
 request-residency adapter is compiled into the run and
 `EKV_RESIDENT_HINT_POLICY=adaptive` is set. `resident` requests a complete-GPU

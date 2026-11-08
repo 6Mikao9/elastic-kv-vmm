@@ -5,7 +5,6 @@ import hashlib
 import json
 import math
 import os
-from pathlib import Path
 import signal
 import subprocess
 import sys
@@ -13,9 +12,10 @@ import time
 import urllib.error
 import urllib.request
 import zipfile
+from pathlib import Path
 
-from scripts.run_case import HOST, PORT, ROOT, leader_exit, on_sigterm, stop_server
 from benchmarks.client import digest_ids, prompt_ids, write_json
+from scripts.run_case import HOST, PORT, ROOT, leader_exit, on_sigterm, stop_server
 
 
 def server_base_url(host, port):
@@ -372,6 +372,8 @@ def main():
                         choices=("fifo", "longest", "mode-aware", "future", "oracle"),
                         default="future")
     parser.add_argument("--future-no-hints", action="store_true")
+    parser.add_argument("--future-service-time-feedback", action="store_true")
+    parser.add_argument("--future-service-time-ewma-alpha", type=float, default=0.2)
     parser.add_argument("--future-start-tolerance-ms", type=float, default=100.0)
     parser.add_argument("--future-request-timeout-s", type=float, default=600.0)
     parser.add_argument("--future-residency-evidence-timeout-s", type=float, default=10.0)
@@ -404,6 +406,13 @@ def main():
         parser.error("future no-hints requires future policy off")
     if args.future_no_hints and args.future_elastic_residency_budget:
         parser.error("future elastic residency budget requires emitted future hints")
+    if (args.future_service_time_feedback
+            and args.future_plan is None and args.future_workload is None):
+        parser.error("future service-time feedback requires a future plan or workload")
+    if args.future_service_time_feedback and args.future_no_hints:
+        parser.error("future service-time feedback requires emitted future hints")
+    if not 0 < args.future_service_time_ewma_alpha <= 1:
+        parser.error("future service-time EWMA alpha must be in (0, 1]")
     if args.future_plan is None and args.future_workload is None:
         if args.future_max_inflight is not None:
             parser.error("future max-inflight requires a future plan or workload")
@@ -692,6 +701,8 @@ def main():
             "adaptive_sparse/rollout_executor.py",
             "adaptive_sparse/elastic_admission.py",
         )
+    if args.future_service_time_feedback:
+        sources += ("adaptive_sparse/service_time.py",)
     if args.resident_limit:
         sources += resident_hint_sources(args.resident_limit)
     if args.diagnostic_captures:
@@ -764,6 +775,8 @@ def main():
         "future_plan": future_plan_manifest,
         "future_planning_policy": effective_future_policy if future_plan_mode else None,
         "future_hints_emitted": future_plan_mode and not args.future_no_hints,
+        "future_service_time_feedback": args.future_service_time_feedback,
+        "future_service_time_ewma_alpha": args.future_service_time_ewma_alpha,
         "future_max_inflight": args.future_max_inflight,
         "future_queue_policy": args.future_queue_policy,
         "future_elastic_residency_budget": args.future_elastic_residency_budget,
@@ -795,6 +808,8 @@ def main():
                "future_policy": args.future_policy,
                "future_planning_policy": effective_future_policy if future_plan_mode else None,
                "future_hints_emitted": future_plan_mode and not args.future_no_hints,
+               "future_service_time_feedback": args.future_service_time_feedback,
+               "future_service_time_ewma_alpha": args.future_service_time_ewma_alpha,
                "future_max_inflight": args.future_max_inflight,
                "future_queue_policy": args.future_queue_policy,
                "future_elastic_residency_budget": args.future_elastic_residency_budget,
@@ -817,8 +832,9 @@ def main():
             results["probes"].append(probe(opener, length, base_url))
             write_json(output / "results.json", results)
         if future_plan_mode:
-            from adaptive_sparse.rollout_executor import execute_rollout
             from adaptive_sparse.elastic_admission import elastic_config_from_planner
+            from adaptive_sparse.rollout_executor import execute_rollout
+            from adaptive_sparse.service_time import ServiceTimeEstimator
             from benchmarks.client import MemorySampler, memory_summary
 
             elastic_config = None
@@ -860,6 +876,13 @@ def main():
                             not args.future_forbid_deadline_overcommit
                         ),
                         poll_interval_ms=args.future_poll_interval_ms,
+                        service_time_estimator=(
+                            ServiceTimeEstimator(
+                                alpha=args.future_service_time_ewma_alpha
+                            )
+                            if args.future_service_time_feedback
+                            else None
+                        ),
                     )
                     sampler.take()
             finally:

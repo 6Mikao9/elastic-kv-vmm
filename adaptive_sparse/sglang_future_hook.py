@@ -16,9 +16,17 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Iterable
 
+from .service_time import (
+    DEFAULT_DECODE_TOKENS_PER_S,
+    DEFAULT_PREFILL_TOKENS_PER_S,
+    MAX_SERVICE_RATE,
+    MIN_SERVICE_RATE,
+)
+
 ACTION_TYPE = "elastic.future"
-ACTION_VERSION = "2"
-SUPPORTED_ACTION_VERSIONS = frozenset(("1", "2"))
+ACTION_VERSION = "3"
+LEGACY_ACTION_VERSION = "2"
+SUPPORTED_ACTION_VERSIONS = frozenset(("1", "2", ACTION_VERSION))
 POLICY_ENV = "EKV_FUTURE_POLICY"
 STATS_PATH_ENV = "EKV_FUTURE_STATS_PATH"
 HORIZON_ENV = "EKV_FUTURE_ORDERING_HORIZON_MS"
@@ -53,6 +61,8 @@ class FutureHint:
     residence: str | None = None
     prefix_group: str | None = None
     shared_prefix_tokens: int = 0
+    prefill_tokens_per_s: float | None = None
+    decode_tokens_per_s: float | None = None
 
     @classmethod
     def from_payload(cls, payload: Any) -> "FutureHint":
@@ -69,6 +79,8 @@ class FutureHint:
             "residence",
             "prefix_group",
             "shared_prefix_tokens",
+            "prefill_tokens_per_s",
+            "decode_tokens_per_s",
         }
         unknown = set(payload) - allowed
         if unknown:
@@ -127,6 +139,12 @@ class FutureHint:
         )
         if shared_prefix_tokens and prefix_group is None:
             raise ValueError("prefix_group is required for shared_prefix_tokens")
+        prefill_tokens_per_s = _optional_rate(
+            payload.get("prefill_tokens_per_s"), "prefill_tokens_per_s"
+        )
+        decode_tokens_per_s = _optional_rate(
+            payload.get("decode_tokens_per_s"), "decode_tokens_per_s"
+        )
         return cls(
             release,
             deadline,
@@ -138,6 +156,8 @@ class FutureHint:
             residence,
             prefix_group,
             shared_prefix_tokens,
+            prefill_tokens_per_s,
+            decode_tokens_per_s,
         )
 
 
@@ -155,6 +175,21 @@ def _bounded_int64(value: Any, name: str) -> int:
     if not 0 <= value <= (1 << 63) - 1:
         raise ValueError(f"{name} is outside the supported range")
     return value
+
+
+def _optional_rate(value: Any, name: str) -> float | None:
+    if value is None:
+        return None
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or not MIN_SERVICE_RATE <= float(value) <= MAX_SERVICE_RATE
+    ):
+        raise ValueError(
+            f"{name} must be finite and in [{MIN_SERVICE_RATE}, {MAX_SERVICE_RATE}]"
+        )
+    return float(value)
 
 
 def _extract_hint(request: Any) -> FutureHint | None:
@@ -176,6 +211,11 @@ def _extract_hint(request: Any) -> FutureHint | None:
     hint = FutureHint.from_payload(getattr(action, "payload", None))
     if action_version == "1" and hint.deadline_clock is not None:
         raise ValueError("action version 1 cannot carry an absolute deadline clock")
+    if action_version != ACTION_VERSION and (
+        hint.prefill_tokens_per_s is not None
+        or hint.decode_tokens_per_s is not None
+    ):
+        raise ValueError("service-time rates require action version 3")
     return hint
 
 
@@ -229,8 +269,8 @@ def order_requests(
     requests: Iterable[Any],
     *,
     now_s: float,
-    prefill_tokens_per_s: float = 8_000.0,
-    decode_tokens_per_s: float = 20_000.0,
+    prefill_tokens_per_s: float = DEFAULT_PREFILL_TOKENS_PER_S,
+    decode_tokens_per_s: float = DEFAULT_DECODE_TOKENS_PER_S,
     priority_sign: int | None = None,
     horizon_ms: int | None = None,
 ) -> list[Any]:
@@ -244,6 +284,14 @@ def order_requests(
     queue = list(requests)
     if not queue:
         return queue
+    prefill_tokens_per_s = _optional_rate(
+        prefill_tokens_per_s, "prefill_tokens_per_s"
+    )
+    decode_tokens_per_s = _optional_rate(
+        decode_tokens_per_s, "decode_tokens_per_s"
+    )
+    if prefill_tokens_per_s is None or decode_tokens_per_s is None:
+        raise ValueError("default service-time rates must be finite and positive")
     decorated_hints = []
     for request in queue:
         hint = _extract_hint(request)
@@ -273,10 +321,18 @@ def order_requests(
         zip(queue, decorated_hints)
     ):
         released = age_ms >= hint.release_after_ms
-        prefill_ms = 1000.0 * _prompt_tokens(request) / prefill_tokens_per_s
+        request_prefill_rate = (
+            hint.prefill_tokens_per_s or prefill_tokens_per_s
+        )
+        request_decode_rate = hint.decode_tokens_per_s or decode_tokens_per_s
+        prefill_ms = 1000.0 * _prompt_tokens(request) / request_prefill_rate
         if hint.deadline_after_ms is not None and hint.expected_output_tokens is None:
             raise ValueError("deadline planning requires expected_output_tokens")
-        decode_ms = 1000.0 * (hint.expected_output_tokens or 1) / decode_tokens_per_s
+        decode_ms = (
+            1000.0
+            * (hint.expected_output_tokens or 1)
+            / request_decode_rate
+        )
         estimated_request_ms = prefill_ms + decode_ms
         remaining_deadline_ms = deadline_remaining_ms(
             hint, now_s=now_s, age_ms=age_ms

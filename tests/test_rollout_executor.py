@@ -21,6 +21,7 @@ from adaptive_sparse.rollout_executor import (
     load_plan,
     make_kv_hints,
 )
+from adaptive_sparse.service_time import ServiceTimeEstimator
 
 
 class FakeClock:
@@ -98,6 +99,71 @@ class RolloutExecutorTest(unittest.TestCase):
         )
         demoted = make_kv_hints(submission(), residence_override="host_backed")
         self.assertEqual(demoted["actions"][0]["payload"]["residence"], "host_backed")
+
+    def test_rejects_invalid_runtime_service_time_rate_before_dispatch(self):
+        with self.assertRaisesRegex(
+            RolloutExecutionError,
+            "invalid runtime service-time hint",
+        ):
+            make_kv_hints(submission(), prefill_tokens_per_s=0)
+
+    def test_measured_rates_upgrade_only_later_hints_to_v3(self):
+        base = submission()
+        hints = {
+            key: value
+            for key, value in base.hint.items()
+            if key != "deadline_after_ms"
+        }
+        rows = [
+            RolloutSubmission(
+                request_id=request_id,
+                planned_arrival_ms=0,
+                submit_at_ms=0,
+                estimated_finish_ms=20,
+                kind="tool",
+                prompt_tokens=32,
+                output_tokens=8,
+                hint=dict(hints),
+            )
+            for request_id in ("first", "second")
+        ]
+        seen = {}
+
+        def generate(url, spec, timeout, stream):
+            seen[spec["request_id"]] = spec["future_hint"]
+            return {
+                "_started_perf_s": time.perf_counter(),
+                "end_to_end_s": 0.01,
+                "output_tokens": 8,
+                "ttft_s": 0.008,
+                "tpot_s": 0.001,
+            }
+
+        estimator = ServiceTimeEstimator(alpha=1.0)
+        result = execute_rollout(
+            "http://server/generate",
+            rows,
+            generator=generate,
+            max_inflight=1,
+            poll_interval_ms=1,
+            max_submit_lateness_ms=10_000,
+            service_time_estimator=estimator,
+        )
+
+        self.assertEqual(seen["first"]["actions"][0]["action_version"], "2")
+        second_action = seen["second"]["actions"][0]
+        self.assertEqual(second_action["action_version"], "3")
+        self.assertEqual(second_action["payload"]["prefill_tokens_per_s"], 4_000.0)
+        self.assertEqual(second_action["payload"]["decode_tokens_per_s"], 1_000.0)
+        telemetry = result["summary"]["service_time_estimator"]
+        self.assertEqual(telemetry["prefill_samples"], 2)
+        self.assertEqual(telemetry["decode_samples"], 2)
+        by_id = {row["request_id"]: row for row in result["requests"]}
+        self.assertIsNone(by_id["first"]["service_time_prefill_tokens_per_s_hint"])
+        self.assertEqual(
+            by_id["second"]["service_time_prefill_tokens_per_s_hint"],
+            4_000.0,
+        )
 
     def test_runtime_budget_demotes_only_the_new_request(self):
         base = submission()

@@ -78,8 +78,10 @@ Mamba 和 paged allocator 约束仍由原生 `PrefillAdder` 决定。规划器�
 action version 2 在 HTTP 实际发送时同时写入 `deadline_after_ms` 和同机
 `perf_counter` 时钟域下的 `deadline_absolute_ms`。scheduler 接收请求后使用绝对
 值计算剩余时间，因此网络、tokenization 和跨进程排队不会被误算成额外 slack。
-旧 action version 1 仍按 scheduler 相对时间解释，以保持兼容；新执行器只发送
-version 2。该绝对时钟假定 orchestrator 与 SGLang 位于同一主机。跨机部署需要
+旧 action version 1 仍按 scheduler 相对时间解释，以保持兼容。执行器默认发送
+version 2；启用实测服务时间反馈后，取得样本的后续请求升级为 version 3，并
+额外携带 `prefill_tokens_per_s` 与 `decode_tokens_per_s`。该绝对时钟假定
+orchestrator 与 SGLang 位于同一主机。跨机部署需要
 改用经过校准的 Unix clock 或显式时钟偏移。所有数字都要做有限值、非负值和上限
 校验。`kv_hints` 是受信任 orchestrator 的内部提示通道，不应当成任意应用客户端
 的安全控制接口。
@@ -184,15 +186,41 @@ MVP 不求解任意加权优化问题，而是使用可解释的字典序，避�
 7. `chunked_req` 不参与重排，当前 chunk 必须先完成；
 8. 只改变合法候选的相对顺序，不跳过原生 `PrefillAdder` 检查。
 
-服务时间先用可观测的 EWMA 估计：
+服务时间使用可观测的闭环 EWMA 估计：
 
 ```text
 prefill_time = prompt_tokens / prefill_tokens_per_s
 decode_time  = expected_output_tokens / decode_tokens_per_s
 ```
 
-初值来自配置，之后只用真实完成样本更新。estimator 必须带置信区间或保守倍率；
-没有样本时宁可使用宽裕估计，也不要声称能精确满足 deadline。
+`adaptive_sparse/service_time.py` 从已经写回 rollout 结果的 `ttft_s` 与 `tpot_s`
+更新两条独立状态：
+
+```text
+observed_prefill_rate = prompt_tokens / ttft_s
+observed_decode_rate  = 1 / tpot_s
+```
+
+每个方向分别使用 EWMA，默认 `alpha=0.2`。首个有效样本之前不伪造测量值，
+调度器继续使用保守的 `8,000 token/s` prefill 与 `20,000 token/s` decode 默认值；
+取得样本后，执行器把两项估计写入新请求的 `elastic.future` action v3。action
+v1/v2 的载荷、排序和兼容行为保持不变，只有 v3 可以携带
+`prefill_tokens_per_s` 与 `decode_tokens_per_s`。
+
+速率限制在 `[0.001, 1e9] token/s`。异常高/低样本会被截断并分别记录；非有限、
+非正延迟或非正 token 数不会进入 EWMA，而是计入 `rejected_samples`。TTFT 包含
+请求在真实服务端的排队和调度时间，因此这里得到的是“有效服务速率”，不是
+GPU prefill 峰值算力。实验启用入口为 `--service-time-feedback`
+（MiniMax runner 为 `--future-service-time-feedback`），结果摘要会输出两条
+EWMA、样本数、截断数和拒绝数。该反馈默认关闭；开启后由执行器在已完成的
+in-flight 请求被回收后，为后续派发请求附带最新速率。
+每个结果行同时记录 `service_time_prefill_tokens_per_s_hint` 与
+`service_time_decode_tokens_per_s_hint`，从而可以核对某个请求实际收到的是
+冷启动默认值还是某次 EWMA 快照。
+
+没有足够样本、样本持续越界或 TP 侧观测不一致时仍应使用宽裕默认值，不能仅凭
+短窗口 EWMA 声称 deadline 可满足。真实收益必须比较关闭/开启反馈的两组相同
+GPU trace。
 
 ### 4.0 已知未来的有界 oracle
 
