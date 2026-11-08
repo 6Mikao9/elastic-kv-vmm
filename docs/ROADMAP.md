@@ -33,6 +33,41 @@ Prefill activation allocation and MiniMax CUDA Graph support remain
 separate extensions. A configured prefill headroom term is not ownership
 of the activation allocator. See the [research report](HISPARSE_REPORT_ZH.md).
 
+### Performance targets and next optimizations (2026-11-04)
+
+The dynamic policy has two reference targets: approach fully GPU-resident
+performance at low load, and approach native HiSparse serving performance
+at high load. Keep the same native sparse attention semantics and matched
+workloads. At low load compare TTFT, TPOT and tail latency; at high load
+compare throughput under a common latency objective, capacity and failure
+rate. Measure transition stalls and recovery time separately. These are
+acceptance goals, not demonstrated results or an assumed speedup threshold.
+
+Physical chunk co-occupancy is an implementation issue to optimize, not
+prefix sharing: the 240 MiB/rank joint-reclaim example used independent
+request pages and disabled radix caching. Investigate request-affine
+placement without excessive tail waste. For cheaper candidate selection,
+maintain request-to-chunk and chunk-to-live-page/owner indexes on allocation,
+release and migration events; update only affected candidates. Rank by
+reclaimable whole chunks after retained hot pages and live references, then
+account for transfer and temporary-allocation costs. Keep a small cached
+shortlist, search bounded groups of co-occupants only when needed, and use
+the current exact planner plus TP agreement before committing. Validate
+incremental scores against exact occupancy and measure bookkeeping cost.
+
+Separately, explore reuse of identical prefix KV that another request still
+holds on the GPU. A HiSparse Top-K lookup could first resolve a compatible
+shared GPU copy and avoid host-to-device fetch when available. Begin with
+immutable complete prefix blocks and device-to-device fill of the existing
+hot buffer; evaluate direct shared reads only after correctness. Identity
+must include model/weight version, full prefix, position/RoPE, adapter and
+other input-dependent conditions. Protect shared and in-flight references,
+use copy-on-write for mutable tails, and version mappings across eviction
+or migration. Pinned shared chunks can reduce reclamation, so their budget
+cost must be included. Benchmark against equivalent native prefix-cache
+settings; this potential benefit is not automatic from VMM and has not yet
+been measured in the current radix-disabled MiniMax experiments.
+
 ## Deferred research
 
 After the current delivery is tested, documented and pushed:
