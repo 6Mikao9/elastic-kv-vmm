@@ -55,6 +55,7 @@ class PlaneProjection:
         self.planes = planes
         self.backing = Backing(self.plane_stride * planes, chunk_bytes, device)
         self.mapped_chunks = set()
+        self.precommitted_chunks = set()
 
     def _physical_chunks(self, indices):
         return [plane * self.plane_chunks + index
@@ -62,15 +63,29 @@ class PlaneProjection:
 
     def ensure(self, indices):
         pending = set(indices) - self.mapped_chunks
+        if pending or self.precommitted_chunks.intersection(indices):
+            self.backing.ensure(self._physical_chunks(indices))
+            self.mapped_chunks.update(indices)
+            self.precommitted_chunks.difference_update(indices)
+
+    def precommit(self, indices):
+        pending = set(indices) - self.mapped_chunks - self.precommitted_chunks
         if pending:
-            self.backing.ensure(self._physical_chunks(pending))
-            self.mapped_chunks.update(pending)
+            self.backing.precommit(self._physical_chunks(pending))
+            self.precommitted_chunks.update(pending)
+            return len(pending)
+        return 0
 
     def reclaim(self, indices, *, synchronize=True):
-        pending = self.mapped_chunks.intersection(indices)
+        pending = (self.mapped_chunks | self.precommitted_chunks).intersection(indices)
         if pending:
             self.backing.reclaim(self._physical_chunks(pending), synchronize=synchronize)
             self.mapped_chunks.difference_update(pending)
+            self.precommitted_chunks.difference_update(pending)
+
+    @property
+    def allocated_chunks(self):
+        return self.mapped_chunks | self.precommitted_chunks
 
     @property
     def backed_bytes(self):
@@ -78,7 +93,10 @@ class PlaneProjection:
 
     @property
     def metrics(self):
-        return self.backing.metrics
+        return {
+            **self.backing.metrics,
+            "precommitted_chunks": len(self.precommitted_chunks),
+        }
 
     def views(self, dtype, shape):
         raw = self.backing.raw
@@ -96,6 +114,17 @@ class Residency:
         self.retain_chunks = int(os.environ.get("EKV_RETAIN_CHUNKS", "1"))
         if self.retain_chunks < 1:
             raise ValueError("EKV_RETAIN_CHUNKS must retain at least the sink chunk")
+        self.precommit_lookahead = int(os.environ.get("EKV_PRECOMMIT_CHUNKS", "0"))
+        if not 0 <= self.precommit_lookahead <= 4:
+            raise ValueError("EKV_PRECOMMIT_CHUNKS must be in [0, 4]")
+        self.precommit_limit = int(
+            os.environ.get(
+                "EKV_PRECOMMIT_MAX_CHUNKS", str(max(1, self.precommit_lookahead))
+            )
+        )
+        if not 0 <= self.precommit_limit <= 16:
+            raise ValueError("EKV_PRECOMMIT_MAX_CHUNKS must be in [0, 16]")
+        self.precommitted = set()
         self.live = np.zeros(pool.size + pool.page_size, dtype=np.bool_)
         self.live[0] = True
         self.counts = np.zeros((len(self.live) * slot_bytes + self.chunk_bytes - 1)
@@ -157,10 +186,39 @@ class Residency:
             if not needed.issubset(arena.mapped_chunks):
                 arena.ensure(needed)
                 self.backed = sum(a.backed_bytes for a in self.arenas)
+        self.precommitted.difference_update(needed)
+        self._precommit_after(ranges)
         for start, stop in ranges:
             self.live[start:stop] = True
             self.live_count += stop - start
         self.counters["alloc_calls"] += 1
+
+    def _precommit_after(self, ranges):
+        if not self.precommit_lookahead:
+            return
+        candidates = set()
+        chunk_count = len(self.counts)
+        for _, stop in ranges:
+            first = stop * self.slot_bytes // self.chunk_bytes
+            for chunk in range(first, min(chunk_count, first + self.precommit_lookahead)):
+                if self.counts[chunk] == 0 and chunk not in self.precommitted:
+                    candidates.add(chunk)
+        added_count = 0
+        for chunk in sorted(candidates):
+            if len(self.precommitted) >= self.precommit_limit:
+                break
+            added = sum(arena.precommit([chunk]) for arena in self.arenas)
+            if added:
+                self.precommitted.add(chunk)
+                added_count += 1
+        if added_count:
+            self.counters["precommit_batches"] = (
+                self.counters.get("precommit_batches", 0) + 1
+            )
+            self.counters["precommit_chunks"] = (
+                self.counters.get("precommit_chunks", 0) + added_count
+            )
+            self.backed = sum(a.backed_bytes for a in self.arenas)
 
     def release_idle_only(self, ids):
         if ids[0] < 1 or ids[-1] > self.pool.size or not self.live[ids].all():
@@ -174,7 +232,7 @@ class Residency:
     def reclaim_idle(self):
         if self.live_count:
             return
-        candidates = [(arena, {i for i in arena.mapped_chunks if i >= self.retain_chunks})
+        candidates = [(arena, {i for i in arena.allocated_chunks if i >= self.retain_chunks})
                       for arena in self.arenas]
         if any(indices for _, indices in candidates):
             start = time.perf_counter_ns()
@@ -184,6 +242,7 @@ class Residency:
             for arena, indices in candidates:
                 arena.reclaim(indices, synchronize=False)
             self.backed = sum(arena.backed_bytes for arena in self.arenas)
+            self.precommitted.clear()
 
     def release(self, ids):
         if len(ids) == 0:
@@ -226,6 +285,9 @@ class Residency:
         result = {**metrics, **self.counters, "mode": MODE, "layout": self.layout,
                   "chunk_bytes": self.chunk_bytes, "logical_capacity_bytes": self.logical_bytes,
                   "retain_chunks": self.retain_chunks if MODE == "v5" else None,
+                  "precommit_lookahead": self.precommit_lookahead,
+                  "precommit_limit": self.precommit_limit,
+                  "precommitted_chunks": len(self.precommitted),
                   "backed_bytes": backed, "peak_backed_bytes": self.peak,
                   "live_tokens": self.live_count if MODE == "v5" else int(np.count_nonzero(self.live)) - 1}
         target = Path(self.stats_path)

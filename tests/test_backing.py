@@ -37,9 +37,13 @@ class BackingTest(unittest.TestCase):
         for i, value in ((0, 11), (2, 33), (4, 55)):
             self.assertTrue(views[i].eq(value).all().item())
 
-        # Recommit the missing range. The existing views must still refer to
-        # the same addresses, and only the newly mapped range is zeroed.
-        self.assertEqual(backing.ensure([1, 2, 4]), 1)
+        # Precommit maps the chunk but leaves zeroing on the initialization
+        # stream. ``ensure`` is still the readiness barrier before GPU use.
+        self.assertEqual(backing.precommit([1]), 1)
+        self.assertEqual(backing.mapped_chunks, {0, 2, 4})
+        self.assertEqual(backing.backed_bytes, 4 * chunk)
+        self.assertEqual(backing.ensure([1]), 0)
+        self.assertEqual(backing.mapped_chunks, {0, 1, 2, 4})
         self.assertEqual(backing.backed_bytes, 4 * chunk)
         self.assertEqual(backing.raw.data_ptr(), base)
         self.assertEqual(views[1].data_ptr(), base + chunk)

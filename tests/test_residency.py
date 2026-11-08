@@ -18,21 +18,33 @@ SLOT = 3 * CHUNK // 4
 class FakeArena:
     def __init__(self):
         self.mapped_chunks = {0}
+        self.precommitted_chunks = set()
         self.reclaimed = []
 
     @property
     def backed_bytes(self):
-        return len(self.mapped_chunks) * CHUNK
+        return len(self.mapped_chunks | self.precommitted_chunks) * CHUNK
+
+    @property
+    def allocated_chunks(self):
+        return self.mapped_chunks | self.precommitted_chunks
 
     def ensure(self, indices):
         self.mapped_chunks.update(indices)
+        self.precommitted_chunks.difference_update(indices)
+
+    def precommit(self, indices):
+        pending = set(indices) - self.allocated_chunks
+        self.precommitted_chunks.update(pending)
+        return len(pending)
 
     def reclaim(self, indices, *, synchronize=True):
         if synchronize:
             raise AssertionError("the controller must synchronize the batch once")
-        assert indices <= self.mapped_chunks
+        assert indices <= self.allocated_chunks
         self.reclaimed.append(set(indices))
         self.mapped_chunks.difference_update(indices)
+        self.precommitted_chunks.difference_update(indices)
 
 
 class ResidencyTest(unittest.TestCase):
@@ -83,6 +95,41 @@ class ResidencyTest(unittest.TestCase):
             self.ctrl.release_idle_only(np.array([1, 1]))
         np.testing.assert_array_equal(self.ctrl.live, before)
         self.assertEqual(self.ctrl.live_count, 2)
+
+    def test_optional_lookahead_maps_one_chunk_ahead_and_reclaims_it(self):
+        with (
+            patch.object(adapter, "MODE", "v5"),
+            patch.dict(os.environ, {"EKV_PRECOMMIT_CHUNKS": "1"}),
+        ):
+            self.ctrl = adapter.Residency(self.ctrl.pool, self.arenas, SLOT, "test")
+        self.ctrl.retain_chunks = 2
+        self.ctrl.admit_ranges([(1, 4)])
+        self.assertEqual(self.ctrl.precommitted, {3})
+        for arena in self.arenas:
+            self.assertEqual(arena.mapped_chunks, {0, 1, 2})
+            self.assertEqual(arena.precommitted_chunks, {3})
+
+        self.ctrl.admit_ranges([(4, 5)])
+        self.assertEqual(self.ctrl.precommitted, set())
+        for arena in self.arenas:
+            self.assertEqual(arena.mapped_chunks, {0, 1, 2, 3})
+
+        self.ctrl.release_idle_only(np.array([1, 2, 3, 4]))
+        self.ctrl.reclaim_idle()
+        self.assertEqual(self.ctrl.live_count, 0)
+        for arena in self.arenas:
+            self.assertEqual(arena.mapped_chunks, {0, 1})
+            self.assertEqual(arena.precommitted_chunks, set())
+
+    def test_precommit_configuration_is_bounded(self):
+        for value in ("-1", "5"):
+            with self.subTest(value=value):
+                with (
+                    patch.object(adapter, "MODE", "v5"),
+                    patch.dict(os.environ, {"EKV_PRECOMMIT_CHUNKS": value}),
+                ):
+                    with self.assertRaisesRegex(ValueError, "EKV_PRECOMMIT_CHUNKS"):
+                        adapter.Residency(self.ctrl.pool, self.arenas, SLOT, "test")
 
     def test_crossing_slots_retain_shared_chunks(self):
         # Slot 1 touches chunks 0,1. Slot 2 touches chunks 1,2.

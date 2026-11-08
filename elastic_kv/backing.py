@@ -20,7 +20,7 @@ def _load_library(path):
     lib = ct.CDLL(path)
     lib.ev_create.argtypes = [ct.c_int, ct.c_uint64, ct.c_uint64]
     lib.ev_create.restype = ct.c_void_p
-    for name in ("ev_ensure", "ev_drop"):
+    for name in ("ev_ensure", "ev_precommit", "ev_drop"):
         fn = getattr(lib, name)
         fn.argtypes = [ct.c_void_p, ct.POINTER(ct.c_uint64), ct.c_size_t]
         fn.restype = ct.c_int
@@ -69,12 +69,16 @@ class Backing:
         self.reserved_bytes = self._number("ev_reserved")
         self.granularity = self._number("ev_granularity")
         self._mapped = set()
+        self._precommitted = set()
         self._raw_ref = None
         self._poisoned = False
         self._metrics = {
             "ensure_calls": 0,
             "ensure_chunks": 0,
             "ensure_ns": 0,
+            "precommit_calls": 0,
+            "precommit_chunks": 0,
+            "precommit_ns": 0,
             "reclaim_calls": 0,
             "reclaim_chunks": 0,
             "reclaim_ns": 0,
@@ -111,7 +115,7 @@ class Backing:
 
     @property
     def mapped_chunks(self):
-        return frozenset(self._mapped)
+        return frozenset(self._mapped - self._precommitted)
 
     @property
     def backed_bytes(self):
@@ -129,7 +133,7 @@ class Backing:
     def raw(self):
         """Borrow a contiguous uint8 view spanning the logical reservation."""
         self._check()
-        if 0 not in self._mapped:
+        if 0 not in self.mapped_chunks:
             raise RuntimeError("commit the sink chunk before building the tensor view")
         cached = self._raw_ref() if self._raw_ref else None
         if cached is not None:
@@ -154,15 +158,41 @@ class Backing:
     def ensure(self, indices):
         """Commit and zero missing chunks, returning their count."""
         self._check()
-        pending = self._ids(indices) - self._mapped
-        if not pending:
+        ids = self._ids(indices)
+        pending = ids - self._mapped
+        needs_initialization = pending or bool(ids & self._precommitted)
+        if not needs_initialization:
             return 0
         start = time.perf_counter_ns()
         self._batch("ev_ensure", pending)
         self._mapped.update(pending)
+        self._precommitted.clear()
         self._metrics["ensure_ns"] += time.perf_counter_ns() - start
         self._metrics["ensure_calls"] += 1
         self._metrics["ensure_chunks"] += len(pending)
+        self._metrics["peak_backed_bytes"] = max(
+            self._metrics["peak_backed_bytes"], len(self._mapped) * self.chunk_bytes
+        )
+        return len(pending)
+
+    def precommit(self, indices):
+        """Map missing chunks and start zeroing without blocking the caller.
+
+        The chunks become usable only after a later ``ensure`` waits for the
+        backing initialization stream. Callers must keep the returned chunks
+        out of kernel argument lists until that synchronization completes.
+        """
+        self._check()
+        pending = self._ids(indices) - self._mapped
+        if not pending:
+            return 0
+        start = time.perf_counter_ns()
+        self._batch("ev_precommit", pending)
+        self._mapped.update(pending)
+        self._precommitted.update(pending)
+        self._metrics["precommit_ns"] += time.perf_counter_ns() - start
+        self._metrics["precommit_calls"] += 1
+        self._metrics["precommit_chunks"] += len(pending)
         self._metrics["peak_backed_bytes"] = max(
             self._metrics["peak_backed_bytes"], len(self._mapped) * self.chunk_bytes
         )
@@ -184,6 +214,7 @@ class Backing:
             self._metrics["reclaim_sync_ns"] += time.perf_counter_ns() - start
         self._batch("ev_drop", pending)
         self._mapped.difference_update(pending)
+        self._precommitted.difference_update(pending)
         self._metrics["reclaim_ns"] += time.perf_counter_ns() - start
         self._metrics["reclaim_calls"] += 1
         self._metrics["reclaim_chunks"] += len(pending)
@@ -196,5 +227,6 @@ class Backing:
         self._handle = None
         status = self._finalizer()
         self._mapped.clear()
+        self._precommitted.clear()
         if status:
             raise RuntimeError(self._error())

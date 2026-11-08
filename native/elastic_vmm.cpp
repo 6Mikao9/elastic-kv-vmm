@@ -82,16 +82,28 @@ public:
         CurrentContext current(context_);
         check(cuMemAddressReserve(&base_, reserved_bytes_, granularity_, 0, 0),
               "cuMemAddressReserve");
+        check(cuStreamCreate(&zero_stream_, CU_STREAM_NON_BLOCKING), "cuStreamCreate");
     }
 
     void ensure(const uint64_t* ids, size_t count) {
+        ensure_impl(ids, count, true);
+    }
+
+    void precommit(const uint64_t* ids, size_t count) {
+        ensure_impl(ids, count, false);
+    }
+
+private:
+    void ensure_impl(const uint64_t* ids, size_t count, bool wait_for_zero) {
         const auto pending = normalize(ids, count, false);
         if (pending.empty()) {
+            if (wait_for_zero) {
+                wait_for_initialization();
+            }
             return;
         }
         CurrentContext current(context_);
         size_t started = 0;
-        bool issued_zero = false;
         try {
             for (uint64_t id : pending) {
                 auto& chunk = chunks_.try_emplace(id).first->second;
@@ -113,18 +125,21 @@ public:
                 const size_t bytes = (end - start) * chunk_bytes_;
                 const CUdeviceptr begin = address(pending[start]);
                 check(cuMemSetAccess(begin, bytes, &access, 1), "cuMemSetAccess");
-                issued_zero = true;
-                check(cuMemsetD8Async(begin, 0, bytes, CU_STREAM_LEGACY), "zero new backing");
+                check(cuMemsetD8Async(begin, 0, bytes, zero_stream_), "zero new backing");
+                zero_pending_ = true;
                 start = end;
             }
-            check(cuStreamSynchronize(CU_STREAM_LEGACY), "wait for backing initialization");
+            if (wait_for_zero) {
+                wait_for_initialization();
+            }
         } catch (...) {
             // Do not release a range if we cannot establish completion of
             // its zeroing. The caller must stop using a poisoned backing.
-            if (issued_zero && cuStreamSynchronize(CU_STREAM_LEGACY) != CUDA_SUCCESS) {
+            if (zero_pending_ && cuStreamSynchronize(zero_stream_) != CUDA_SUCCESS) {
                 poisoned_ = true;
                 throw;
             }
+            zero_pending_ = false;
             while (started > 0) {
                 auto it = chunks_.find(pending[--started]);
                 if (release(it->first, it->second) == CUDA_SUCCESS) {
@@ -137,6 +152,15 @@ public:
         }
     }
 
+    void wait_for_initialization() {
+        if (!zero_pending_) {
+            return;
+        }
+        check(cuStreamSynchronize(zero_stream_), "wait for backing initialization");
+        zero_pending_ = false;
+    }
+
+public:
     // Caller must establish that no stream, graph replay, transfer, or other
     // in-flight user can access these addresses when they are decommitted.
     void drop(const uint64_t* ids, size_t count) {
@@ -145,6 +169,7 @@ public:
             return;
         }
         CurrentContext current(context_);
+        wait_for_initialization();
         for (uint64_t id : pending) {
             auto it = chunks_.find(id);
             const CUresult result = release(id, it->second);
@@ -176,6 +201,10 @@ public:
             if (base_) {
                 record(cuMemAddressFree(base_, reserved_bytes_));
                 base_ = 0;
+            }
+            if (zero_stream_) {
+                record(cuStreamDestroy(zero_stream_));
+                zero_stream_ = nullptr;
             }
             CUcontext popped = nullptr;
             record(cuCtxPopCurrent(&popped));
@@ -246,10 +275,12 @@ private:
     CUcontext context_ = nullptr;
     CUdevice device_{};
     CUdeviceptr base_ = 0;
+    CUstream zero_stream_ = nullptr;
     CUmemAllocationProp prop_{};
     size_t reserved_bytes_ = 0;
     size_t chunk_bytes_ = 0;
     size_t granularity_ = 0;
+    bool zero_pending_ = false;
     bool poisoned_ = false;
     std::map<uint64_t, Chunk> chunks_;
 };
@@ -294,6 +325,13 @@ void* ev_create(int device, uint64_t capacity_bytes, uint64_t chunk_bytes) {
 int ev_ensure(void* handle, const uint64_t* indices, size_t count) {
     return call(-1, [&] {
         require(handle).ensure(indices, count);
+        return 0;
+    });
+}
+
+int ev_precommit(void* handle, const uint64_t* indices, size_t count) {
+    return call(-1, [&] {
+        require(handle).precommit(indices, count);
         return 0;
     });
 }
