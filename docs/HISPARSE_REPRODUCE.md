@@ -133,6 +133,21 @@ bash "$RUN" "$GPUS" "$MODEL" native "$OUT/adaptive-deadline-residency" \
   "${COMMON[@]}" "${BENCH1[@]}" "${MIXED[@]}" "${PRESSURE[@]}" \
   --future-policy deadline --resident-hint-policy adaptive \
   --resident-min-hint-output-tokens 128 "${MIXED12K[@]}"
+
+# Optional future-growth admission accounting. Run dry_run first and compare
+# its would-decline reasons with the actual `insufficient-physical-reserve`
+# fallbacks before allowing the broker to change placement.
+bash "$RUN" "$GPUS" "$MODEL" native "$OUT/adaptive-broker-dry-run" \
+  "${COMMON[@]}" "${BENCH1[@]}" "${MIXED[@]}" "${PRESSURE[@]}" \
+  --future-policy deadline --resident-hint-policy adaptive \
+  --resident-min-hint-output-tokens 128 --resident-broker dry_run \
+  "${MIXED12K[@]}"
+
+bash "$RUN" "$GPUS" "$MODEL" native "$OUT/adaptive-broker-enforce" \
+  "${COMMON[@]}" "${BENCH1[@]}" "${MIXED[@]}" "${PRESSURE[@]}" \
+  --future-policy deadline --resident-hint-policy adaptive \
+  --resident-min-hint-output-tokens 128 --resident-broker enforce \
+  "${MIXED12K[@]}"
 ```
 
 Before treating an arm as performance evidence, require a complete outer
@@ -143,6 +158,9 @@ differences; do not establish a speed claim from a single off/deadline pair.
 For the residency-policy arm also require nonzero `resident_layer_rows`, inspect
 the per-rank `future_decision_reasons`, and verify that the configured threshold
 rejected the intended short decoded requests before interpreting timing.
+For broker arms additionally inspect `request_residency.resident_broker`,
+confirm that dry-run assessments are present, and verify in enforce mode that
+every broker decline fell back to native HiSparse without changing correctness.
 
 The summarizer requires a completed outer `results.json`, the matching
 `source_manifest.json`, consistent runtime capacity and timing without

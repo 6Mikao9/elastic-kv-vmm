@@ -254,8 +254,13 @@ def commit_promote(prepared, publish_gpu_resident, synchronize):
     coordinator = prepared.coordinator
     pool = coordinator.mem_pool_device
     # Native cleanup releases host and hot ownership and clears old mappings.
-    # It must run before publishing new physical locations.
-    coordinator.request_finished(prepared.request)
+    # The residency hook separates this migration cleanup from final request
+    # completion so broker baselines survive repeated demote/promote cycles.
+    cleanup = getattr(coordinator, "_ekv_cleanup_promotion_source", None)
+    if cleanup is None:
+        coordinator.request_finished(prepared.request)
+    else:
+        cleanup(prepared.request)
     pool.full_to_hisparse_device_index_mapping[prepared.logical] = (
         prepared.destination[:len(prepared.logical)])
     synchronize()

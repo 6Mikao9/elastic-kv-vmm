@@ -3,7 +3,7 @@ from itertools import combinations
 from random import Random
 from types import SimpleNamespace as B
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from adaptive_sparse.scheduler_budget import (
     SchedulerBudget, _chunk_release_counts, _rank_demotions, _releasable,
@@ -98,7 +98,8 @@ class SchedulerBudgetTest(unittest.TestCase):
         self.assertEqual(policy.stats["demotions"], 0)
     def test_shared_pages_reclaim_only_as_union_and_publish_together(self):
         policy = SchedulerBudget(100, 0, 0, 0, max_group=2)
-        ctrl = B(_ekv_resident={1, 2})
+        release_broker = Mock()
+        ctrl = B(_ekv_resident={1, 2}, _ekv_broker_release_request=release_broker)
         backing = B(backed_bytes=10, mapped_chunks={9})
         tracker = B(backing=backing, refs={9: 2}, chunks=lambda _: {9}, chunk_bytes=10)
         self.assertEqual(_releasable(tracker, [1]), set())
@@ -132,6 +133,9 @@ class SchedulerBudgetTest(unittest.TestCase):
         self.assertEqual(policy.stats["group_sizes"], {"2": 1})
         self.assertEqual(policy.stats["reasons"], {"prefill_pressure_group": 1})
         self.assertEqual(policy.stats["released_bytes"], 10)
+        self.assertEqual(
+            release_broker.call_args_list, [call(1), call(2)]
+        )
     def test_low_water_slack_trim_starts_stability_after_actual_release(self):
         policy = SchedulerBudget(100, 0, 0, 0, low=60, stable=2, trim_low_water=True)
         policy.promote = Mock()
@@ -152,3 +156,95 @@ class SchedulerBudgetTest(unittest.TestCase):
         self.assertEqual(policy.stats["low_water_slack_actions"], 1)
         self.assertEqual(policy.stats["low_water_slack_bytes"], 20)
         self.assertEqual(policy.stats["demotions"], 0)
+
+    def test_broker_rejection_filters_promotion_before_prepare(self):
+        policy = SchedulerBudget(0, 0, 0, 0)
+        request = B(
+            rid="a",
+            kv=B(req_pool_idx=1, kv_committed_len=8, kv_allocated_len=8),
+            finished=lambda: False,
+            hisparse_staging=False,
+        )
+        policy.residency_since["a"] = (False, 0)
+        backing = B(backed_bytes=0, mapped_chunks=set())
+        tracker = B(backing=backing, refs={}, chunk_bytes=1)
+        physical = B(free_pages=[], available_size=lambda: 100)
+        gate = Mock(return_value=False)
+        ctrl = B(
+            _ekv_resident=set(),
+            mem_pool_device=B(
+                adaptive_vmm=tracker, page_size=2, layer_num=1,
+                bytes_per_token_k=1, bytes_per_token_v=1,
+            ),
+            token_to_kv_pool_allocator=B(hisparse_attn_allocator=physical),
+            req_device_buffer_size={1: 4},
+            padded_buffer_size=4,
+            device_buffer_size=4,
+            _ekv_broker_can_promote=gate,
+        )
+        with patch("adaptive_sparse.scheduler_budget.prepare_promote") as prepare:
+            policy.promote(
+                B(reqs=[request]), ctrl, lambda value: (value, value),
+                lambda: None, False, 0,
+            )
+        gate.assert_called_once_with(request, 100)
+        prepare.assert_not_called()
+        self.assertEqual(policy.stats["broker_rejected_promotions"], 1)
+
+    def test_broker_promotion_captures_growth_before_native_cleanup(self):
+        policy = SchedulerBudget(0, 0, 0, 0)
+        request = B(
+            rid="a",
+            kv=B(req_pool_idx=1, kv_committed_len=8, kv_allocated_len=8),
+            finished=lambda: False,
+            hisparse_staging=False,
+        )
+        policy.residency_since["a"] = (False, 0)
+        backing = B(backed_bytes=0, mapped_chunks=set())
+        tracker = B(
+            backing=backing,
+            refs={},
+            chunk_bytes=1,
+            chunks=lambda page: {page},
+        )
+        class PageList(list):
+            def __getitem__(self, key):
+                value = super().__getitem__(key)
+                return PageList(value) if isinstance(key, slice) else value
+
+            def tolist(self):
+                return list(self)
+
+        physical = B(free_pages=PageList([0, 1, 2, 3]), available_size=lambda: 100)
+        plan = Mock(return_value=(8, 4, 7, 1))
+        commit_broker = Mock()
+        ctrl = B(
+            _ekv_resident=set(),
+            mem_pool_device=B(
+                adaptive_vmm=tracker, page_size=2, layer_num=1,
+                bytes_per_token_k=1, bytes_per_token_v=1,
+            ),
+            token_to_kv_pool_allocator=B(hisparse_attn_allocator=physical),
+            req_device_buffer_size={1: 4},
+            padded_buffer_size=4,
+            device_buffer_size=4,
+            _ekv_broker_can_promote=Mock(return_value=True),
+            _ekv_broker_promotion_plan=plan,
+            _ekv_broker_commit_promotion=commit_broker,
+        )
+
+        def commit(prepared, publish, synchronize):
+            publish(1)
+            return 0
+
+        with patch(
+            "adaptive_sparse.scheduler_budget.prepare_promote", return_value="prepared"
+        ), patch("adaptive_sparse.scheduler_budget.commit_promote", side_effect=commit):
+            policy.promote(
+                B(reqs=[request]), ctrl, lambda value: (value, value),
+                lambda: None, False, 0,
+            )
+
+        plan.assert_called_once_with(request)
+        commit_broker.assert_called_once_with(request, 7)
+        self.assertIn(1, ctrl._ekv_resident)

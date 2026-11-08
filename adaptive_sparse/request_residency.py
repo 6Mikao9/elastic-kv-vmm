@@ -6,6 +6,12 @@ from pathlib import Path
 import torch
 
 from .future_residency import decide_resident_claim
+from .residency_broker import (
+    ResidencyBroker,
+    page_aligned_growth_slots,
+    page_aligned_slots,
+    remaining_output_tokens,
+)
 
 
 def install_request_residency():
@@ -34,6 +40,14 @@ def install_request_residency():
     )
     if minimum_hint_tokens < 1:
         raise ValueError("resident hint output threshold must be positive")
+    broker_mode = os.environ.get("EKV_RESIDENT_BROKER", "off")
+    if broker_mode not in ("off", "dry_run", "enforce"):
+        raise ValueError("EKV_RESIDENT_BROKER must be off, dry_run or enforce")
+    broker_lookahead_tokens = int(
+        os.environ.get("EKV_RESIDENT_BROKER_LOOKAHEAD_TOKENS", "256")
+    )
+    if broker_lookahead_tokens < 1:
+        raise ValueError("resident broker lookahead must be positive")
 
     from sglang.srt.layers.attention import minimax_sparse_backend as backend
     from sglang.srt.managers import hisparse_coordinator as coordinator
@@ -71,6 +85,33 @@ def install_request_residency():
     if hint_policy == "adaptive":
         from .sglang_future_hook import _extract_hint
 
+    def hinted_output_tokens(req):
+        if hint_policy != "adaptive":
+            return None
+        try:
+            hint = _extract_hint(req)
+        except (AttributeError, TypeError, ValueError):
+            return None
+        return None if hint is None else hint.expected_output_tokens
+
+    def growth_estimate(req, current_tokens, pool, expected_override=None):
+        predicted_tokens = (
+            expected_override
+            if expected_override is not None
+            else hinted_output_tokens(req)
+        )
+        if predicted_tokens is None:
+            predicted_tokens = broker_lookahead_tokens
+        growth_slots = page_aligned_growth_slots(
+            current_tokens=current_tokens,
+            target_tokens=current_tokens + predicted_tokens,
+            page_size=pool.page_size,
+        )
+        logical_token_bytes = pool.layer_num * (
+            pool.bytes_per_token_k + pool.bytes_per_token_v
+        )
+        return growth_slots, growth_slots * logical_token_bytes, logical_token_bytes
+
     def initialize(self, *args, **kwargs):
         if (not cuda_graph_fully_disabled() or not get_schedule().disable_overlap_schedule
                 or get_disagg().disaggregation_mode != "null"
@@ -81,26 +122,99 @@ def install_request_residency():
             raise RuntimeError("Static residency requires MiniMax HiSparse without speculation")
         self._ekv_resident = set()
         self._ekv_decode_rows = None
+        self._ekv_residency_broker = ResidencyBroker()
+        self._ekv_broker_baseline_tokens = {}
         self._ekv_residency_stats = {"resident_admissions": 0, "native_admissions": 0,
                                      "resident_decode_rows": 0, "native_decode_rows": 0,
                                      "mixed_decode_batches": 0, "resident_layer_rows": 0,
                                      "future_hint_claim_attempts": 0, "future_hint_declines": 0,
                                      "future_hint_missing": 0, "future_hint_invalid": 0,
-                                     "future_decision_reasons": {}}
+                                     "future_decision_reasons": {},
+                                     "resident_broker_mode": broker_mode}
+
+    def publish_broker_stats(self):
+        snapshot = self._ekv_residency_broker.snapshot()
+        stats = self._ekv_residency_stats
+        stats["resident_broker"] = snapshot
+        return snapshot
+
+    def promotion_plan(req):
+        """Capture a promotion's budget before native cleanup mutates request state."""
+        pool = self.mem_pool_device
+        current_tokens = req.kv.kv_committed_len
+        predicted_total = hinted_output_tokens(req)
+        baseline = self._ekv_broker_baseline_tokens.get(req.kv.req_pool_idx)
+        if predicted_total is not None and baseline is not None:
+            predicted_total = remaining_output_tokens(
+                predicted_total=predicted_total,
+                current_tokens=current_tokens,
+                baseline_tokens=baseline,
+            )
+        growth_slots, growth_bytes, token_bytes = growth_estimate(
+            req, current_tokens, pool, predicted_total
+        )
+        return current_tokens, growth_slots, growth_bytes, token_bytes
+
+    def broker_can_promote(self, req, available_tokens):
+        if broker_mode == "off":
+            return True
+        pool = self.mem_pool_device
+        current_tokens, growth_slots, _, token_bytes = promotion_plan(req)
+        required_slots = page_aligned_slots(current_tokens, pool.page_size) + growth_slots
+        decision = self._ekv_residency_broker.assess(
+            req.kv.req_pool_idx,
+            available_bytes=available_tokens * token_bytes,
+            fixed_reserve_bytes=reserve * token_bytes,
+            predicted_growth_bytes=required_slots * token_bytes,
+        )
+        self._ekv_residency_stats["resident_broker_promotion_checks"] = (
+            self._ekv_residency_stats.get("resident_broker_promotion_checks", 0) + 1
+        )
+        publish_broker_stats(self)
+        return broker_mode == "dry_run" or decision.admit
+
+    def broker_promotion_plan(self, req):
+        if broker_mode == "off":
+            return None
+        return promotion_plan(req)
+
+    def broker_commit_promotion(self, req, growth_bytes):
+        if broker_mode == "off":
+            return
+        current_tokens = req.kv.kv_committed_len
+        key = req.kv.req_pool_idx
+        self._ekv_residency_broker.reserve(key, predicted_growth_bytes=growth_bytes)
+        self._ekv_residency_broker.set_last_length(key, current_tokens)
+        publish_broker_stats(self)
+
+    def broker_release_request(self, req):
+        self._ekv_residency_broker.release(req.kv.req_pool_idx)
+        publish_broker_stats(self)
+
+    def broker_finish_request(self, req):
+        self._ekv_residency_broker.release(req.kv.req_pool_idx)
+        self._ekv_broker_baseline_tokens.pop(req.kv.req_pool_idx, None)
+        publish_broker_stats(self)
 
     def stage(self, req):
         stats = self._ekv_residency_stats
+        if broker_mode != "off":
+            self._ekv_broker_baseline_tokens.setdefault(
+                req.kv.req_pool_idx, req.kv.kv_committed_len
+            )
 
         def adopt_native(reason=None):
             stats["native_admissions"] += 1
             if reason is not None:
                 reasons = stats["future_decision_reasons"]
                 reasons[reason] = reasons.get(reason, 0) + 1
+            publish_broker_stats(self)
             original_stage(self, req)
 
         slots_available = len(self._ekv_resident) < limit
         claim = True
         decline_reason = None
+        residence = expected = None
         if hint_policy == "adaptive":
             try:
                 hint = _extract_hint(req)
@@ -152,6 +266,33 @@ def install_request_residency():
         if slots.item() < reserve:
             adopt_native("insufficient-physical-reserve")
             return
+        if broker_mode != "off":
+            pool = self.mem_pool_device
+            _, predicted_growth, logical_token_bytes = growth_estimate(
+                req, req.kv.kv_allocated_len, pool, expected
+            )
+            key = req.kv.req_pool_idx
+            if broker_mode == "enforce":
+                decision = self._ekv_residency_broker.try_admit(
+                    key,
+                    available_bytes=slots.item() * logical_token_bytes,
+                    fixed_reserve_bytes=reserve * logical_token_bytes,
+                    predicted_growth_bytes=predicted_growth,
+                )
+                if not decision.admit:
+                    adopt_native("broker-insufficient-growth-headroom")
+                    return
+            else:
+                decision = self._ekv_residency_broker.assess(
+                    key,
+                    available_bytes=slots.item() * logical_token_bytes,
+                    fixed_reserve_bytes=reserve * logical_token_bytes,
+                    predicted_growth_bytes=predicted_growth,
+                )
+                self._ekv_residency_broker.reserve(
+                    key, predicted_growth_bytes=predicted_growth
+                )
+            self._ekv_residency_broker.set_last_length(key, req.kv.kv_allocated_len)
         event = torch.cuda.Event()
         event.record()
         self._ekv_resident.add(req.kv.req_pool_idx)
@@ -167,6 +308,20 @@ def install_request_residency():
     def map_latest(self, lengths, locations, rows, lengths_cpu, rows_cpu):
         resident_rows = [i for i, row in enumerate(rows_cpu.tolist())
                          if row in self._ekv_resident]
+        if broker_mode != "off" and resident_rows:
+            pool = self.mem_pool_device
+            bytes_per_token = pool.layer_num * (
+                pool.bytes_per_token_k + pool.bytes_per_token_v
+            )
+            request_indices = rows_cpu.tolist()
+            current_lengths = lengths_cpu.tolist()
+            for row in resident_rows:
+                self._ekv_residency_broker.consume_new_page_slots(
+                    request_indices[row],
+                    length=int(current_lengths[row]),
+                    bytes_per_token=bytes_per_token,
+                    page_size=pool.page_size,
+                )
         resident_set = set(resident_rows)
         sparse_rows = [i for i in range(len(rows_cpu)) if i not in resident_set]
         self._ekv_residency_stats["resident_decode_rows"] += len(resident_rows)
@@ -238,10 +393,20 @@ def install_request_residency():
         return result.unsqueeze(0)
 
     def finish(self, req):
+        broker_finish_request(self, req)
+        self._ekv_resident.discard(req.kv.req_pool_idx)
+        return original_finish(self, req)
+
+    def cleanup_promotion_source(self, req):
+        # Promotion releases the host-owned hot buffer, but the request keeps
+        # generating.  Preserve its staging baseline for later demote/promote
+        # cycles; only final completion or abort may discard it.
+        broker_release_request(self, req)
         self._ekv_resident.discard(req.kv.req_pool_idx)
         return original_finish(self, req)
 
     def abort(self, req):
+        broker_finish_request(self, req)
         self._ekv_resident.discard(req.kv.req_pool_idx)
         return original_abort(self, req)
 
@@ -251,5 +416,11 @@ def install_request_residency():
     cls.map_last_loc_to_buffer = map_latest
     cls.request_finished = finish
     cls.abort_staging_request = abort
+    if broker_mode != "off":
+        cls._ekv_broker_can_promote = broker_can_promote
+        cls._ekv_broker_promotion_plan = broker_promotion_plan
+        cls._ekv_broker_commit_promotion = broker_commit_promotion
+        cls._ekv_broker_release_request = broker_release_request
+        cls._ekv_cleanup_promotion_source = cleanup_promotion_source
     attn._hisparse_swap_in_blocks = swap
     cls._ekv_static_residency = True

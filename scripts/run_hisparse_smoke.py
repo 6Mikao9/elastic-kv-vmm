@@ -83,6 +83,15 @@ def validate_resident_hint_options(parser, *, policy, minimum_tokens, resident_l
         parser.error("adaptive resident hints require future hints and request residency")
 
 
+def validate_resident_broker_options(parser, *, mode, lookahead_tokens, resident_limit):
+    if mode not in ("off", "dry_run", "enforce"):
+        parser.error("resident broker mode must be off, dry_run or enforce")
+    if lookahead_tokens < 1:
+        parser.error("resident broker lookahead must be positive")
+    if mode != "off" and not resident_limit:
+        parser.error("resident broker requires enabled request residency")
+
+
 def resident_hint_environment(policy, minimum_tokens, resident_limit):
     if not resident_limit:
         return {}
@@ -99,12 +108,29 @@ def resident_hint_manifest(policy, minimum_tokens):
     }
 
 
+def resident_broker_environment(mode, lookahead_tokens, resident_limit):
+    if not resident_limit or mode == "off":
+        return {}
+    return {
+        "EKV_RESIDENT_BROKER": mode,
+        "EKV_RESIDENT_BROKER_LOOKAHEAD_TOKENS": str(lookahead_tokens),
+    }
+
+
+def resident_broker_manifest(mode, lookahead_tokens):
+    return {
+        "resident_broker_mode": mode,
+        "resident_broker_lookahead_tokens": lookahead_tokens,
+    }
+
+
 def resident_hint_sources(resident_limit):
     if not resident_limit:
         return ()
     return (
         "adaptive_sparse/request_residency.py",
         "adaptive_sparse/future_residency.py",
+        "adaptive_sparse/residency_broker.py",
         "adaptive_sparse/resident_lookup.py",
     )
 
@@ -149,6 +175,8 @@ def main():
     parser.add_argument("--resident-full-batch-swap", action="store_true")
     parser.add_argument("--resident-hint-policy", choices=("off", "adaptive"), default="off")
     parser.add_argument("--resident-min-hint-output-tokens", type=int, default=128)
+    parser.add_argument("--resident-broker", choices=("off", "dry_run", "enforce"), default="off")
+    parser.add_argument("--resident-broker-lookahead-tokens", type=int, default=256)
     parser.add_argument("--adaptive-budget-mib", type=int, default=0)
     parser.add_argument("--adaptive-low-mib", type=int, default=0)
     parser.add_argument("--adaptive-prefill-headroom-mib", type=int, default=0)
@@ -210,6 +238,12 @@ def main():
         minimum_tokens=args.resident_min_hint_output_tokens,
         resident_limit=args.resident_limit,
         future_policy=args.future_policy,
+    )
+    validate_resident_broker_options(
+        parser,
+        mode=args.resident_broker,
+        lookahead_tokens=args.resident_broker_lookahead_tokens,
+        resident_limit=args.resident_limit,
     )
     if args.adaptive_plan_capture and not args.logical_shadow:
         parser.error("allocation plan capture is diagnostic and requires logical shadow")
@@ -286,6 +320,7 @@ def main():
         environment.pop("EKV_ALLOCATOR_STATS_DIR", None)
     for name in ("EKV_VMM_STATS_DIR", "EKV_RESIDENT_LIMIT", "EKV_RESIDENT_FREE_RESERVE",
                  "EKV_RESIDENT_HINT_POLICY", "EKV_RESIDENT_MIN_HINT_OUTPUT_TOKENS",
+                 "EKV_RESIDENT_BROKER", "EKV_RESIDENT_BROKER_LOOKAHEAD_TOKENS",
                  "EKV_LAYER_TRACE_DIR", "EKV_DISABLE_FUSED_QKNORM", "EKV_RESIDENT_RESOLVER"):
         environment.pop(name, None)
     environment.pop("EKV_FUTURE_POLICY", None)
@@ -329,6 +364,10 @@ def main():
         environment["EKV_RESIDENT_RESOLVER"] = args.resident_resolver
         environment.update(resident_hint_environment(
             args.resident_hint_policy, args.resident_min_hint_output_tokens,
+            args.resident_limit,
+        ))
+        environment.update(resident_broker_environment(
+            args.resident_broker, args.resident_broker_lookahead_tokens,
             args.resident_limit,
         ))
     command = [sys.executable, "-u", *launch, "--model-path",
@@ -398,6 +437,9 @@ def main():
         **resident_hint_manifest(
             args.resident_hint_policy, args.resident_min_hint_output_tokens
         ),
+        **resident_broker_manifest(
+            args.resident_broker, args.resident_broker_lookahead_tokens
+        ),
         "adaptive_settings": adaptive_settings if adaptive else None,
         "chunk_aware_retention": args.chunk_aware_retention,
         "future_policy": args.future_policy,
@@ -409,6 +451,9 @@ def main():
                "vmm_backing": args.vmm_backing, "resident_limit": args.resident_limit,
                **resident_hint_manifest(
                    args.resident_hint_policy, args.resident_min_hint_output_tokens
+               ),
+               **resident_broker_manifest(
+                   args.resident_broker, args.resident_broker_lookahead_tokens
                ),
                "future_policy": args.future_policy,
                "status": "running", "probes": []}

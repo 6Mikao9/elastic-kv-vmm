@@ -219,8 +219,9 @@ class SGLangFutureHookTest(unittest.TestCase):
             sys.modules.pop("sglang", None)
             hook._installed = False
             hook.install()
-        self.assertFalse(hook._installed)
-        self.assertNotIn("sglang", sys.modules)
+            self.assertFalse(hook._installed)
+            self.assertNotIn("sglang", sys.modules)
+        hook._installed = False
 
     def test_installer_wraps_native_policy_after_it_runs(self):
         calls = []

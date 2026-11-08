@@ -79,6 +79,7 @@ class SchedulerBudget:
                       "group_requests_demoted": 0,
                       "slack_reclaim_actions": 0, "slack_reclaim_bytes": 0,
                       "low_water_slack_actions": 0, "low_water_slack_bytes": 0,
+                      "broker_rejected_promotions": 0,
                       "min_live_bytes": None, "max_live_bytes": 0,
                       "min_reclaimable_bytes": None, "max_reclaimable_bytes": 0}
         self.steps = 0
@@ -352,6 +353,10 @@ class SchedulerBudget:
         if any(type(value) is not int or value < 0 for value in releases):
             raise MigrationFatal("scheduler TP demotion commit failed") from error
         coordinator._ekv_resident.difference_update(rows)
+        release_broker = getattr(coordinator, "_ekv_broker_release_request", None)
+        if release_broker is not None:
+            for rid in chosen:
+                release_broker(requests[rid][0])
         self.last_change = time.monotonic()
         self.forced |= force
         self.low_since = None
@@ -387,6 +392,11 @@ class SchedulerBudget:
             if not self.eligible(request, pool, now, forced):
                 continue
             pages = -(-length // pool.page_size)
+            available_tokens = physical.available_size()
+            can_promote = getattr(coordinator, "_ekv_broker_can_promote", None)
+            if can_promote is not None and not can_promote(request, available_tokens):
+                self.stats["broker_rejected_promotions"] += 1
+                continue
             # Upper bound includes transient coexistence with the source hot buffer.
             if len(physical.free_pages) >= pages:
                 available_pages = physical.free_pages[:pages]
@@ -395,7 +405,7 @@ class SchedulerBudget:
             missing = set().union(*(tracker.chunks(page) for page in available_pages.tolist()))
             missing.difference_update(tracker.backing.mapped_chunks)
             ceiling = self.budget if forced else self.low
-            if physical.available_size() < pages * pool.page_size or (
+            if available_tokens < pages * pool.page_size or (
                     ceiling and tracker.backing.backed_bytes + len(missing) * tracker.chunk_bytes > ceiling):
                 continue
             requests[request.rid] = request
@@ -406,6 +416,19 @@ class SchedulerBudget:
             return
         request = requests[min(candidates)]
         started = time.monotonic()
+        broker_plan = None
+        plan_broker = getattr(coordinator, "_ekv_broker_promotion_plan", None)
+        if plan_broker is not None:
+            try:
+                broker_plan = plan_broker(request)
+            except Exception as exc:
+                raise MigrationFatal("scheduler TP broker planning failed") from exc
+            plans = exchange(broker_plan)
+            if not plans or any(plan != plans[0] for plan in plans):
+                raise MigrationFatal("scheduler TP broker plan mismatch")
+            if (not isinstance(broker_plan, tuple) or len(broker_plan) != 4
+                    or any(type(value) is not int or value < 0 for value in broker_plan)):
+                raise MigrationFatal("scheduler TP broker plan is malformed")
         prepared = None
         error = None
         try:
@@ -425,6 +448,11 @@ class SchedulerBudget:
             error = exc
         if any(type(value) is not int or value < 0 for value in exchange(growth)):
             raise MigrationFatal("scheduler TP promotion commit failed") from error
+        commit_broker = getattr(coordinator, "_ekv_broker_commit_promotion", None)
+        if commit_broker is not None:
+            if broker_plan is None:
+                raise MigrationFatal("scheduler TP broker plan missing before commit")
+            commit_broker(request, broker_plan[2])
         self.last_change = time.monotonic()
         self.low_since = None
         self.promoted |= forced

@@ -245,6 +245,46 @@ CPU、确定性的，并且每个 TP rank 使用相同的 hint；真正的 admis
 这一步的验收目标是“占用槽的请求确实是策略希望保护的请求”，而不是仅凭驻留
 请求数宣称加速。性能结论仍需和静态驻留、原生 HiSparse 在同一独占窗口配对比较。
 
+### 5.2 驻留增长预算账本
+
+请求槽数量小于物理 KV 容量上限。一个完整驻留请求即使当前能通过
+`available_size() >= free_reserve`，其后续 decode 仍可能继续申请页面；若只看
+槽位，框架会把同一份未来 headroom 承诺给多个请求。
+[`residency_broker.py`](../adaptive_sparse/residency_broker.py) 因此维护一个
+CPU-only、确定性的增长账本：
+
+```text
+required = fixed_reserve
+         + sum(active pending growth reservations)
+         + candidate predicted growth
+```
+
+候选增长优先使用 hint 的 `expected_output_tokens`；没有该字段时使用显式的
+lookahead 保守值。预测和消费都按 allocator 的 `page_size` 取整：例如 128-token
+页上预测当前 128 个 token 后再生成 130 个 token，共享预算必须记入 256 个新增
+slot，而不是只记 130 个 token 的字节。请求跨过页边界时消费对应整页承诺；完成
+或中止时释放剩余承诺。`available_size()` 已经包含实际占用的 KV，因此这里只
+跟踪 allocator 尚未观察到的未来增长，不能把已消费部分再次重复计数。
+
+运行器提供两种模式：
+
+| 模式 | 行为 |
+|---|---|
+| `dry_run` | 记录是否超出共同预算，但保留原有驻留选择；用于校准预测 |
+| `enforce` | 超预算时回退原生 HiSparse hot-set，并在 telemetry 中记录原因 |
+
+两种模式都要求启用请求驻留。各 TP rank 仍使用所有 rank 的最小可用容量做决定，
+账本输入和 hint 相同，因此拒绝决定保持一致。它不申请 CUDA 内存，不替代原生
+allocator，也不能把预测变成硬 OOM 保证。动态 demotion 在物理提交完成后释放
+对应承诺；promotion 在迁移前把“当前完整历史所需页面 + 剩余输出增长”一起计入
+同一账本，提交成功后才只保留尚未发生的未来增长承诺。hint 的输出长度是请求初始
+总预测，动态升级时会扣除从 staging 基线到当前长度已经生成的 token。升级迁移在
+清理 host hot buffer 时只释放当前 reservation，保留 baseline，使后续
+demote/promote 仍按同一生成进度扣减；只有真实请求完成或 abort 才删除 baseline。
+请求完成与中止则无条件清理残留承诺。当前在 SGLang 0.5.17 镜像内
+139 项测试通过、3 项因无 GPU 跳过；在线迁移开销、预测误差和端到端
+收益仍需真实 serving 配对实验。
+
 ## 6. 状态机与失败回退
 
 ```text

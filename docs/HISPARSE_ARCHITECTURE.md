@@ -78,6 +78,7 @@ length. All TP ranks apply the same policy and the existing physical-reserve
 vote remains authoritative. Missing hints preserve the legacy long-request
 default; the feature is inert unless `EKV_RESIDENT_HINT_POLICY=adaptive`.
 [Hint residency policy](../adaptive_sparse/future_residency.py) ·
+[Residency growth broker](../adaptive_sparse/residency_broker.py) ·
 [Future scheduler hook](../adaptive_sparse/sglang_future_hook.py)
 
 ## Budget and migration
