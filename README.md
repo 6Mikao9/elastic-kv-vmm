@@ -91,7 +91,7 @@ bash scripts/container_case.sh 0 "$MODEL_HUB" "$MODEL_REL" \
 
 Use a fresh output directory for every run. Substitute `baseline` or `v0`–`v4` for ablations. Set `EKV_EXECUTION=graph-pad` for capture batches 1, 2, 4, 8 (including additional 3/5/3-request padding probes), or `graph` for exact batches 1–8. `EKV_RETAIN_CHUNKS=8` selects the warm retention policy. These are environment variables on the container script. The Qwen3-4B snapshot revision is recorded in `environment.json`. Never copy weights into this repository.
 
-For an existing isolated environment, the direct entry point is `python3 -m elastic_kv.launch` with the supported flags in `scripts/run_case.py`. The module entry point is required: it installs the adapter in the spawned scheduler process as well as the launcher. `EKV_MODE` selects the arm; `EKV_STATS_PATH` optionally records residency telemetry.
+For an existing isolated environment, the primary entry point is `python3 -m elastic_kv` (or `elastic-sglang` after installing `pyproject.toml`). It validates elastic settings before importing SGLang, installs the adapter, and forwards the remaining arguments to SGLang. `python3 -m elastic_kv.launch` remains compatible with the experiment scripts. The module entry point is required so the adapter is installed in the spawned scheduler process as well as the launcher. See [server usage](docs/SERVER.md); `EKV_STATS_PATH` optionally records residency telemetry.
 
 Summarize only explicitly selected completed runs:
 
