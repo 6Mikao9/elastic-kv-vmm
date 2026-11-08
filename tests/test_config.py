@@ -25,6 +25,7 @@ class ElasticConfigTest(unittest.TestCase):
                 "EKV_ADMISSION_POLICY": "physical",
                 "EKV_PREFILL_HEADROOM_MIB": "512",
                 "EKV_PREFILL_HEADROOM_SCOPED": "1",
+                "EKV_ALLOW_OVERLAP_SCHEDULE": "1",
                 "EKV_PREFILL_WORKSPACE_BYTES_PER_TOKEN": "1536",
                 "EKV_PREFILL_WORKSPACE_MAX_MIB": "768",
                 "EKV_PRECOMMIT_CHUNKS": "2",
@@ -49,6 +50,7 @@ class ElasticConfigTest(unittest.TestCase):
         self.assertEqual(config.admission_policy, "physical")
         self.assertEqual(config.prefill_headroom_mib, 512)
         self.assertTrue(config.prefill_headroom_scoped)
+        self.assertTrue(config.allow_overlap_schedule)
         self.assertEqual(config.prefill_workspace_bytes_per_token, 1536)
         self.assertEqual(config.prefill_workspace_max_mib, 768)
         self.assertEqual(config.precommit_chunks, 2)
@@ -71,6 +73,13 @@ class ElasticConfigTest(unittest.TestCase):
             ElasticConfig(mode="v4", activation_policy="telemetry")
         with self.assertRaisesRegex(ValueError, "physical admission requires"):
             ElasticConfig(mode="v4", admission_policy="physical")
+
+    def test_overlap_schedule_requires_v5(self):
+        with self.assertRaisesRegex(ValueError, "overlap scheduling requires"):
+            ElasticConfig(mode="v4", allow_overlap_schedule=True)
+        self.assertTrue(
+            ElasticConfig(mode="v5", allow_overlap_schedule=True).allow_overlap_schedule
+        )
 
     def test_invalid_integer_is_actionable(self):
         with self.assertRaisesRegex(ValueError, "EKV_CHUNK_MIB must be an integer"):
@@ -162,6 +171,7 @@ class ElasticConfigTest(unittest.TestCase):
                 "--elastic-admission-policy",
                 "physical",
                 "--elastic-prefill-headroom-scoped",
+                "--elastic-allow-overlap-schedule",
                 "--elastic-prefill-workspace-bytes-per-token",
                 "1536",
                 "--elastic-prefill-workspace-max-mib",
@@ -211,6 +221,7 @@ class ElasticConfigTest(unittest.TestCase):
                 config.future_ordering_horizon_ms,
                 config.future_stats_path,
                 config.prefill_headroom_scoped,
+                config.allow_overlap_schedule,
                 config.prefill_workspace_bytes_per_token,
                 config.prefill_workspace_max_mib,
                 config.global_broker_path,
@@ -232,6 +243,7 @@ class ElasticConfigTest(unittest.TestCase):
                 4,
                 1500,
                 "/tmp/future.json",
+                True,
                 True,
                 1536,
                 768,

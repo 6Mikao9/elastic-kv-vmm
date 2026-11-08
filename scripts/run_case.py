@@ -21,18 +21,83 @@ URL = f"http://{HOST}:{PORT}"
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def server_environment(mode, stats_path, base=None, future_stats_path=None):
+def server_environment(
+    mode, stats_path, base=None, future_stats_path=None, allow_overlap_schedule=False
+):
     """Build a clean server environment for one measured mode."""
     env = dict(os.environ if base is None else base)
     env["EKV_MODE"] = mode
     env["PYTHONUNBUFFERED"] = "1"
     env.pop("EKV_STATS_PATH", None)
     env.pop("EKV_FUTURE_STATS_PATH", None)
+    env.pop("EKV_ALLOW_OVERLAP_SCHEDULE", None)
     if mode != "baseline":
         env["EKV_STATS_PATH"] = str(stats_path)
     if future_stats_path is not None:
         env["EKV_FUTURE_STATS_PATH"] = str(future_stats_path)
+    if allow_overlap_schedule:
+        env["EKV_ALLOW_OVERLAP_SCHEDULE"] = "1"
     return env
+
+
+def build_server_command(
+    model_path,
+    execution,
+    *,
+    allow_overlap_schedule=False,
+    prefill_chunk="2048",
+):
+    """Build the launcher argv without disturbing SGLang option/value pairs."""
+    command = [
+        sys.executable,
+        "-m",
+        "elastic_kv.launch",
+        "--model-path",
+        str(Path(model_path).resolve()),
+        "--host",
+        HOST,
+        "--port",
+        str(PORT),
+    ]
+    if not allow_overlap_schedule:
+        command.append("--disable-overlap-schedule")
+    command.extend(
+        (
+            "--page-size",
+            "1",
+            "--attention-backend",
+            "triton",
+            "--disable-radix-cache",
+            "--max-total-tokens",
+            "32768",
+            "--context-length",
+            "8192",
+            "--chunked-prefill-size",
+            str(prefill_chunk),
+            "--mem-fraction-static",
+            "0.5",
+        )
+    )
+    if execution == "eager":
+        command.append("--disable-cuda-graph")
+    elif execution == "graph":
+        command.extend(
+            (
+                "--disable-cuda-graph-padding",
+                "--cuda-graph-bs",
+                "1",
+                "2",
+                "3",
+                "4",
+                "5",
+                "6",
+                "7",
+                "8",
+            )
+        )
+    else:
+        command.extend(("--cuda-graph-bs", "1", "2", "4", "8"))
+    return command
 
 
 def leader_exit(server):
@@ -93,10 +158,13 @@ def main(argv=None):
     parser.add_argument("--execution", choices=("eager", "graph", "graph-pad"), default=os.environ.get("EKV_EXECUTION", "eager"))
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--allow-overlap-schedule", action="store_true")
     parser.add_argument("--workloads", nargs="+")
     args = parser.parse_args(argv)
     if args.repeats < 1:
         parser.error("--repeats must be positive")
+    if args.allow_overlap_schedule and args.mode != "v5":
+        parser.error("--allow-overlap-schedule requires --mode v5")
     if not args.model_path.is_dir():
         parser.error("--model-path must be an existing local model directory")
 
@@ -124,6 +192,7 @@ def main(argv=None):
                "native/elastic_vmm.cpp", "benchmarks/client.py", "scripts/run_case.py")
     future_policy = os.environ.get("EKV_FUTURE_POLICY", "off")
     manifest = {"mode": args.mode, "execution": args.execution, "model_label": args.label,
+                "allow_overlap_schedule": args.allow_overlap_schedule,
                 "retain_chunks": int(os.environ.get("EKV_RETAIN_CHUNKS", "1")),
                 "activation_policy": os.environ.get("EKV_ACTIVATION_POLICY", "off"),
                 "prefill_headroom_mib": int(os.environ.get("EKV_PREFILL_HEADROOM_MIB", "0")),
@@ -137,24 +206,14 @@ def main(argv=None):
         args.mode,
         stats_path,
         future_stats_path=future_stats_path if future_policy != "off" else None,
+        allow_overlap_schedule=args.allow_overlap_schedule,
     )
-    server_command = [
-        sys.executable, "-m", "elastic_kv.launch",
-        "--model-path", str(args.model_path.resolve()),
-        "--host", HOST, "--port", str(PORT),
-        "--page-size", "1", "--attention-backend", "triton",
-        "--disable-overlap-schedule", "--disable-radix-cache",
-        "--max-total-tokens", "32768", "--context-length", "8192",
-        "--chunked-prefill-size", os.environ.get("EKV_PREFILL_CHUNK", "2048"),
-        "--mem-fraction-static", "0.5",
-    ]
-    if args.execution == "eager":
-        server_command.append("--disable-cuda-graph")
-    elif args.execution == "graph":
-        server_command.extend(("--disable-cuda-graph-padding", "--cuda-graph-bs",
-                               "1", "2", "3", "4", "5", "6", "7", "8"))
-    else:
-        server_command.extend(("--cuda-graph-bs", "1", "2", "4", "8"))
+    server_command = build_server_command(
+        args.model_path,
+        args.execution,
+        allow_overlap_schedule=args.allow_overlap_schedule,
+        prefill_chunk=os.environ.get("EKV_PREFILL_CHUNK", "2048"),
+    )
     client_command = [
         sys.executable, str(ROOT / "benchmarks" / "client.py"),
         "--url", URL, "--output", str(result_path),

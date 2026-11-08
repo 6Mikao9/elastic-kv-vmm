@@ -19,6 +19,10 @@ from . import activation
 from .slots import FreeSlots
 
 MODE = os.environ.get("EKV_MODE", "baseline")
+ALLOW_OVERLAP_SCHEDULE = os.environ.get(
+    "EKV_ALLOW_OVERLAP_SCHEDULE", "0"
+).lower() in ("1", "true", "yes", "on")
+OVERLAP_SCHEDULE_ACTIVE = False
 VALID_MODES = ("baseline", "v0", "v1", "v2", "v3", "v4", "v5")
 HOST_FREE_MODES = ("v2", "v3", "v4")
 CONTROLLERS = []
@@ -43,6 +47,15 @@ def _queue_free_group(allocator, free_index):
 def _replace_if_present(module, name, replacement):
     if hasattr(module, name):
         setattr(module, name, replacement)
+
+
+def _overlap_schedule_supported(server_args, *, mode, allow):
+    """Permit the V5 lifecycle's explicit reclaim fence to back overlap opt-in."""
+
+    return bool(
+        server_args.disable_overlap_schedule
+        or (mode == "v5" and allow and not server_args.enable_two_batch_overlap)
+    )
 
 
 class PlaneProjection:
@@ -143,6 +156,9 @@ class Residency:
                                // self.chunk_bytes, dtype=np.int64)
         self.counts[0] = 1  # permanent dummy/sink slot
         self.counters = dict(alloc_calls=0, free_calls=0, index_d2h_ns=0, hook_ns=0)
+        self.counters["overlap_schedule_enabled"] = int(
+            OVERLAP_SCHEDULE_ACTIVE
+        )
         self.peak = 0
         if MODE == "v5":
             self.live_count = 0
@@ -730,11 +746,15 @@ def install():
             return super().restore_state(state)
 
     def validate_server_args(a, *, is_hybrid=False, use_mla_backend=False):
+        global OVERLAP_SCHEDULE_ACTIVE
         graph_safe = a.disable_cuda_graph or MODE in ("baseline", "v4", "v5")
         backends = (a.attention_backend, a.prefill_attention_backend,
                     a.decode_attention_backend)
         required = (a.page_size == 1, a.attention_backend == "triton", graph_safe,
-                    a.disable_overlap_schedule, a.disable_radix_cache, a.tp_size == 1,
+                    _overlap_schedule_supported(
+                        a, mode=MODE, allow=ALLOW_OVERLAP_SCHEDULE
+                    ),
+                    a.disable_radix_cache, a.tp_size == 1,
                     a.pp_size == 1, a.dp_size == 1, not a.enable_two_batch_overlap,
                     all(backend in (None, "triton") for backend in backends),
                     a.disaggregation_mode == "null", not a.enable_memory_saver,
@@ -742,7 +762,11 @@ def install():
                     not getattr(a, "enable_page_major_kv_layout", False),
                     getattr(a, "dcp_size", 1) == 1)
         if not all(required) or is_hybrid or use_mla_backend:
-            raise RuntimeError("Require dense MHA, TP1, Triton, supported Graph mode, no overlap/cache/spec/PD")
+            raise RuntimeError(
+                "Require dense MHA, TP1, Triton, supported Graph/overlap mode, "
+                "no radix/cache/spec/PD"
+            )
+        OVERLAP_SCHEDULE_ACTIVE = not a.disable_overlap_schedule
 
     def validate_mha_geometry(model_config, extra_pairs=()):
         head_dim = getattr(model_config, "head_dim", None)

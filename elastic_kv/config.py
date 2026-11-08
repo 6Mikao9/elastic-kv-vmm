@@ -84,6 +84,7 @@ class ElasticConfig:
     stats_path: str | None = None
     future_stats_path: str | None = None
     prefill_headroom_scoped: bool = False
+    allow_overlap_schedule: bool = False
     prefill_workspace_bytes_per_token: int = 0
     prefill_workspace_max_mib: int = DEFAULT_PREFILL_WORKSPACE_MAX_MIB
     global_broker_path: str | None = None
@@ -113,6 +114,8 @@ class ElasticConfig:
             raise ValueError("retain_chunks must retain at least the sink chunk")
         if self.prefill_headroom_mib < 0:
             raise ValueError("prefill_headroom_mib must be nonnegative")
+        if self.allow_overlap_schedule and self.mode != "v5":
+            raise ValueError("overlap scheduling requires elastic mode v5")
         if not 0 <= self.precommit_chunks <= 4:
             raise ValueError("precommit_chunks must be between 0 and 4")
         if self.precommit_max_chunks < max(1, self.precommit_chunks):
@@ -249,6 +252,10 @@ class ElasticConfig:
                 "EKV_PREFILL_HEADROOM_SCOPED",
                 env.get("EKV_PREFILL_HEADROOM_SCOPED", "0"),
             ),
+            allow_overlap_schedule=_boolean(
+                "EKV_ALLOW_OVERLAP_SCHEDULE",
+                env.get("EKV_ALLOW_OVERLAP_SCHEDULE", "0"),
+            ),
             prefill_workspace_bytes_per_token=_integer(
                 "EKV_PREFILL_WORKSPACE_BYTES_PER_TOKEN",
                 env.get("EKV_PREFILL_WORKSPACE_BYTES_PER_TOKEN", "0"),
@@ -318,6 +325,7 @@ class ElasticConfig:
         stats_path: str | None = None,
         future_stats_path: str | None = None,
         prefill_headroom_scoped: bool | None = None,
+        allow_overlap_schedule: bool | None = None,
         prefill_workspace_bytes_per_token: int | None = None,
         prefill_workspace_max_mib: int | None = None,
         global_broker_path: str | None = None,
@@ -346,6 +354,7 @@ class ElasticConfig:
                 ("stats_path", stats_path),
                 ("future_stats_path", future_stats_path),
                 ("prefill_headroom_scoped", prefill_headroom_scoped),
+                ("allow_overlap_schedule", allow_overlap_schedule),
                 (
                     "prefill_workspace_bytes_per_token",
                     prefill_workspace_bytes_per_token,
@@ -384,6 +393,9 @@ class ElasticConfig:
             ),
             "EKV_PREFILL_HEADROOM_SCOPED": (
                 "1" if self.prefill_headroom_scoped else "0"
+            ),
+            "EKV_ALLOW_OVERLAP_SCHEDULE": (
+                "1" if self.allow_overlap_schedule else "0"
             ),
             "EKV_PREFILL_WORKSPACE_BYTES_PER_TOKEN": str(
                 self.prefill_workspace_bytes_per_token
@@ -443,6 +455,7 @@ class ElasticConfig:
             "stats_path": self.stats_path,
             "future_stats_path": self.future_stats_path,
             "prefill_headroom_scoped": self.prefill_headroom_scoped,
+            "allow_overlap_schedule": self.allow_overlap_schedule,
             "prefill_workspace_bytes_per_token": (
                 self.prefill_workspace_bytes_per_token
             ),

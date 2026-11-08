@@ -16,12 +16,16 @@ def _module(name, **attributes):
 class AdapterCompatibilityTest(unittest.TestCase):
     def setUp(self):
         adapter.MODE = "v5"
+        adapter.ALLOW_OVERLAP_SCHEDULE = False
+        adapter.OVERLAP_SCHEDULE_ACTIVE = False
         adapter._installed = False
         adapter.CONTROLLERS.clear()
 
     def tearDown(self):
         adapter._installed = False
         adapter.MODE = "baseline"
+        adapter.ALLOW_OVERLAP_SCHEDULE = False
+        adapter.OVERLAP_SCHEDULE_ACTIVE = False
         adapter.CONTROLLERS.clear()
 
     def test_installs_on_newer_mem_cache_api(self):
@@ -385,6 +389,68 @@ class AdapterCompatibilityTest(unittest.TestCase):
                 SimpleNamespace(is_not_in_free_group=True, free_group=[])
             )
         )
+
+    def test_overlap_support_requires_v5_opt_in_without_tbo(self):
+        server_args = SimpleNamespace(
+            disable_overlap_schedule=True,
+            enable_two_batch_overlap=False,
+        )
+        self.assertTrue(
+            adapter._overlap_schedule_supported(
+                server_args, mode="baseline", allow=False
+            )
+        )
+
+        server_args.disable_overlap_schedule = False
+        self.assertTrue(
+            adapter._overlap_schedule_supported(
+                server_args, mode="v5", allow=True
+            )
+        )
+        self.assertFalse(
+            adapter._overlap_schedule_supported(
+                server_args, mode="v4", allow=True
+            )
+        )
+        self.assertFalse(
+            adapter._overlap_schedule_supported(
+                server_args, mode="v5", allow=False
+            )
+        )
+        server_args.enable_two_batch_overlap = True
+        self.assertFalse(
+            adapter._overlap_schedule_supported(
+                server_args, mode="v5", allow=True
+            )
+        )
+
+    def test_v5_reclaim_waits_for_scheduler_work_before_unmapping(self):
+        events = []
+        ctrl = object.__new__(adapter.Residency)
+        ctrl.pool = SimpleNamespace(size=2)
+        ctrl.slot_bytes = 1
+        ctrl.chunk_bytes = 1
+        ctrl.live = adapter.np.array([True, True, False], dtype=adapter.np.bool_)
+        ctrl.counts = adapter.np.array([1, 1, 0], dtype=adapter.np.int64)
+        ctrl.counters = {"free_calls": 0}
+        ctrl.publish = lambda **_kwargs: None
+        arena = SimpleNamespace(
+            mapped_chunks={1},
+            reclaim=lambda indices, synchronize: events.append(
+                ("reclaim", set(indices), synchronize)
+            ),
+        )
+        ctrl.arenas = [arena]
+
+        with patch.object(
+            adapter.torch.cuda,
+            "synchronize",
+            side_effect=lambda: events.append(("synchronize",)),
+        ):
+            ctrl.release(adapter.np.array([1], dtype=adapter.np.int64))
+
+        self.assertEqual(events[0], ("synchronize",))
+        self.assertEqual(events[1], ("reclaim", {1}, False))
 
     def test_deferred_free_takes_owned_copy(self):
         source = object()

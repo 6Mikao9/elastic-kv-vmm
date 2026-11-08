@@ -22,6 +22,10 @@ changing the attention addressing model:
    forward boundary; observe mode records would-admit without mutation. Exact
    hard partitions, true activation ownership and transactional OOM recovery
    remain open.
+   SGLang schedule overlap is now an explicit V5-only experiment. The
+   implementation keeps a device-wide fence before physical unmap and rejects
+   two-batch overlap; correctness, memory and serving latency still need a
+   paired GPU comparison before it becomes a default.
 5. Add a vLLM implementation using existing local model snapshots read-only,
    and validate correctness, memory and serving efficiency against vLLM's
    own baseline.

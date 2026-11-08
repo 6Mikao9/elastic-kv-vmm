@@ -66,6 +66,9 @@ def _parser() -> argparse.ArgumentParser:
         "--elastic-prefill-headroom-scoped", action="store_true", default=None
     )
     parser.add_argument(
+        "--elastic-allow-overlap-schedule", action="store_true", default=None
+    )
+    parser.add_argument(
         "--elastic-prefill-workspace-bytes-per-token", type=int
     )
     parser.add_argument("--elastic-prefill-workspace-max-mib", type=int)
@@ -116,6 +119,7 @@ def resolve_config(argv: Sequence[str]) -> tuple[ElasticConfig, list[str], bool]
         stats_path=args.elastic_stats_path,
         future_stats_path=args.elastic_future_stats_path,
         prefill_headroom_scoped=args.elastic_prefill_headroom_scoped,
+        allow_overlap_schedule=args.elastic_allow_overlap_schedule,
         prefill_workspace_bytes_per_token=(
             args.elastic_prefill_workspace_bytes_per_token
         ),

@@ -32,6 +32,14 @@ python -m elastic_kv \
   --disable-radix-cache
 ```
 
+SGLang's schedule overlap is disabled by the recorded experiment runner. To
+test overlap with V5, omit SGLang's `--disable-overlap-schedule` and pass
+`--elastic-allow-overlap-schedule` (or set
+`EKV_ALLOW_OVERLAP_SCHEDULE=1`). The opt-in is accepted only for V5 and rejects
+two-batch overlap. Before unmapping a VMM chunk, the adapter synchronizes prior
+device work; this protects correctness but also means the option does not yet
+carry a measured end-to-end speedup.
+
 The equivalent installed command is `elastic-sglang`. Environment variables
 remain supported for existing experiment scripts. Explicit elastic command-line
 options take precedence over `EKV_*` values for the current process tree.
@@ -50,6 +58,7 @@ SGLang or touch CUDA.
 | `--elastic-admission-policy` | `logical` | `physical` requires `v5` |
 | `--elastic-prefill-headroom-mib` | `0` | nonnegative integer |
 | `--elastic-prefill-headroom-scoped` | `false` | apply fallback headroom only during prefill scheduling |
+| `--elastic-allow-overlap-schedule` | `false` | experimental V5-only scheduling overlap; two-batch overlap remains unsupported |
 | `--elastic-prefill-workspace-bytes-per-token` | `0` | requires V5 physical admission |
 | `--elastic-prefill-workspace-max-mib` | `256` | positive bound on the waiting-prompt estimate |
 | `--elastic-precommit-chunks` | `0` | bounded chunk lookahead from 0 to 4 |
