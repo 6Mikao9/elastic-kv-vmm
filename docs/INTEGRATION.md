@@ -77,7 +77,9 @@ first-come policy and does not preempt another process's live KV. A caller that
 never reaches the broker, such as another runtime's original CUDA allocator,
 remains outside the guarantee. Dead owners are reclaimed only after the stale
 interval when their PID is gone or the boot ID changed; a live hung owner keeps
-its lease because invalidating it could overcommit still-mapped memory.
+its lease because invalidating it could overcommit still-mapped memory. See
+[the broker architecture](GLOBAL_VMM_BROKER_ZH.md) for lifecycle and validation
+details.
 
 Use a directory or a `{gpu}` path template for a multi-GPU launch. The broker
 uses CUDA visibility metadata (or the device index as a fallback) to validate

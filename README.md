@@ -134,7 +134,9 @@ to forcibly unmap another process: every participating instance must run a
 scheduler boundary. The mechanism covers VMM-backed KV only, uses first-come
 leases, does not include weights, PyTorch workspace or activation allocations,
 does not enforce per-model fairness, and cannot preempt live KV in a process
-that does not participate.
+that does not participate. See the [cross-instance broker design](docs/GLOBAL_VMM_BROKER_ZH.md)
+for lease lifetimes, failure semantics, multi-GPU state paths and the paired
+validation matrix.
 
 `EKV_PREFILL_HEADROOM_SCOPED=1` (or `--elastic-prefill-headroom-scoped`) makes
 the static fallback apply only while native prefill admission is active.
