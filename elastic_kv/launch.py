@@ -4,10 +4,34 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from typing import Sequence
 
 from .config import ACTIVATION_POLICIES, MODES, ElasticConfig
+
+
+SPAWN_INSTALL_ENV = "_ELASTIC_KV_INSTALL_ON_IMPORT"
+
+
+def _install_adapter() -> None:
+    from .adapter import install
+
+    install()
+
+
+def _install_spawned_worker() -> None:
+    """Install in a multiprocessing-spawned worker reconstructing this module.
+
+    The parent sets ``SPAWN_INSTALL_ENV`` only after validating configuration.
+    A normal import used by tests, tooling, and ``--elastic-dry-run`` never
+    imports SGLang or touches CUDA.
+    """
+
+    if os.environ.get(SPAWN_INSTALL_ENV) != "1":
+        return
+    ElasticConfig.from_env().apply()
+    _install_adapter()
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -54,10 +78,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     # Install only after configuration is authoritative. The adapter captures
-    # these environment values at import time in both launcher and workers.
-    from .adapter import install
-
-    install()
+    # these environment values at import time. The sentinel makes a spawned
+    # worker install the same adapter when Python reconstructs this module.
+    os.environ[SPAWN_INSTALL_ENV] = "1"
+    _install_adapter()
     from sglang.srt.entrypoints.http_server import launch_server
     from sglang.srt.server_args import prepare_server_args
 
@@ -67,3 +91,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+# A multiprocessing child re-imports this module without calling ``main``.
+# It inherits the sentinel and no longer sees a half-configured server.
+_install_spawned_worker()

@@ -21,6 +21,17 @@ URL = f"http://{HOST}:{PORT}"
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def server_environment(mode, stats_path, base=None):
+    """Build a clean server environment for one measured mode."""
+    env = dict(os.environ if base is None else base)
+    env["EKV_MODE"] = mode
+    env["PYTHONUNBUFFERED"] = "1"
+    env.pop("EKV_STATS_PATH", None)
+    if mode != "baseline":
+        env["EKV_STATS_PATH"] = str(stats_path)
+    return env
+
+
 def leader_exit(server):
     # Keep the leader unreaped so its process group ID cannot be reused before
     # cleanup, even if the server exits before its workers.
@@ -95,7 +106,8 @@ def main(argv=None):
         if path.exists():
             parser.error(f"output already exists: {path}; choose a new --output-dir")
 
-    sources = ("elastic_kv/adapter.py", "elastic_kv/backing.py", "elastic_kv/launch.py",
+    sources = ("elastic_kv/adapter.py", "elastic_kv/backing.py", "elastic_kv/config.py",
+               "elastic_kv/launch.py", "elastic_kv/__main__.py",
                "elastic_kv/slots.py", "elastic_kv/graph_support.py",
                "elastic_kv/activation.py",
                "native/elastic_vmm.cpp", "benchmarks/client.py", "scripts/run_case.py")
@@ -108,12 +120,7 @@ def main(argv=None):
                            for name in sources}}
     (output / "source_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
-    env = {
-        **os.environ,
-        "EKV_MODE": args.mode,
-        "EKV_STATS_PATH": str(stats_path),
-        "PYTHONUNBUFFERED": "1",
-    }
+    env = server_environment(args.mode, stats_path)
     server_command = [
         sys.executable, "-m", "elastic_kv.launch",
         "--model-path", str(args.model_path.resolve()),

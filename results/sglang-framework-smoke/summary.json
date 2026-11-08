@@ -1,0 +1,108 @@
+{
+  "schema_version": 1,
+  "kind": "real_sglang_vmm_smoke",
+  "workload": "short_serial",
+  "shapes": [
+    [
+      128,
+      64
+    ],
+    [
+      128,
+      64
+    ],
+    [
+      128,
+      64
+    ],
+    [
+      128,
+      64
+    ],
+    [
+      128,
+      64
+    ],
+    [
+      128,
+      64
+    ]
+  ],
+  "repeats": 2,
+  "pairs": {
+    "eager": {
+      "baseline": {
+        "arm": "baseline-2rep",
+        "status": "complete",
+        "throughput": 62.98328749478577,
+        "ttft_median_s": 0.023983199149370193,
+        "tpot_median_s": 0.015756282770621872,
+        "device_peak_bytes": 6686638080,
+        "adapter": null
+      },
+      "v5": {
+        "arm": "v5-eager-2rep-fix",
+        "status": "complete",
+        "throughput": 63.72240691747759,
+        "ttft_median_s": 0.023901333566755056,
+        "tpot_median_s": 0.015582590940452758,
+        "device_peak_bytes": 2928541696,
+        "adapter": {
+          "mode": "v5",
+          "layout": "layer_contiguous_shared_arena",
+          "logical_capacity_bytes": 3758211072,
+          "backed_bytes": 117440512,
+          "peak_backed_bytes": 587202560,
+          "live_tokens": 0,
+          "graph_capture_calls": null,
+          "actual_graph_replay_calls": null,
+          "padded_graph_replay_calls": null,
+          "boundary_sync_ns": 378455
+        }
+      },
+      "changes": {
+        "throughput_fraction": 0.011735167408544855,
+        "ttft_fraction": -0.003413455482117689,
+        "tpot_fraction": -0.011023655306121372,
+        "device_peak_reduction_fraction": 0.5620307752621778
+      }
+    },
+    "graph-pad": {
+      "baseline": {
+        "arm": "baseline-graph-pad-2rep",
+        "status": "complete",
+        "throughput": 353.7706170249358,
+        "ttft_median_s": 0.02311478671617806,
+        "tpot_median_s": 0.0024931171007217872,
+        "device_peak_bytes": 6751649792,
+        "adapter": null
+      },
+      "v5": {
+        "arm": "v5-graph-pad-keep8-2rep",
+        "status": "complete",
+        "throughput": 345.7306251165094,
+        "ttft_median_s": 0.023588820593431592,
+        "tpot_median_s": 0.0025287487780645728,
+        "device_peak_bytes": 2993553408,
+        "adapter": {
+          "mode": "v5",
+          "layout": "layer_contiguous_shared_arena",
+          "logical_capacity_bytes": 3758211072,
+          "backed_bytes": 939524096,
+          "peak_backed_bytes": 2466250752,
+          "live_tokens": 0,
+          "graph_capture_calls": 1,
+          "actual_graph_replay_calls": 3040,
+          "padded_graph_replay_calls": 381,
+          "boundary_sync_ns": 139942
+        }
+      },
+      "changes": {
+        "throughput_fraction": -0.022726567785757434,
+        "ttft_fraction": 0.02050781965129511,
+        "tpot_fraction": 0.014292019148426593,
+        "device_peak_reduction_fraction": 0.5566189745879521
+      }
+    }
+  }
+}

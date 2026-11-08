@@ -19,3 +19,4 @@ results/vllm/pilot*/
 *.bin
 *.pt
 *.pth
+forks/*.tar.gz

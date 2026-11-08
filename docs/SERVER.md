@@ -23,6 +23,11 @@ The equivalent installed command is `elastic-sglang`. Environment variables
 remain supported for existing experiment scripts. Explicit elastic command-line
 options take precedence over `EKV_*` values for the current process tree.
 
+SGLang uses multiprocessing on worker startup. The launcher marks the validated
+configuration and installs the same adapter when Python re-imports the launch
+module in a spawned worker; a dry run or ordinary import does not import
+SGLang or touch CUDA.
+
 | Option | Default | Constraint |
 |---|---:|---|
 | `--elastic-mode` | `baseline` | `baseline`, `v0` through `v5` |
