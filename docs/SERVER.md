@@ -83,6 +83,13 @@ prefill-pressure migration path. `EKV_FUTURE_PREFILL_HORIZON_MS`,
 headroom for native allocation; it does not create future KV or activation
 buffers eagerly. See [the future planner design](FUTURE_PLANNER_DESIGN.md#53-已知未来请求的-prefill-预留).
 
+For active MiniMax KV demotion, `EKV_ADAPTIVE_DEADLINE_GUARD_MS` (default
+`500`) protects requests whose hinted deadline is imminent. Within the same
+guard tier, demotion candidate efficiency is adjusted by hint weight,
+remaining decode work and shared-prefix reuse potential. Missing hints remain
+neutral. The option changes only candidate ordering after the existing
+adaptive budget and migration safety checks have already triggered.
+
 Set `--elastic-future-ordering-horizon-ms` (or `EKV_FUTURE_ORDERING_HORIZON_MS`)
 to make deadline reordering fall back to
 the native queue when any request is still farther than that horizon from its

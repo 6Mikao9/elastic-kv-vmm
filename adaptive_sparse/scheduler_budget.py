@@ -1,25 +1,37 @@
 """MiniMax eager scheduler integration for budget-triggered demotion."""
 
+import hashlib
+import json
+import logging
+import os
+import time
 from collections import Counter, deque
 from dataclasses import replace
 from functools import wraps
-from fractions import Fraction
-import hashlib
 from itertools import combinations
-import logging
-import json
-import os
 from pathlib import Path
-import time
 
 from .adaptive_runtime import MigrationFatal
-from .migration import (
-    abort_demote, abort_promote, commit_demote, commit_promote, plan_demote_pages, prepare_demote, prepare_promote,
-)
 from .future_prefill import (
     FuturePrefillConfig, effective_prefill_headroom, empty_plan,
     plan_future_prefill, reconcile_tp_plan,
 )
+from .migration import (
+    abort_demote,
+    abort_promote,
+    commit_demote,
+    commit_promote,
+    plan_demote_pages,
+    prepare_demote,
+    prepare_promote,
+)
+from .runtime_value import (
+    DEFAULT_DEADLINE_GUARD_MS,
+    merge_demotion_values,
+    rank_demotions,
+    runtime_values,
+)
+from .runtime_value import evidence as runtime_value_evidence
 
 
 SCHEDULER_SHA256S = frozenset({
@@ -305,27 +317,31 @@ def _demand_index_demotion_groups(index, tracker, requests, cost, *, max_group,
     )
 
 
-def _rank_demotions(rank_candidates):
-    ranks = tuple(rank_candidates)
-    if not ranks:
-        return []
-    common = set(ranks[0])
-    for rank in ranks[1:]:
-        common.intersection_update(rank)
-    return sorted(common, key=lambda rid: (
-        -Fraction(min(rank[rid][0] for rank in ranks),
-                  max(1, max(rank[rid][1] for rank in ranks))), rid))
+def _rank_demotions(
+    rank_candidates,
+    rank_values=None,
+    *,
+    deadline_guard_ms=DEFAULT_DEADLINE_GUARD_MS,
+):
+    """Backward-compatible adapter to the pure runtime-value ranker."""
+
+    return rank_demotions(
+        tuple(rank_candidates), tuple(rank_values or ()),
+        guard_ms=deadline_guard_ms,
+    )
 
 
 class SchedulerBudget:
     def __init__(self, budget, headroom, dwell, force_step, low=0, stable=2,
                  observe=16, promote_step=0, stats_path=None, byte_cap=512 << 20,
                  max_group=1, capture_plans=False, trim_low_water=False,
-                 group_search_limit=256):
+                 group_search_limit=256, deadline_guard_ms=DEFAULT_DEADLINE_GUARD_MS):
         if max_group not in (1, 2, 3, 4):
             raise ValueError("max_group must be between 1 and 4")
         if group_search_limit < 1:
             raise ValueError("group_search_limit must be positive")
+        if deadline_guard_ms < 0:
+            raise ValueError("deadline_guard_ms must be nonnegative")
         self.budget = budget
         self.headroom = headroom
         self.dwell = dwell
@@ -340,6 +356,7 @@ class SchedulerBudget:
         self.byte_cap = byte_cap
         self.max_group = max_group
         self.group_search_limit = group_search_limit
+        self.deadline_guard_ms = deadline_guard_ms
         self.capture_plans = capture_plans
         self.trim_low_water = trim_low_water
         self.demand_index = PhysicalDemandIndex()
@@ -371,6 +388,11 @@ class SchedulerBudget:
                       "future_prefill_capped": 0,
                       "future_prefill_tp_fallbacks": 0,
                       "future_prefill_pressure_observations": 0,
+                      "runtime_value_hints": 0,
+                      "runtime_value_invalid": 0,
+                      "runtime_value_guarded": 0,
+                      "deadline_last_resort_actions": 0,
+                      "last_demotion_runtime_values": {},
                       "min_live_bytes": None, "max_live_bytes": 0,
                       "min_reclaimable_bytes": None, "max_reclaimable_bytes": 0}
         self.steps = 0
@@ -560,12 +582,29 @@ class SchedulerBudget:
                                           "released": released_pages,
                                           "predicted_chunks": sorted(chunks)}
 
+        request_values, value_stats = runtime_values(batch.reqs, now_s=now)
+        self.stats["runtime_value_hints"] += value_stats["hinted"]
+        self.stats["runtime_value_invalid"] += value_stats["invalid"]
+        self.stats["runtime_value_guarded"] += sum(
+            value.deadline_guarded(self.deadline_guard_ms)
+            for value in request_values.values()
+        )
+
         def cost(rid):
             return self.transfer_cost(requests[rid][0], coordinator.mem_pool_device)
 
         metrics = {rid: (len(chunks) * tracker.chunk_bytes, cost(rid))
                    for rid, (_, _, _, chunks) in requests.items() if chunks or force}
-        ranked = _rank_demotions(exchange(metrics))
+        ranking_values = exchange({
+            rid: merge_demotion_values(
+                (request_values[rid],), guard_ms=self.deadline_guard_ms
+            )
+            for rid in metrics
+        })
+        ranked = _rank_demotions(
+            exchange(metrics), ranking_values,
+            deadline_guard_ms=self.deadline_guard_ms,
+        )
         if not ranked and not force:
             self.capture_plan(plans, tracker, page_size)
         if ranked:
@@ -592,7 +631,17 @@ class SchedulerBudget:
             self.stats["group_index_truncated"] += int(index_truncated)
             self.stats["rejected_cap"] += rejected_by_cap
             self.stats["group_index_fallbacks"] += int(used_fallback)
-            ranked_groups = _rank_demotions(exchange(groups))
+            group_values = {
+                group: merge_demotion_values(
+                    (request_values[rid] for rid in group),
+                    guard_ms=self.deadline_guard_ms,
+                )
+                for group in groups
+            }
+            ranked_groups = _rank_demotions(
+                exchange(groups), exchange(group_values),
+                deadline_guard_ms=self.deadline_guard_ms,
+            )
             chosen = ranked_groups[0] if ranked_groups else ()
             chunks = group_chunks.get(chosen, set())
         else:
@@ -602,7 +651,8 @@ class SchedulerBudget:
                 self.stats["no_reclaimable_candidate"] += 1
             return
         self.demote_group(chosen, requests, chunks, coordinator, tracker, exchange,
-                          synchronize, force, prefill, sum(cost(rid) for rid in chosen))
+                          synchronize, force, prefill, sum(cost(rid) for rid in chosen),
+                          runtime_values=request_values)
 
     def capture_plan(self, plans, tracker, page_size):
         if (not self.capture_plans or self.stats_path is None or
@@ -632,7 +682,7 @@ class SchedulerBudget:
         temporary.replace(output)
 
     def demote_group(self, chosen, requests, chunks, coordinator, tracker, exchange,
-                     synchronize, force, prefill, transfer):
+                     synchronize, force, prefill, transfer, runtime_values=None):
         started = time.monotonic()
         prepared = []
         error = None
@@ -675,6 +725,20 @@ class SchedulerBudget:
         for rid in chosen:
             self.residency_since[rid] = (False, self.last_change)
         reason = "forced_decode" if force else ("prefill_pressure" if prefill else "decode_pressure")
+        selected_values = {
+            rid: runtime_values.get(rid) for rid in chosen
+        } if runtime_values is not None else {}
+        self.stats["last_demotion_runtime_values"] = {
+            rid: runtime_value_evidence(value, guard_ms=self.deadline_guard_ms)
+            for rid, value in selected_values.items()
+            if value is not None
+        }
+        if any(
+            value is not None and value.deadline_guarded(self.deadline_guard_ms)
+            for value in selected_values.values()
+        ):
+            self.stats["deadline_last_resort_actions"] += 1
+            reason += "_deadline_last_resort"
         if len(chosen) > 1:
             self.stats["group_actions"] += 1
             self.stats["group_requests_demoted"] += len(chosen)
@@ -790,6 +854,9 @@ def install_scheduler_budget():
     group_search_limit = int(os.environ.get(
         "EKV_ADAPTIVE_GROUP_SEARCH_LIMIT", "256"
     ))
+    deadline_guard_ms = int(os.environ.get(
+        "EKV_ADAPTIVE_DEADLINE_GUARD_MS", str(DEFAULT_DEADLINE_GUARD_MS)
+    ))
     capture_plans = os.environ.get("EKV_ADAPTIVE_PLAN_CAPTURE") == "1"
     trim_low_water = os.environ.get("EKV_ADAPTIVE_TRIM_LOW_WATER") == "1"
     future_mode = os.environ.get("EKV_FUTURE_PREFILL_MODE", "off")
@@ -816,6 +883,7 @@ def install_scheduler_budget():
         return
     if (min(budget, headroom, force, dwell, low, stable, promote) < 0
             or observe < 1 or cap < 1 or group_search_limit < 1
+            or deadline_guard_ms < 0
             or max_group not in (1, 2, 3, 4)
             or (low and low >= budget) or (promote and (not force or promote <= force))):
         raise ValueError("adaptive scheduler settings must be nonnegative")
@@ -852,7 +920,7 @@ def install_scheduler_budget():
                           if stats_dir else None)
             self._ekv_adaptive_budget = SchedulerBudget(
                 budget, headroom, dwell, force, low, stable, observe, promote, stats_path, cap, max_group, capture_plans,
-                trim_low_water, group_search_limit)
+                trim_low_water, group_search_limit, deadline_guard_ms)
 
         def exchange(value):
             if coordinator.tp_world_size == 1:

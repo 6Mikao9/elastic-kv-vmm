@@ -89,7 +89,13 @@ stable interval and minimum dwell time govern promotion eligibility. The
 policy also bounds migration traffic and checks whether promotion can
 allocate a complete destination while the source remains live. Forced
 decode steps support controlled tests of both directions.
-[Scheduler budget](../adaptive_sparse/scheduler_budget.py)
+When a request has `kv_hints`, demotion ranking divides the existing
+byte-efficiency term by a bounded retention value derived from business
+weight, remaining output, deadline distance and shared-prefix reuse potential.
+An imminent deadline protects an individual or joint candidate from ordinary
+pressure; SGLang's hard priority and native admission remain unchanged.
+[Scheduler budget](../adaptive_sparse/scheduler_budget.py) ·
+[Runtime value](../adaptive_sparse/runtime_value.py)
 
 The planner counts releasable physical chunks using the page ownership
 tracker. A long request can have few exclusive chunks if pages from

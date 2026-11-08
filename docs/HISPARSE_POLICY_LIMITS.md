@@ -6,7 +6,7 @@
 
 ## 候选与迁移成本
 
-Demotion 按各 rank 最小可回收字节除以最大传输字节排序，请求 ID 只用于平局。预测基于独占物理 chunk，迁移后另记录实际净释放。双请求候选按两者释放页的并集重新计算 chunk 引用，且要求每个 rank 的净释放预测为正。单请求或双请求事务的传输上限默认每 rank 512 MiB，可用 EKV_ADAPTIVE_MIGRATION_BYTE_CAP 调整。当前缺少滚动带宽和耗时额度。后续可用实测拷贝速率做启动前筛选。
+Demotion 先按各 rank 最小可回收字节除以最大传输字节计算迁移效率。请求携带 `kv_hints` 时，效率再除以一个有界 retention value：业务权重、剩余输出 token、距 deadline 的时间和可能复用的共享前缀长度会提高驻留价值；`kind` 与 `prefix_group` 原样写入决策遥测。距离 deadline 不超过 `EKV_ADAPTIVE_DEADLINE_GUARD_MS`（默认 500 ms）的请求进入保护层，只在没有普通候选或强制迁移时最后降级；联合候选只要有一个成员受保护，整组也进入保护层。该值只影响已有迁移预算内的候选顺序，不覆盖 SGLang 原生硬 priority、准入或请求所有权。缺失或非法 hint 使用中性值，因此传统流量仍保持原排序。预测基于独占物理 chunk，迁移后另记录实际净释放。双请求候选按两者释放页的并集重新计算 chunk 引用，且要求每个 rank 的净释放预测为正。单请求或双请求事务的传输上限默认每 rank 512 MiB，可用 EKV_ADAPTIVE_MIGRATION_BYTE_CAP 调整。当前缺少滚动带宽和耗时额度。后续可用实测拷贝速率做启动前筛选。
 
 ## 防抖与 prefill 余量
 

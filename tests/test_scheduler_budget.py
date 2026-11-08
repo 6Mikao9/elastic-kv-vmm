@@ -1,8 +1,8 @@
+import unittest
 from collections import Counter
 from itertools import combinations
 from random import Random
 from types import SimpleNamespace as B
-import unittest
 from unittest.mock import Mock, call, patch
 
 from adaptive_sparse.scheduler_budget import (
@@ -12,6 +12,7 @@ from adaptive_sparse.scheduler_budget import (
     _releasable, _releasable_counts, _releasable_group, _releasable_pair,
 )
 from adaptive_sparse.future_prefill import empty_plan
+from adaptive_sparse.runtime_value import RuntimeRequestValue, merge_demotion_values
 
 
 class SchedulerBudgetTest(unittest.TestCase):
@@ -82,6 +83,18 @@ class SchedulerBudgetTest(unittest.TestCase):
         self.assertEqual(_rank_demotions(ranks), ["b", "a"])
         self.assertEqual(_rank_demotions(ranks[::-1]), ["b", "a"])
         self.assertEqual(_rank_demotions(()), [])
+
+    def test_common_rank_uses_runtime_value_and_deadline_guard(self):
+        ranks = [{"a": (100, 10), "b": (100, 10)}]
+        values = [{
+            "a": merge_demotion_values([
+                RuntimeRequestValue("a", weight=64, remaining_output_tokens=1024)
+            ]),
+            "b": merge_demotion_values([
+                RuntimeRequestValue("b", deadline_remaining_ms=50)
+            ]),
+        }]
+        self.assertEqual(_rank_demotions(ranks, values, deadline_guard_ms=500), ["a", "b"])
 
     def test_releasable_group_requires_every_shared_chunk_owner(self):
         tracker = B(

@@ -101,6 +101,13 @@ deadline ordering, static residency and live elastic residency using the same
 requests and report capacity delay, demotions, deadline misses, TTFT/TPOT and
 whole-device memory separately.
 
+Active residency now consumes the same immutable hint at demotion time.  A
+conservative retention value combines business weight, remaining decode work,
+deadline distance, and potential shared-prefix reuse; imminent deadlines and
+joint request groups are ranked in a protected tier.  Missing hints remain
+neutral, so legacy ordering is unchanged.  This is a tested CPU policy path;
+serving gains still require the pending exclusive-GPU comparison.
+
 ### Performance targets and next optimizations (2026-11-04)
 
 The dynamic policy has two reference targets: approach fully GPU-resident

@@ -31,6 +31,11 @@ def remember_request_decision(
     native_buffer_tokens: int,
     slots_available: bool,
     tp_world_size: int,
+    weight: float | None = None,
+    deadline_after_ms: int | None = None,
+    kind: str | None = None,
+    prefix_group: str | None = None,
+    shared_prefix_tokens: int = 0,
 ) -> None:
     """Keep bounded, rank-local evidence for the executor to reconcile."""
 
@@ -50,6 +55,11 @@ def remember_request_decision(
         "native_buffer_tokens": native_buffer_tokens,
         "slots_available": slots_available,
         "tp_world_size": tp_world_size,
+        "weight": weight,
+        "deadline_after_ms": deadline_after_ms,
+        "kind": kind,
+        "prefix_group": prefix_group,
+        "shared_prefix_tokens": shared_prefix_tokens,
         "timestamp_monotonic_ns": time.monotonic_ns(),
     }
     while len(decisions) > _REQUEST_DECISION_LIMIT:
@@ -182,12 +192,12 @@ def install_request_residency():
         stats["resident_broker"] = snapshot
         return snapshot
 
-    def promotion_plan(req):
+    def promotion_plan(coordinator, req):
         """Capture a promotion's budget before native cleanup mutates request state."""
-        pool = self.mem_pool_device
+        pool = coordinator.mem_pool_device
         current_tokens = req.kv.kv_committed_len
         predicted_total = hinted_output_tokens(req)
-        baseline = self._ekv_broker_baseline_tokens.get(req.kv.req_pool_idx)
+        baseline = coordinator._ekv_broker_baseline_tokens.get(req.kv.req_pool_idx)
         if predicted_total is not None and baseline is not None:
             predicted_total = remaining_output_tokens(
                 predicted_total=predicted_total,
@@ -203,7 +213,7 @@ def install_request_residency():
         if broker_mode == "off":
             return True
         pool = self.mem_pool_device
-        current_tokens, growth_slots, _, token_bytes = promotion_plan(req)
+        current_tokens, growth_slots, _, token_bytes = promotion_plan(self, req)
         required_slots = page_aligned_slots(current_tokens, pool.page_size) + growth_slots
         decision = self._ekv_residency_broker.assess(
             req.kv.req_pool_idx,
@@ -220,7 +230,7 @@ def install_request_residency():
     def broker_promotion_plan(self, req):
         if broker_mode == "off":
             return None
-        return promotion_plan(req)
+        return promotion_plan(self, req)
 
     def broker_commit_promotion(self, req, growth_bytes):
         if broker_mode == "off":
@@ -248,6 +258,8 @@ def install_request_residency():
             )
 
         residence = expected = None
+        hint_weight = hint_deadline = hint_kind = hint_prefix = None
+        hint_shared_prefix_tokens = 0
         claim = True
         decline_reason = None
         claim_reason = None
@@ -265,6 +277,11 @@ def install_request_residency():
                 native_buffer_tokens=self.device_buffer_size,
                 slots_available=slots_available,
                 tp_world_size=self.tp_world_size,
+                weight=hint_weight,
+                deadline_after_ms=hint_deadline,
+                kind=hint_kind,
+                prefix_group=hint_prefix,
+                shared_prefix_tokens=hint_shared_prefix_tokens,
             )
 
         def adopt_native(reason=None):
@@ -287,6 +304,11 @@ def install_request_residency():
             else:
                 residence = hint.residence
                 expected = hint.expected_output_tokens
+                hint_weight = hint.weight
+                hint_deadline = hint.deadline_after_ms
+                hint_kind = hint.kind
+                hint_prefix = hint.prefix_group
+                hint_shared_prefix_tokens = hint.shared_prefix_tokens
             decision = decide_resident_claim(
                 sequence_tokens=req.kv.kv_allocated_len,
                 native_buffer_tokens=self.device_buffer_size,

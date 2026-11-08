@@ -210,6 +210,7 @@ def main():
     parser.add_argument("--adaptive-migration-cap-mib", type=int, default=512)
     parser.add_argument("--adaptive-max-group", type=int, choices=(1, 2, 3, 4), default=1)
     parser.add_argument("--adaptive-group-search-limit", type=int, default=256)
+    parser.add_argument("--adaptive-deadline-guard-ms", type=int, default=500)
     parser.add_argument("--adaptive-plan-capture", action="store_true")
     parser.add_argument("--adaptive-trim-low-water", action="store_true")
     parser.add_argument("--chunk-aware-retention", action="store_true")
@@ -331,6 +332,7 @@ def main():
         "EKV_ADAPTIVE_MIGRATION_BYTE_CAP": args.adaptive_migration_cap_mib * (1 << 20),
         "EKV_ADAPTIVE_MAX_GROUP": args.adaptive_max_group,
         "EKV_ADAPTIVE_GROUP_SEARCH_LIMIT": args.adaptive_group_search_limit,
+        "EKV_ADAPTIVE_DEADLINE_GUARD_MS": args.adaptive_deadline_guard_ms,
         "EKV_ADAPTIVE_PLAN_CAPTURE": int(args.adaptive_plan_capture),
         "EKV_ADAPTIVE_TRIM_LOW_WATER": int(args.adaptive_trim_low_water),
     }
@@ -514,7 +516,7 @@ def main():
     if adaptive:
         sources += ("adaptive_sparse/scheduler_budget.py", "adaptive_sparse/migration.py",
                     "adaptive_sparse/adaptive_runtime.py", "adaptive_sparse/policy.py",
-                    "adaptive_sparse/future_prefill.py")
+                    "adaptive_sparse/future_prefill.py", "adaptive_sparse/runtime_value.py")
     with zipfile.ZipFile(output / "source_snapshot.zip", "x", compression=zipfile.ZIP_DEFLATED) as archive:
         for name in dict.fromkeys(sources):
             if Path(name).suffix in (".py", ".cpp", ".sh"):
