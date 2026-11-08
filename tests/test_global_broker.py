@@ -56,6 +56,15 @@ class GlobalAdmissionBrokerTest(unittest.TestCase):
             self.path, capacity, owner_id=owner, heartbeat_seconds=None, **kwargs
         )
 
+    def test_reuses_a_connection_within_one_thread(self):
+        broker = self.broker("owner")
+        try:
+            self.assertIs(broker._connect(), broker._connect())
+            self.assertTrue(broker.claim("prefill-0", 1).admit)
+            self.assertEqual(broker.release_claim("prefill-0"), 1)
+        finally:
+            broker.close()
+
     def test_two_owners_share_one_capacity_without_partial_leases(self):
         first = self.broker("first")
         second = self.broker("second")

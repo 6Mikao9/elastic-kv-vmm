@@ -113,7 +113,8 @@ broker file and give it one aggregate VMM capacity:
 
 ```bash
 --elastic-global-broker-path /run/ekv/gpu0.sqlite \
---elastic-global-broker-mib 6144
+--elastic-global-broker-mib 6144 \
+--elastic-global-broker-prefill-mode observe
 ```
 
 Each `Backing` reserves chunk leases before `cuMemMap` and returns them only
@@ -123,6 +124,17 @@ current free bytes from native physical admission. For TP or other multi-GPU
 launches, pass a directory or a `{gpu}` path template so every physical GPU gets
 its own state file, for example `/run/ekv/gpu-{gpu}.sqlite`. Resource metadata
 rejects accidental reuse of one file across GPUs.
+
+The opt-in `observe` prefill mode compares the waiting-prompt activation
+estimate with the shared broker and records whether it would fit. `enforce`
+atomically claims the estimate before SGLang chooses the prefill batch, so a
+peer process cannot spend the same VMM headroom first. The claim is released
+only after the matching model forward succeeds; empty batches release it
+immediately. A failed scheduler or forward keeps the claim until backend
+teardown rather than assuming uncertain activation state is quiescent. This
+coordinates the admission budget but leaves PyTorch's activation allocation
+outside VMM ownership. Start with `observe`, then compare both arms on the same
+GPU; CPU tests alone do not establish a serving throughput benefit.
 
 For cooperative fair sharing between two models, assign every process of one
 model a stable tenant and weight. Start with `observe` to verify the target and
@@ -304,7 +316,7 @@ See the [integration map](docs/INTEGRATION.md) for changed components, Graph lif
 - `v0` and `v1` reclaim empty chunks on logical frees. The later arms defer reclamation until the instance is idle; they therefore do not promise prompt return of all slack under a permanently busy workload.
 - A fixed virtual address is not sufficient to make arbitrary unmapping safe. SGLang Graph padding uses a permanently backed sink row and maps real slots before replay. Overlap scheduling, speculative decoding, HiCache/PD transfers, prefix-cache retention and hybrid recurrent states remain unsupported. vLLM Graph execution remains unsupported.
 - CUDA allocation failures are fail-stop. A successfully mapped earlier plane may remain allocated until worker teardown if a later plane fails. There is no transactional OOM recovery or hard per-tenant partition; the optional broker can apply cooperative weighted soft shares and recovers a dead owner's leases only after proving the process or boot generation is gone.
-- A shared SQLite VMM broker can prevent independently mapped K/V chunks from exceeding one configured aggregate capacity, and both instances still release idle backing to the driver. `EKV_GLOBAL_BROKER_FAIR_MODE=enforce` adds weighted soft shares between explicit tenants and records unmet demand for anti-starvation. Dense V5 admission and MiniMax demotion both consume the result. The broker can deny growth but cannot unmap another live process's KV or transfer live KV, so fairness is cooperative, soft and limited to VMM-backed KV. Model weights and activation allocators remain outside its budget, and no dual-instance GPU throughput comparison has yet been completed.
+- A shared SQLite VMM broker can prevent independently mapped K/V chunks from exceeding one configured aggregate capacity, and both instances still release idle backing to the driver. Dense V5 can additionally reserve a calibrated prefill-workspace estimate as a temporary claim before batch selection; `observe` records would-admit and `enforce` atomically competes with VMM leases. `EKV_GLOBAL_BROKER_FAIR_MODE=enforce` adds weighted soft shares between explicit tenants and records unmet demand for anti-starvation. Dense V5 admission and MiniMax demotion both consume the result. The broker can deny growth but cannot unmap another live process's KV or transfer live KV, so fairness is cooperative and soft. Model weights, PyTorch activation allocation ownership, Graph pools and caches remain outside the mapped budget, and no dual-instance GPU throughput comparison has yet been completed.
 - Optional V5 activation policies measure prefill demand, trim unused retained KV chunks before prefill under pressure, and return actually releasable PyTorch cache before new VMM commitment. They never evict live KV or release Graph pools. Headroom is empirical; unresolved pressure is recorded, not converted into scheduler backpressure. This is not a guaranteed activation-budget lender or OOM recovery system.
 
 ## Related work

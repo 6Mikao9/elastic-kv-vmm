@@ -13,6 +13,7 @@ from .config import (
     ADMISSION_POLICIES,
     FUTURE_POLICIES,
     GLOBAL_BROKER_FAIR_MODES,
+    GLOBAL_BROKER_PREFILL_MODES,
     MODES,
     ElasticConfig,
 )
@@ -87,6 +88,10 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--elastic-global-broker-wait-ms", type=int)
     parser.add_argument(
+        "--elastic-global-broker-prefill-mode",
+        choices=GLOBAL_BROKER_PREFILL_MODES,
+    )
+    parser.add_argument(
         "--elastic-dry-run",
         action="store_true",
         help="validate and print the resolved backend settings without importing SGLang",
@@ -125,6 +130,7 @@ def resolve_config(argv: Sequence[str]) -> tuple[ElasticConfig, list[str], bool]
             args.elastic_global_broker_demand_ttl_seconds
         ),
         global_broker_wait_ms=args.elastic_global_broker_wait_ms,
+        global_broker_prefill_mode=args.elastic_global_broker_prefill_mode,
     )
     return config, sglang_argv, args.elastic_dry_run
 

@@ -4,7 +4,7 @@
 共享的准入层。它仍然保留 SGLang 的调度器、注意力内核和逻辑 slot/block；改变的是
 `cuMemMap` 之前由谁确认整张 GPU 上还能映射多少物理块。
 
-当前实现解决四件事：
+当前实现解决五件事：
 
 1. 同卡两个实例不会在并发扩池时各自看见同一份空闲显存，然后一起超卖。
 2. 一个实例映射或卸载失败时，broker 不会提前释放仍可能被 CUDA 映射的租约。
@@ -12,6 +12,8 @@
    的长驻请求，并在容量稳定恢复后再允许提升。
 4. 多个模型租户可以按稳定 `tenant_id` 和权重获得软公平份额；等待中的租户会发布
    短期容量需求，超额租户因此在全局显存耗尽前就停止继续增长并进入协作回收。
+5. Dense V5 可以在 prefill batch 选择前，把校准后的 activation workspace
+   估算作为临时容量 claim 与 VMM lease 放进同一个原子预算。
 
 它还没有实现跨进程强制卸载。一个不参与 scheduler hook 的进程，或仍持有活 KV
 的另一个模型，不会被 broker 直接改写。
@@ -59,6 +61,20 @@ Dense V5 在 SGLang 调用 allocator `available_size()` 时，同时读取：
 
 最终 token 准则取这些约束的最小值。已经映射的空洞和已 precommit 的 chunk 不会
 被重复收费。
+
+prefill 的临时 claim 默认关闭。`EKV_GLOBAL_BROKER_PREFILL_MODE=observe` 只比较
+等待队列的 workspace 估算和 broker 当前余量，不插入记录；`enforce` 在
+`Scheduler.get_new_batch_prefill` 选择 batch 前原子插入 claim。broker 的可用字节
+和 fairness 用量都会同时扣除 lease 与 claim，因此预热/压缩之后能腾出的空间不会
+被两个实例在同一时刻重复花掉。`ModelRunner.forward` 成功返回后才删除 claim；
+scheduler 返回空 batch 时立即删除。scheduler 或 forward 抛错时不猜测激活和在途
+kernel 已经静止，claim 保留到 backend/process teardown。
+
+这个 claim 只是跨进程准入承诺，不拥有 PyTorch 实际分配的 activation。启用它需要
+V5 physical admission、有效 broker 和正的
+`EKV_PREFILL_WORKSPACE_BYTES_PER_TOKEN`；估算仍应由目标模型和 prefill chunk 校准。
+先跑 `observe`，确认 would-admit、claim denial、TTFT/TPOT 和整卡 NVML 后再用
+`enforce`。
 
 ### MiniMax 请求级 HiSparse
 
@@ -143,6 +159,15 @@ EKV_GLOBAL_BROKER_DEMAND_TTL_SECONDS=10
 EKV_GLOBAL_BROKER_WAIT_MS=0
 ```
 
+Dense V5 的跨实例 prefill 准入示例：
+
+```bash
+EKV_ADMISSION_POLICY=physical
+EKV_PREFILL_WORKSPACE_BYTES_PER_TOKEN=1536
+EKV_PREFILL_WORKSPACE_MAX_MIB=768
+EKV_GLOBAL_BROKER_PREFILL_MODE=observe  # 先观察；验收通过后改 enforce
+```
+
 同一 tenant 的所有进程必须使用相同权重。公平模式和权重会写入状态文件，运行中
 配置不一致会 fail closed。更换模式或权重应在所有实例正常退出后使用新状态文件，
 或者清理已确认无活租约的旧状态文件；不要在不清楚 native mapping 是否仍存活时
@@ -179,14 +204,15 @@ PyTorch allocator cache、Graph private pool 和 activation workspace 仍然由�
 - `off` 模式仍先到先得；`enforce` 只提供软公平，不保证瞬时精确到字节。
 - 压力协调依赖实例运行 scheduler hook；它不能控制未接入 broker 的 allocator。
 - 没有跨进程 live-KV 传输，也没有可由 broker 单方面触发的 safe preemption。
-- MiniMax 的 indexer、权重、activation 和 Graph pool 不在当前 VMM 预算内。
+- MiniMax 的 indexer、权重、Graph pool，以及 Dense V5 实际由 PyTorch 分配的
+  activation 仍不在当前 VMM backing 所有权内；prefill claim 只协调准入预算。
 - 同进程、同一完整 prefix 的 resident donor 已能直接服务 HiSparse Top-K；跨实例
   共享前缀、部分 block 共享和 donor 完成后的 pinning 尚未接入。
 - 还没有使用真实双实例、多 TP 规模完成端到端时延和 OOM 对照；dense
   双实例的可执行 arm、采样字段和验收条件见
   [双实例验证设计](DUAL_INSTANCE_VALIDATION_ZH.md)。
-- 公平预算仍只覆盖 VMM-backed KV；prefill 激活、权重、PyTorch cache 和 Graph
-  private pool 仍是外部预算。
+- 公平预算覆盖 VMM-backed KV 与可选的 prefill capacity claim；权重、PyTorch
+  cache、Graph private pool 和 claim 后面的真实 activation allocation 仍是外部预算。
 
 ## 下一轮验证
 
@@ -222,3 +248,16 @@ CPU 上可以用 `python -m benchmarks.global_broker_latency` 单独测 SQLite �
 连接及调度噪声，不能外推到 Linux/tmpfs 或 GPU 服务路径。该基准只覆盖控制面，
 不包含 `cuMemMap`、模型计算或真实双实例竞争。
 [原始结果](../results/global-broker-latency/windows-cpu-20261109.json)
+
+加入 prefill claim 后，第一版仍为每次操作重新打开 SQLite，`claim+release`
+中位数为 8.616/8.575/8.319 ms（`off/observe/enforce`），会明显放大 prefill
+边界开销。broker 现改为每个调用线程复用连接，并在 close 时统一关闭所有线程的
+连接；同一 500 次基准中，`claim+release` 中位数降至
+1.200/1.208/1.194 ms，p95 为 1.380/1.377/1.361 ms。`reserve+release` 也由约
+8.6 ms 降至约 1.22 ms。快照中位数由约 1.6–1.7 ms 降至 49–61 µs。
+
+这组对比只证明 Windows CPU 上的控制面连接复用有效，仍不代表 GPU 服务热路径延迟
+或端到端吞吐；真实部署应在目标 Linux/tmpfs 文件系统上重跑，并测 prefill 边界的
+TTFT。改造前、后原始文件分别为
+[per-call](../results/global-broker-latency/windows-cpu-claims-per-call-20261109.json)
+和 [复用连接](../results/global-broker-latency/windows-cpu-claims-reused-20261109.json)。

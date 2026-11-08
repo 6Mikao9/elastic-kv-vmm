@@ -882,7 +882,11 @@ def install():
         runner.ModelRunner.init_memory_pool = guarded_init
     from .graph_support import install_graph_hooks
     install_graph_hooks()
-    if MODE != "v5" and os.environ.get("EKV_ACTIVATION_POLICY", "off") != "off":
-        raise RuntimeError("Activation policies currently require V5")
+    activation_requested = (
+        os.environ.get("EKV_ACTIVATION_POLICY", "off") != "off"
+        or os.environ.get("EKV_GLOBAL_BROKER_PREFILL_MODE", "off") != "off"
+    )
+    if MODE != "v5" and activation_requested:
+        raise RuntimeError("Activation and prefill-claim policies currently require V5")
     activation.install_activation_hooks()
     _installed = True

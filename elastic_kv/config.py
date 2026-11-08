@@ -30,6 +30,7 @@ DEFAULT_PRECOMMIT_CHUNKS = 0
 DEFAULT_FUTURE_ORDERING_HORIZON_MS = 0
 DEFAULT_GLOBAL_BROKER_STALE_SECONDS = 120
 GLOBAL_BROKER_FAIR_MODES = ("off", "observe", "enforce")
+GLOBAL_BROKER_PREFILL_MODES = ("off", "observe", "enforce")
 
 
 def _integer(name: str, value: object, *, minimum: int) -> int:
@@ -93,6 +94,7 @@ class ElasticConfig:
     global_broker_tenant_weight: float = 1.0
     global_broker_demand_ttl_seconds: float = 10.0
     global_broker_wait_ms: int = 0
+    global_broker_prefill_mode: str = "off"
 
     def __post_init__(self) -> None:
         if self.mode not in MODES:
@@ -153,6 +155,8 @@ class ElasticConfig:
             raise ValueError("global broker demand TTL must be positive")
         if not 0 <= self.global_broker_wait_ms <= 5_000:
             raise ValueError("global broker wait must be between 0 and 5000 ms")
+        if self.global_broker_prefill_mode not in GLOBAL_BROKER_PREFILL_MODES:
+            raise ValueError("unknown global broker prefill mode")
         if bool(self.global_broker_path) != (self.global_broker_mib > 0):
             raise ValueError(
                 "global broker requires both a path and a positive capacity"
@@ -161,6 +165,19 @@ class ElasticConfig:
             raise ValueError(
                 "fair global broker requires an enabled broker path and capacity"
             )
+        if self.global_broker_prefill_mode != "off":
+            if not self.global_broker_path:
+                raise ValueError(
+                    "global broker prefill claims require an enabled broker path and capacity"
+                )
+            if self.mode != "v5" or self.admission_policy != "physical":
+                raise ValueError(
+                    "global broker prefill claims require v5 physical admission"
+                )
+            if self.prefill_workspace_bytes_per_token <= 0:
+                raise ValueError(
+                    "global broker prefill claims require a positive workspace estimate"
+                )
         if self.activation_policy != "off" and self.mode != "v5":
             raise ValueError("activation policies require elastic mode v5")
         if self.admission_policy != "logical" and self.mode != "v5":
@@ -280,6 +297,9 @@ class ElasticConfig:
                 env.get("EKV_GLOBAL_BROKER_WAIT_MS", "0"),
                 minimum=0,
             ),
+            global_broker_prefill_mode=env.get(
+                "EKV_GLOBAL_BROKER_PREFILL_MODE", "off"
+            ).strip().lower(),
         )
 
     def with_overrides(
@@ -308,6 +328,7 @@ class ElasticConfig:
         global_broker_tenant_weight: float | None = None,
         global_broker_demand_ttl_seconds: float | None = None,
         global_broker_wait_ms: int | None = None,
+        global_broker_prefill_mode: str | None = None,
     ) -> "ElasticConfig":
         changes = {
             key: value
@@ -341,6 +362,7 @@ class ElasticConfig:
                     global_broker_demand_ttl_seconds,
                 ),
                 ("global_broker_wait_ms", global_broker_wait_ms),
+                ("global_broker_prefill_mode", global_broker_prefill_mode),
             )
             if value is not None
         }
@@ -381,6 +403,7 @@ class ElasticConfig:
                 self.global_broker_demand_ttl_seconds
             ),
             "EKV_GLOBAL_BROKER_WAIT_MS": str(self.global_broker_wait_ms),
+            "EKV_GLOBAL_BROKER_PREFILL_MODE": self.global_broker_prefill_mode,
         }
         if self.stats_path is not None:
             result["EKV_STATS_PATH"] = self.stats_path
@@ -434,6 +457,7 @@ class ElasticConfig:
                 self.global_broker_demand_ttl_seconds
             ),
             "global_broker_wait_ms": self.global_broker_wait_ms,
+            "global_broker_prefill_mode": self.global_broker_prefill_mode,
         }
 
     def to_json(self) -> str:

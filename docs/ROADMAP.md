@@ -17,8 +17,11 @@ changing the attention addressing model:
    prefill token budget through SGLang's native `available_size()` call. A
    per-GPU SQLite broker now provides cross-process VMM leases, dense/MiniMax
    pressure signals, and opt-in weighted soft fairness between explicit tenant
-   ids. Exact hard partitions, activation ownership and transactional OOM
-   recovery remain open.
+   ids. A temporary prefill capacity claim now shares the same atomic broker
+   budget as VMM leases before batch selection and is released at the successful
+   forward boundary; observe mode records would-admit without mutation. Exact
+   hard partitions, true activation ownership and transactional OOM recovery
+   remain open.
 5. Add a vLLM implementation using existing local model snapshots read-only,
    and validate correctness, memory and serving efficiency against vLLM's
    own baseline.

@@ -1,8 +1,10 @@
 """Cross-process leases for aggregate CUDA VMM physical backing.
 
 The broker coordinates callers on one host and one device.  It is deliberately
-limited to chunks that a ``Backing`` is about to map; model weights, allocator
-caches and activations remain outside its capacity.
+limited to chunks that a ``Backing`` is about to map plus optional temporary
+capacity claims. Model weights and allocator caches remain outside its
+capacity; a prefill claim reserves admission budget without owning the later
+PyTorch activation allocation.
 """
 
 from __future__ import annotations
@@ -165,7 +167,14 @@ class GlobalAdmissionBroker:
         self._closed = False
         self._stop = threading.Event()
         self._heartbeat_thread = None
-        self._initialize()
+        self._local = threading.local()
+        self._connections = set()
+        self._connections_lock = threading.Lock()
+        try:
+            self._initialize()
+        except BaseException:
+            self._close_all_connections()
+            raise
         if heartbeat_seconds is not None:
             self._heartbeat_thread = threading.Thread(
                 target=self._heartbeat_loop,
@@ -176,19 +185,55 @@ class GlobalAdmissionBroker:
             self._heartbeat_thread.start()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(
-            str(self.path), timeout=self.timeout_seconds, isolation_level=None
-        )
-        connection.execute(f"PRAGMA busy_timeout = {int(self.timeout_seconds * 1000)}")
+        connection = getattr(self._local, "connection", None)
+        if connection is None:
+            connection = sqlite3.connect(
+                str(self.path),
+                timeout=self.timeout_seconds,
+                isolation_level=None,
+                check_same_thread=False,
+            )
+            connection.execute(
+                f"PRAGMA busy_timeout = {int(self.timeout_seconds * 1000)}"
+            )
+            self._local.connection = connection
+            with self._connections_lock:
+                self._connections.add(connection)
         return connection
+
+    def _close_thread_connection(self) -> None:
+        connection = getattr(self._local, "connection", None)
+        if connection is None:
+            return
+        self._local.connection = None
+        with self._connections_lock:
+            self._connections.discard(connection)
+        if connection.in_transaction:
+            connection.rollback()
+        connection.close()
+
+    def _close_all_connections(self) -> None:
+        with self._connections_lock:
+            connections = tuple(self._connections)
+            self._connections.clear()
+        for connection in connections:
+            try:
+                if connection.in_transaction:
+                    connection.rollback()
+                connection.close()
+            except sqlite3.Error:
+                pass
 
     @contextmanager
     def _connection(self):
         connection = self._connect()
         try:
             yield connection
-        finally:
-            connection.close()
+        except BaseException:
+            if connection.in_transaction:
+                connection.rollback()
+            self._close_thread_connection()
+            raise
 
     def _initialize(self) -> None:
         now = time.time()
@@ -876,6 +921,7 @@ class GlobalAdmissionBroker:
         self._stop.set()
         if self._heartbeat_thread is not None:
             self._heartbeat_thread.join(timeout=max(1.0, self.timeout_seconds))
+        self._close_all_connections()
 
     def _heartbeat_loop(self, interval: float) -> None:
         while not self._stop.wait(interval):

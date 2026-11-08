@@ -24,6 +24,7 @@ python -m elastic_kv \
   --elastic-prefill-workspace-max-mib 1024 \
   --elastic-global-broker-path /run/ekv/gpu0.sqlite \
   --elastic-global-broker-mib 6144 \
+  --elastic-global-broker-prefill-mode observe \
   --model-path /models/Qwen3-0.6B-Base \
   --attention-backend triton \
   --page-size 1 \
@@ -65,6 +66,7 @@ SGLang or touch CUDA.
 | `--elastic-global-broker-tenant-weight` | `1` | positive weight shared by every owner of the tenant |
 | `--elastic-global-broker-demand-ttl-seconds` | `10` | lifetime of a denied request's starvation signal |
 | `--elastic-global-broker-wait-ms` | `0` | bounded lease retry from 0 to 5000 ms |
+| `--elastic-global-broker-prefill-mode` | `off` | `off`, `observe`, or `enforce`; requires V5 physical admission, broker capacity, and a positive workspace estimate |
 
 The CLI currently launches the guarded dense-MHA scope documented in
 [integration](INTEGRATION.md). Unsupported SGLang configurations fail at
@@ -87,7 +89,7 @@ the same `--elastic-global-broker-path` and the same aggregate
 a `{gpu}` template such as `/run/ekv/gpu-{gpu}.sqlite`. The SQLite transaction is
 the cross-process admission point, and a lease is kept until the corresponding
 chunk is unambiguously unmapped. This coordinates VMM backing only. Weights,
-PyTorch caches and activations are outside the capacity. The default remains
+PyTorch caches and activations are outside the mapped capacity. The default remains
 first-come. `observe` reports weighted shares and would-yield decisions;
 `enforce` adds cooperative soft fairness, and another process's live KV is never
 forcibly preempted.
@@ -103,7 +105,15 @@ fallback are combined with `max`, because both model the same transient
 workspace. `--elastic-prefill-headroom-scoped` removes the fallback from decode
 admission and applies it only while native prefill admission is running. The
 rate is still a calibrated model-specific estimate; it does not own or resize
-PyTorch's internal activation allocations.
+PyTorch's internal activation allocations. `--elastic-global-broker-prefill-mode
+observe` reports whether the estimate would fit the shared broker without
+inserting a claim. `enforce` inserts one temporary claim before
+`get_new_batch_prefill` and releases it only after the corresponding
+`ModelRunner.forward` succeeds. A denied claim returns no prefill batch. A
+scheduler or forward exception deliberately retains the claim until process or
+backend teardown because activation and in-flight access quiescence cannot be
+proved. This mode coordinates admission against concurrent VMM growth; it does
+not make the activation allocation itself VMM-backed.
 
 Set `--elastic-future-stats-path` (or `EKV_FUTURE_STATS_PATH`) to atomically
 export scheduler hook counters from `adaptive_sparse.sglang_future_hook`; these

@@ -44,6 +44,7 @@ def _run_mode(mode, iterations, directory):
     )
     owners = (first, second)
     samples_us = []
+    claim_samples_us = []
     snapshot_samples_us = []
     try:
         first.reserve({"first-anchor": chunk})
@@ -59,6 +60,15 @@ def _run_mode(mode, iterations, directory):
             if index >= 50:
                 samples_us.append(elapsed_us)
 
+            claim_key = f"{owner.owner_id}/claim-{index}"
+            started = time.perf_counter_ns()
+            decision = owner.claim(claim_key, chunk)
+            if not decision.admit or owner.release_claim(claim_key) != chunk:
+                raise RuntimeError("broker benchmark claim did not round trip")
+            claim_elapsed_us = (time.perf_counter_ns() - started) / 1_000.0
+            if index >= 50:
+                claim_samples_us.append(claim_elapsed_us)
+
             started = time.perf_counter_ns()
             owner.snapshot()
             snapshot_elapsed_us = (time.perf_counter_ns() - started) / 1_000.0
@@ -73,6 +83,9 @@ def _run_mode(mode, iterations, directory):
         "median_reserve_release_us": statistics.median(samples_us),
         "p95_reserve_release_us": _percentile(samples_us, 0.95),
         "max_reserve_release_us": max(samples_us),
+        "median_claim_release_us": statistics.median(claim_samples_us),
+        "p95_claim_release_us": _percentile(claim_samples_us, 0.95),
+        "max_claim_release_us": max(claim_samples_us),
         "median_snapshot_us": statistics.median(snapshot_samples_us),
         "p95_snapshot_us": _percentile(snapshot_samples_us, 0.95),
         "max_snapshot_us": max(snapshot_samples_us),

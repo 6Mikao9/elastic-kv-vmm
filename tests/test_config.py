@@ -40,6 +40,7 @@ class ElasticConfigTest(unittest.TestCase):
                 "EKV_GLOBAL_BROKER_TENANT_WEIGHT": "3.5",
                 "EKV_GLOBAL_BROKER_DEMAND_TTL_SECONDS": "7.5",
                 "EKV_GLOBAL_BROKER_WAIT_MS": "125",
+                "EKV_GLOBAL_BROKER_PREFILL_MODE": "enforce",
             }
         )
         self.assertEqual(config.chunk_mib, 4)
@@ -63,6 +64,7 @@ class ElasticConfigTest(unittest.TestCase):
         self.assertEqual(config.global_broker_tenant_weight, 3.5)
         self.assertEqual(config.global_broker_demand_ttl_seconds, 7.5)
         self.assertEqual(config.global_broker_wait_ms, 125)
+        self.assertEqual(config.global_broker_prefill_mode, "enforce")
 
     def test_activation_policy_requires_v5(self):
         with self.assertRaisesRegex(ValueError, "require elastic mode v5"):
@@ -120,6 +122,36 @@ class ElasticConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "between 0 and 5000"):
             ElasticConfig(global_broker_wait_ms=5001)
 
+    def test_global_prefill_claim_requires_broker_v5_physical_and_estimate(self):
+        with self.assertRaisesRegex(ValueError, "enabled broker path"):
+            ElasticConfig(global_broker_prefill_mode="enforce")
+        with self.assertRaisesRegex(ValueError, "v5 physical admission"):
+            ElasticConfig(
+                global_broker_path="/tmp/gpu0.sqlite",
+                global_broker_mib=1024,
+                global_broker_prefill_mode="enforce",
+                prefill_workspace_bytes_per_token=1,
+            )
+        with self.assertRaisesRegex(ValueError, "positive workspace estimate"):
+            ElasticConfig(
+                mode="v5",
+                admission_policy="physical",
+                global_broker_path="/tmp/gpu0.sqlite",
+                global_broker_mib=1024,
+                global_broker_prefill_mode="observe",
+            )
+        config = ElasticConfig(
+            mode="v5",
+            admission_policy="physical",
+            global_broker_path="/tmp/gpu0.sqlite",
+            global_broker_mib=1024,
+            global_broker_prefill_mode="enforce",
+            prefill_workspace_bytes_per_token=32,
+        )
+        self.assertEqual(
+            config.as_env()["EKV_GLOBAL_BROKER_PREFILL_MODE"], "enforce"
+        )
+
     def test_cli_overrides_leave_sglang_arguments_untouched(self):
         config, upstream, dry_run = resolve_config(
             [
@@ -160,6 +192,8 @@ class ElasticConfigTest(unittest.TestCase):
                 "8",
                 "--elastic-global-broker-wait-ms",
                 "150",
+                "--elastic-global-broker-prefill-mode",
+                "enforce",
                 "--model-path",
                 "/models/qwen",
                 "--port",
@@ -187,6 +221,7 @@ class ElasticConfigTest(unittest.TestCase):
                 config.global_broker_tenant_weight,
                 config.global_broker_demand_ttl_seconds,
                 config.global_broker_wait_ms,
+                config.global_broker_prefill_mode,
             ),
             (
                 "v5",
@@ -208,6 +243,7 @@ class ElasticConfigTest(unittest.TestCase):
                 2.5,
                 8.0,
                 150,
+                "enforce",
             ),
         )
         self.assertEqual(upstream, ["--model-path", "/models/qwen", "--port", "30000"])

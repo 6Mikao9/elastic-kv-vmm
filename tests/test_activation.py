@@ -7,6 +7,28 @@ from unittest.mock import Mock, patch
 from elastic_kv import activation
 
 
+def _sglang_modules(*, ScheduleBatch, ModelRunner, Scheduler=None):
+    modules = {
+        "torch": ModuleType("torch"),
+        "sglang": ModuleType("sglang"),
+        "sglang.srt": ModuleType("sglang.srt"),
+        "sglang.srt.managers": ModuleType("sglang.srt.managers"),
+        "sglang.srt.managers.schedule_batch": SimpleNamespace(
+            ScheduleBatch=ScheduleBatch
+        ),
+        "sglang.srt.model_executor": ModuleType("sglang.srt.model_executor"),
+        "sglang.srt.model_executor.model_runner": SimpleNamespace(
+            ModelRunner=ModelRunner
+        ),
+    }
+    modules["torch"].cuda = Mock()
+    if Scheduler is not None:
+        modules["sglang.srt.managers.scheduler"] = SimpleNamespace(
+            Scheduler=Scheduler
+        )
+    return modules
+
+
 class ActivationTest(unittest.TestCase):
     def tearDown(self):
         # install_activation_hooks() changes process-wide SGLang hooks and
@@ -18,6 +40,8 @@ class ActivationTest(unittest.TestCase):
         activation._PREFILL_WORKSPACE_RATE = 0
         activation._PREFILL_WORKSPACE_CAP = 0
         activation._PREFILL_HEADROOM_SCOPED = False
+        activation._GLOBAL_PREFILL_MODE = "off"
+        activation._PENDING_PREFILL_CLAIM = None
         activation._CONTEXT = activation.local()
 
     def test_installs_on_newer_forward_method(self):
@@ -154,6 +178,375 @@ class ActivationTest(unittest.TestCase):
             0,
         )
         self.assertFalse(getattr(ModelRunner, "_ekv_activation_hooks", False))
+
+    def test_global_prefill_claim_wraps_scheduler_and_forward(self):
+        cuda = Mock()
+        torch = ModuleType("torch")
+        torch.cuda = cuda
+
+        class Backing:
+            has_global_broker = True
+
+            def __init__(self):
+                self.claims = []
+                self.releases = []
+
+            def claim_broker_capacity(self, key, byte_count):
+                self.claims.append((key, byte_count))
+                return True
+
+            def release_broker_claim(self, key):
+                self.releases.append(key)
+                return 8
+
+        class ScheduleBatch:
+            def prepare_for_extend(self):
+                return None
+
+        class ModelRunner:
+            def forward(self, *args, **kwargs):
+                return "forwarded"
+
+        backing = Backing()
+        counters = {}
+        ctrl = SimpleNamespace(
+            arenas=[SimpleNamespace(backing=backing)], counters=counters
+        )
+
+        class Scheduler:
+            def __init__(self):
+                self.waiting_queue = [SimpleNamespace(origin_input_ids=range(4))]
+                self.chunked_req = None
+                self.token_to_kv_pool_allocator = SimpleNamespace(ctrl=ctrl)
+
+            def get_new_batch_prefill(self, running_batch):
+                self.claim_seen_by_scheduler = bool(backing.claims)
+                return SimpleNamespace(batch_size=1)
+
+        modules = {
+            "torch": torch,
+            "sglang": ModuleType("sglang"),
+            "sglang.srt": ModuleType("sglang.srt"),
+            "sglang.srt.managers": ModuleType("sglang.srt.managers"),
+            "sglang.srt.managers.schedule_batch": SimpleNamespace(
+                ScheduleBatch=ScheduleBatch
+            ),
+            "sglang.srt.managers.scheduler": SimpleNamespace(Scheduler=Scheduler),
+            "sglang.srt.model_executor": ModuleType(
+                "sglang.srt.model_executor"
+            ),
+            "sglang.srt.model_executor.model_runner": SimpleNamespace(
+                ModelRunner=ModelRunner
+            ),
+        }
+        with patch.dict(sys.modules, modules), patch.dict(
+            "os.environ",
+            {
+                "EKV_ACTIVATION_POLICY": "off",
+                "EKV_PREFILL_WORKSPACE_BYTES_PER_TOKEN": "2",
+                "EKV_PREFILL_WORKSPACE_MAX_MIB": "1",
+                "EKV_GLOBAL_BROKER_PREFILL_MODE": "enforce",
+            },
+        ):
+            activation.install_activation_hooks()
+            scheduler = Scheduler()
+            batch = scheduler.get_new_batch_prefill(None)
+            model_runner = ModelRunner()
+            model_runner.token_to_kv_pool = SimpleNamespace(residency=ctrl)
+            result = model_runner.forward(batch)
+
+        self.assertEqual(result, "forwarded")
+        self.assertTrue(scheduler.claim_seen_by_scheduler)
+        self.assertEqual(backing.claims[0][1], 8)
+        self.assertEqual(backing.releases, [backing.claims[0][0]])
+        self.assertEqual(counters["activation_global_prefill_claim_admissions"], 1)
+        self.assertEqual(
+            counters["activation_global_prefill_claim_released_forward"], 1
+        )
+
+    def test_global_prefill_claim_releases_when_scheduler_returns_empty(self):
+        cuda = Mock()
+        torch = ModuleType("torch")
+        torch.cuda = cuda
+
+        class Backing:
+            has_global_broker = True
+
+            def __init__(self):
+                self.releases = []
+
+            def claim_broker_capacity(self, key, byte_count):
+                return True
+
+            def release_broker_claim(self, key):
+                self.releases.append(key)
+                return 4
+
+        class ScheduleBatch:
+            def prepare_for_extend(self):
+                return None
+
+        class ModelRunner:
+            def forward(self, *args, **kwargs):
+                return None
+
+        backing = Backing()
+        counters = {}
+        ctrl = SimpleNamespace(
+            arenas=[SimpleNamespace(backing=backing)], counters=counters
+        )
+
+        class Scheduler:
+            waiting_queue = [SimpleNamespace(origin_input_ids=range(2))]
+            chunked_req = None
+            token_to_kv_pool_allocator = SimpleNamespace(ctrl=ctrl)
+
+            def get_new_batch_prefill(self, running_batch):
+                return None
+
+        modules = {
+            "torch": torch,
+            "sglang": ModuleType("sglang"),
+            "sglang.srt": ModuleType("sglang.srt"),
+            "sglang.srt.managers": ModuleType("sglang.srt.managers"),
+            "sglang.srt.managers.schedule_batch": SimpleNamespace(
+                ScheduleBatch=ScheduleBatch
+            ),
+            "sglang.srt.managers.scheduler": SimpleNamespace(Scheduler=Scheduler),
+            "sglang.srt.model_executor": ModuleType(
+                "sglang.srt.model_executor"
+            ),
+            "sglang.srt.model_executor.model_runner": SimpleNamespace(
+                ModelRunner=ModelRunner
+            ),
+        }
+        with patch.dict(sys.modules, modules), patch.dict(
+            "os.environ",
+            {
+                "EKV_PREFILL_WORKSPACE_BYTES_PER_TOKEN": "2",
+                "EKV_PREFILL_WORKSPACE_MAX_MIB": "1",
+                "EKV_GLOBAL_BROKER_PREFILL_MODE": "enforce",
+            },
+        ):
+            activation.install_activation_hooks()
+            self.assertIsNone(Scheduler().get_new_batch_prefill(None))
+
+        self.assertEqual(len(backing.releases), 1)
+        self.assertEqual(
+            counters["activation_global_prefill_claim_released_empty_batch"], 1
+        )
+
+    def test_global_prefill_claim_survives_forward_error_until_teardown(self):
+        cuda = Mock()
+        torch = ModuleType("torch")
+        torch.cuda = cuda
+
+        class Backing:
+            has_global_broker = True
+
+            def __init__(self):
+                self.releases = []
+
+            def claim_broker_capacity(self, key, byte_count):
+                return True
+
+            def release_broker_claim(self, key):
+                self.releases.append(key)
+                return 2
+
+        class ScheduleBatch:
+            def prepare_for_extend(self):
+                return None
+
+        class ModelRunner:
+            def forward(self, *args, **kwargs):
+                raise RuntimeError("prefill failed")
+
+        backing = Backing()
+        counters = {}
+        ctrl = SimpleNamespace(
+            arenas=[SimpleNamespace(backing=backing)], counters=counters
+        )
+
+        class Scheduler:
+            waiting_queue = [SimpleNamespace(origin_input_ids=range(1))]
+            chunked_req = None
+            token_to_kv_pool_allocator = SimpleNamespace(ctrl=ctrl)
+
+            def get_new_batch_prefill(self, running_batch):
+                return SimpleNamespace(batch_size=1)
+
+        modules = {
+            "torch": torch,
+            "sglang": ModuleType("sglang"),
+            "sglang.srt": ModuleType("sglang.srt"),
+            "sglang.srt.managers": ModuleType("sglang.srt.managers"),
+            "sglang.srt.managers.schedule_batch": SimpleNamespace(
+                ScheduleBatch=ScheduleBatch
+            ),
+            "sglang.srt.managers.scheduler": SimpleNamespace(Scheduler=Scheduler),
+            "sglang.srt.model_executor": ModuleType(
+                "sglang.srt.model_executor"
+            ),
+            "sglang.srt.model_executor.model_runner": SimpleNamespace(
+                ModelRunner=ModelRunner
+            ),
+        }
+        with patch.dict(sys.modules, modules), patch.dict(
+            "os.environ",
+            {
+                "EKV_PREFILL_WORKSPACE_BYTES_PER_TOKEN": "2",
+                "EKV_PREFILL_WORKSPACE_MAX_MIB": "1",
+                "EKV_GLOBAL_BROKER_PREFILL_MODE": "enforce",
+            },
+        ):
+            activation.install_activation_hooks()
+            batch = Scheduler().get_new_batch_prefill(None)
+            model_runner = ModelRunner()
+            model_runner.token_to_kv_pool = SimpleNamespace(residency=ctrl)
+            with self.assertRaisesRegex(RuntimeError, "prefill failed"):
+                model_runner.forward(batch)
+            self.assertIsNone(activation._PENDING_PREFILL_CLAIM)
+            with self.assertRaisesRegex(RuntimeError, "prefill failed"):
+                model_runner.forward(None)
+
+        self.assertEqual(backing.releases, [])
+        self.assertEqual(
+            counters["activation_global_prefill_claim_abandoned_forward_error"], 1
+        )
+
+    def test_global_prefill_claim_survives_scheduler_error(self):
+        class Backing:
+            has_global_broker = True
+
+            def __init__(self):
+                self.releases = []
+
+            def claim_broker_capacity(self, key, byte_count):
+                return True
+
+            def release_broker_claim(self, key):
+                self.releases.append(key)
+                return 2
+
+        class ScheduleBatch:
+            def prepare_for_extend(self):
+                return None
+
+        class ModelRunner:
+            def forward(self, *args, **kwargs):
+                return None
+
+        backing = Backing()
+        counters = {}
+        ctrl = SimpleNamespace(
+            arenas=[SimpleNamespace(backing=backing)], counters=counters
+        )
+
+        class Scheduler:
+            waiting_queue = [SimpleNamespace(origin_input_ids=range(1))]
+            chunked_req = None
+            token_to_kv_pool_allocator = SimpleNamespace(ctrl=ctrl)
+
+            def get_new_batch_prefill(self, running_batch):
+                raise RuntimeError("scheduler failed")
+
+        with patch.dict(
+            sys.modules,
+            _sglang_modules(
+                ScheduleBatch=ScheduleBatch,
+                ModelRunner=ModelRunner,
+                Scheduler=Scheduler,
+            ),
+        ), patch.dict(
+            "os.environ",
+            {
+                "EKV_PREFILL_WORKSPACE_BYTES_PER_TOKEN": "2",
+                "EKV_PREFILL_WORKSPACE_MAX_MIB": "1",
+                "EKV_GLOBAL_BROKER_PREFILL_MODE": "enforce",
+            },
+        ):
+            activation.install_activation_hooks()
+            with self.assertRaisesRegex(RuntimeError, "scheduler failed"):
+                Scheduler().get_new_batch_prefill(None)
+            self.assertIsNone(activation._PENDING_PREFILL_CLAIM)
+
+        self.assertEqual(backing.releases, [])
+        self.assertEqual(
+            counters["activation_global_prefill_claim_abandoned_scheduler_error"],
+            1,
+        )
+
+    def test_observe_mode_checks_capacity_without_inserting_a_claim(self):
+        class Backing:
+            has_global_broker = True
+            broker_snapshot = {
+                "available_bytes": 12,
+                "fair_mode": "enforce",
+                "fairness_pressure": False,
+            }
+
+            def claim_broker_capacity(self, key, byte_count):
+                raise AssertionError("observe mode must not mutate the broker")
+
+        backing = Backing()
+        counters = {}
+        ctrl = SimpleNamespace(
+            arenas=[SimpleNamespace(backing=backing)], counters=counters
+        )
+        estimate = activation.PrefillWorkspaceEstimate(bytes=8)
+
+        with patch.multiple(
+            activation,
+            _GLOBAL_PREFILL_MODE="observe",
+            _PENDING_PREFILL_CLAIM=None,
+            _CONTEXT=activation.local(),
+        ):
+            claim, disposition = activation._reserve_global_prefill_claim(
+                ctrl, estimate, counters
+            )
+
+        self.assertIsNone(claim)
+        self.assertEqual(disposition, "observed")
+        self.assertEqual(
+            counters["activation_global_prefill_observe_would_admit"], 1
+        )
+
+    def test_enforce_mode_fails_closed_on_denial_or_missing_broker(self):
+        class DenyingBacking:
+            has_global_broker = True
+
+            def claim_broker_capacity(self, key, byte_count):
+                return False
+
+        counters = {}
+        ctrl = SimpleNamespace(
+            arenas=[SimpleNamespace(backing=DenyingBacking())], counters=counters
+        )
+        estimate = activation.PrefillWorkspaceEstimate(bytes=8)
+        with patch.multiple(
+            activation,
+            _GLOBAL_PREFILL_MODE="enforce",
+            _PENDING_PREFILL_CLAIM=None,
+        ):
+            claim, disposition = activation._reserve_global_prefill_claim(
+                ctrl, estimate, counters
+            )
+            self.assertIsNone(claim)
+            self.assertEqual(disposition, "denied")
+            self.assertIsNone(activation._PENDING_PREFILL_CLAIM)
+
+            missing_claim, missing_disposition = (
+                activation._reserve_global_prefill_claim(
+                    SimpleNamespace(arenas=[], counters={}),
+                    estimate,
+                    {},
+                )
+            )
+            self.assertIsNone(missing_claim)
+            self.assertEqual(missing_disposition, "missing-broker")
+
+        self.assertEqual(counters["activation_global_prefill_claim_denials"], 1)
 
     def test_prefill_protects_live_and_prospective_chunks_and_resamples(self):
         class Arena:

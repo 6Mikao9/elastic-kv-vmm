@@ -9,7 +9,7 @@ from dataclasses import dataclass
 import os
 from functools import wraps
 from threading import local
-from time import perf_counter_ns
+from time import monotonic_ns, perf_counter_ns
 
 
 _CONTEXT = local()
@@ -19,6 +19,8 @@ _CUDA = None
 _PREFILL_WORKSPACE_RATE = 0
 _PREFILL_WORKSPACE_CAP = 0
 _PREFILL_HEADROOM_SCOPED = False
+_GLOBAL_PREFILL_MODE = "off"
+_PENDING_PREFILL_CLAIM = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +29,14 @@ class PrefillWorkspaceEstimate:
     prompt_tokens: int = 0
     requests: int = 0
     unestimated: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class PrefillCapacityClaim:
+    key: str
+    bytes: int
+    backing: object
+    counters: dict
 
 
 def _add(counters, key, value=1):
@@ -78,6 +88,109 @@ def estimate_prefill_workspace(waiting_queue, *, bytes_per_token, max_bytes):
         requests=requests,
         unestimated=unestimated,
     )
+
+
+def _find_broker_backing(controller):
+    """Return the capacity owner shared by all arenas on this device."""
+
+    for arena in getattr(controller, "arenas", ()):
+        backing = getattr(arena, "backing", None)
+        if backing is not None and getattr(backing, "has_global_broker", False):
+            return backing
+    return None
+
+
+def _observe_global_prefill_claim(backing, byte_count, counters):
+    snapshot = getattr(backing, "broker_snapshot", None)
+    if not isinstance(snapshot, dict):
+        return False
+    available = snapshot.get("available_bytes")
+    would_admit = (
+        isinstance(available, int)
+        and available >= byte_count
+        and not (
+            snapshot.get("fair_mode") == "enforce"
+            and snapshot.get("fairness_pressure")
+        )
+    )
+    _add(
+        counters,
+        "activation_global_prefill_observe_would_admit"
+        if would_admit
+        else "activation_global_prefill_observe_would_deny",
+    )
+    counters["activation_global_prefill_observe_available_bytes"] = available
+    return would_admit
+
+
+def _reserve_global_prefill_claim(controller, estimate, counters):
+    global _PENDING_PREFILL_CLAIM
+
+    byte_count = int(estimate.bytes)
+    if byte_count <= 0:
+        return None, "empty"
+    backing = _find_broker_backing(controller)
+    if backing is None:
+        _add(counters, "activation_global_prefill_missing_broker")
+        return None, "missing-broker"
+    if _GLOBAL_PREFILL_MODE == "observe":
+        _observe_global_prefill_claim(backing, byte_count, counters)
+        return None, "observed"
+
+    key = f"prefill-{os.getpid()}-{monotonic_ns()}"
+    _add(counters, "activation_global_prefill_claim_checks")
+    counters["activation_global_prefill_claim_bytes_last"] = byte_count
+    counters["activation_global_prefill_claim_bytes_max"] = max(
+        counters.get("activation_global_prefill_claim_bytes_max", 0), byte_count
+    )
+    admitted = backing.claim_broker_capacity(key, byte_count)
+    if admitted is not True:
+        _add(counters, "activation_global_prefill_claim_denials")
+        return None, "denied"
+
+    claim = PrefillCapacityClaim(key, byte_count, backing, counters)
+    _PENDING_PREFILL_CLAIM = claim
+    _add(counters, "activation_global_prefill_claim_admissions")
+    return claim, "claimed"
+
+
+def _consume_pending_prefill_claim():
+    global _PENDING_PREFILL_CLAIM
+    claim = _PENDING_PREFILL_CLAIM
+    _PENDING_PREFILL_CLAIM = None
+    return claim
+
+
+def _release_prefill_claim(claim, reason):
+    if claim is None:
+        return 0
+    released = claim.backing.release_broker_claim(claim.key)
+    if released:
+        _add(claim.counters, f"activation_global_prefill_claim_released_{reason}")
+    else:
+        _add(claim.counters, f"activation_global_prefill_claim_release_missing_{reason}")
+    return released
+
+
+def _abandon_prefill_claim(claim, reason):
+    if claim is not None:
+        _add(
+            claim.counters,
+            f"activation_global_prefill_claim_abandoned_{reason}",
+        )
+
+
+def _batch_is_empty(batch):
+    if batch is None:
+        return True
+    is_empty = getattr(batch, "is_empty", None)
+    if callable(is_empty):
+        return bool(is_empty())
+    batch_size = getattr(batch, "batch_size", None)
+    try:
+        return batch_size is not None and int(batch_size) == 0
+    except (TypeError, ValueError):
+        return False
 
 
 def current_prefill_headroom(fallback):
@@ -165,6 +278,7 @@ def install_activation_hooks():
     global _POLICY, _HEADROOM, _CUDA
     global _PREFILL_WORKSPACE_RATE, _PREFILL_WORKSPACE_CAP
     global _PREFILL_HEADROOM_SCOPED
+    global _GLOBAL_PREFILL_MODE, _PENDING_PREFILL_CLAIM
     policy = os.environ.get("EKV_ACTIVATION_POLICY", "off")
     if policy not in ("off", "telemetry", "trim", "recycle", "both"):
         raise ValueError(f"Unknown EKV_ACTIVATION_POLICY={policy}")
@@ -184,13 +298,22 @@ def install_activation_hooks():
     scoped = os.environ.get("EKV_PREFILL_HEADROOM_SCOPED", "0").lower() in (
         "1", "true", "yes", "on"
     )
+    global_prefill_mode = os.environ.get(
+        "EKV_GLOBAL_BROKER_PREFILL_MODE", "off"
+    ).strip().lower()
+    if global_prefill_mode not in ("off", "observe", "enforce"):
+        raise ValueError(
+            f"Unknown EKV_GLOBAL_BROKER_PREFILL_MODE={global_prefill_mode}"
+        )
     _POLICY = policy
     _HEADROOM = headroom << 20
     _PREFILL_WORKSPACE_RATE = workspace_rate
     _PREFILL_WORKSPACE_CAP = workspace_cap
     _PREFILL_HEADROOM_SCOPED = scoped
+    _GLOBAL_PREFILL_MODE = global_prefill_mode
+    _PENDING_PREFILL_CLAIM = None
     _CUDA = None
-    needs_activation_hooks = policy != "off"
+    needs_activation_hooks = policy != "off" or global_prefill_mode != "off"
     needs_scheduler_hook = workspace_rate > 0 or scoped
     if not needs_activation_hooks and not needs_scheduler_hook:
         return
@@ -222,31 +345,46 @@ def install_activation_hooks():
             @wraps(original_forward)
             def forward(self, *args, **kwargs):
                 ctrl = getattr(self.token_to_kv_pool, "residency", None)
+                claim = _consume_pending_prefill_claim()
                 if ctrl is None:
-                    return original_forward(self, *args, **kwargs)
-                device = ctrl.pool.device
-                counters = ctrl.counters
-                allocated_before = cuda.memory_allocated(device)
-                counters["activation_prefill_allocated_before_bytes"] = allocated_before
-                counters["activation_prefill_reserved_before_bytes"] = cuda.memory_reserved(device)
-                counters["activation_prefill_free_before_bytes"] = cuda.mem_get_info(device)[0]
-                cuda.reset_peak_memory_stats(device)
-                result = original_forward(self, *args, **kwargs)
-                peak = cuda.max_memory_allocated(device)
-                counters["activation_prefill_allocated_after_bytes"] = cuda.memory_allocated(device)
-                counters["activation_prefill_reserved_after_bytes"] = cuda.memory_reserved(device)
-                counters["activation_prefill_free_after_bytes"] = cuda.mem_get_info(device)[0]
-                counters["activation_prefill_peak_allocated_bytes"] = max(
-                    counters.get("activation_prefill_peak_allocated_bytes", 0), peak)
-                counters["activation_prefill_peak_growth_bytes"] = max(
-                    counters.get("activation_prefill_peak_growth_bytes", 0),
-                    peak - allocated_before,
-                )
-                batch = args[0] if args else kwargs.get("forward_batch")
-                if batch is not None:
-                    key = f"activation_peak_tokens_{batch.input_ids.numel()}_batch_{batch.batch_size}_bytes"
-                    counters[key] = max(counters.get(key, 0), peak - allocated_before)
-                _add(counters, "activation_prefill_calls")
+                    try:
+                        result = original_forward(self, *args, **kwargs)
+                    except BaseException:
+                        _abandon_prefill_claim(claim, "forward_error")
+                        raise
+                    _release_prefill_claim(claim, "forward")
+                    return result
+                try:
+                    if _POLICY == "off":
+                        result = original_forward(self, *args, **kwargs)
+                    else:
+                        device = ctrl.pool.device
+                        counters = ctrl.counters
+                        allocated_before = cuda.memory_allocated(device)
+                        counters["activation_prefill_allocated_before_bytes"] = allocated_before
+                        counters["activation_prefill_reserved_before_bytes"] = cuda.memory_reserved(device)
+                        counters["activation_prefill_free_before_bytes"] = cuda.mem_get_info(device)[0]
+                        cuda.reset_peak_memory_stats(device)
+                        result = original_forward(self, *args, **kwargs)
+                        peak = cuda.max_memory_allocated(device)
+                        counters["activation_prefill_allocated_after_bytes"] = cuda.memory_allocated(device)
+                        counters["activation_prefill_reserved_after_bytes"] = cuda.memory_reserved(device)
+                        counters["activation_prefill_free_after_bytes"] = cuda.mem_get_info(device)[0]
+                        counters["activation_prefill_peak_allocated_bytes"] = max(
+                            counters.get("activation_prefill_peak_allocated_bytes", 0), peak)
+                        counters["activation_prefill_peak_growth_bytes"] = max(
+                            counters.get("activation_prefill_peak_growth_bytes", 0),
+                            peak - allocated_before,
+                        )
+                        batch = args[0] if args else kwargs.get("forward_batch")
+                        if batch is not None:
+                            key = f"activation_peak_tokens_{batch.input_ids.numel()}_batch_{batch.batch_size}_bytes"
+                            counters[key] = max(counters.get(key, 0), peak - allocated_before)
+                        _add(counters, "activation_prefill_calls")
+                except BaseException:
+                    _abandon_prefill_claim(claim, "forward_error")
+                    raise
+                _release_prefill_claim(claim, "forward")
                 return result
 
             ScheduleBatch.prepare_for_extend = prepare
@@ -306,8 +444,41 @@ def install_activation_hooks():
                     counters["activation_dynamic_prefill_unestimated"] = (
                         estimate.unestimated
                     )
-                with prefill_admission_scope(estimate.bytes):
-                    return original_prefill(self, *args, **kwargs)
+                else:
+                    counters = {}
+
+                claim = None
+                if _GLOBAL_PREFILL_MODE != "off":
+                    if controller is None:
+                        _add(
+                            counters,
+                            "activation_global_prefill_missing_controller",
+                        )
+                        if _GLOBAL_PREFILL_MODE == "enforce":
+                            return None
+                    else:
+                        claim, disposition = _reserve_global_prefill_claim(
+                            controller, estimate, counters
+                        )
+                        _add(
+                            counters,
+                            f"activation_global_prefill_{disposition}",
+                        )
+                        if _GLOBAL_PREFILL_MODE == "enforce" and claim is None:
+                            return None
+
+                try:
+                    with prefill_admission_scope(estimate.bytes):
+                        batch = original_prefill(self, *args, **kwargs)
+                except BaseException:
+                    _consume_pending_prefill_claim()
+                    _abandon_prefill_claim(claim, "scheduler_error")
+                    raise
+
+                if claim is not None and _batch_is_empty(batch):
+                    _consume_pending_prefill_claim()
+                    _release_prefill_claim(claim, "empty_batch")
+                return batch
 
             prefill_with_workspace._elastic_activation_prefill_hook = True
             Scheduler.get_new_batch_prefill = prefill_with_workspace
