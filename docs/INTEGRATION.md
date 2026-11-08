@@ -15,6 +15,14 @@ Its automated checks use representative newer API modules; a real GPU serving
 run on that revision remains necessary. SGLang's built-in post-capture sizing
 must remain off because it owns a different backing lifecycle.
 
+Non-baseline startup is fail-closed. MiniMax sparse/HiSparse, compressed-SWA
+and every other hybrid family are rejected before pool construction; after a
+modern `configure()` call the returned token pool and allocator must still be
+the elastic wrapper and observed allocator. This prevents a newer SGLang KV
+pool family from silently allocating its stock backing while the launcher
+reports that elastic mode is active. The pinned MiniMax request-residency path
+uses its own audited adapter and does not pass through this generic MHA guard.
+
 | Layer | Source | Integration |
 |---|---|---|
 | Physical memory | [elastic_vmm.cpp](../native/elastic_vmm.cpp), [backing.py](../elastic_kv/backing.py) | Reserve stable virtual addresses, map and zero newly committed CUDA chunks, then unmap and release unused physical handles. CuPy/DLPack exposes those addresses as PyTorch tensors. |

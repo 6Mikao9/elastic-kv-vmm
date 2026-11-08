@@ -430,7 +430,6 @@ def install():
         return
     if MODE not in VALID_MODES:
         raise ValueError(f"unknown EKV_MODE={MODE}")
-    import sglang
     import sglang.srt.model_executor.model_runner as runner
 
     # The current SGLang layout imports these classes in mem_cache and builds
@@ -696,12 +695,58 @@ def install():
         if not all(required) or is_hybrid or use_mla_backend:
             raise RuntimeError("Require dense MHA, TP1, Triton, supported Graph mode, no overlap/cache/spec/PD")
 
-    def validate_mha_geometry(model_config):
+    def validate_mha_geometry(model_config, extra_pairs=()):
         head_dim = getattr(model_config, "head_dim", None)
         v_head_dim = getattr(model_config, "v_head_dim", head_dim)
         if head_dim is not None and v_head_dim != head_dim:
             raise RuntimeError(
                 "Elastic KV requires symmetric K/V head dimensions in this prototype"
+            )
+        for extra_head, extra_value_head in extra_pairs:
+            if extra_head is not None and extra_value_head != extra_head:
+                raise RuntimeError(
+                    "Elastic KV requires symmetric K/V head dimensions in this prototype"
+                )
+
+    def is_minimax_sparse_model(configurator):
+        model_config = getattr(configurator, "model_config", None)
+        hf_config = getattr(model_config, "hf_config", None)
+        checker = getattr(configurator_module, "is_minimax_sparse", None)
+        if checker is None and hf_config is not None:
+            try:
+                from sglang.srt.configs.model_config import is_minimax_sparse
+            except (ImportError, AttributeError):
+                checker = None
+            else:
+                checker = is_minimax_sparse
+        if checker is not None and hf_config is not None:
+            try:
+                if checker(hf_config):
+                    return True
+            except (AttributeError, TypeError, ValueError):
+                pass
+        if hf_config is None:
+            return False
+        model_type = str(getattr(hf_config, "model_type", "")).lower()
+        architectures = " ".join(
+            str(value) for value in (getattr(hf_config, "architectures", None) or ())
+        ).lower()
+        return "minimax" in model_type or "minimax" in architectures
+
+    def require_elastic_components(pool=None, allocator=None, *, owner=None):
+        if MODE == "baseline":
+            return
+        if pool is None and owner is not None:
+            pool = getattr(owner, "token_to_kv_pool", None)
+        if allocator is None and owner is not None:
+            allocator = getattr(owner, "token_to_kv_pool_allocator", None)
+        if not isinstance(pool, ElasticPool):
+            raise RuntimeError(
+                "Elastic KV requested a non-elastic token KV pool; refusing a silent stock fallback"
+            )
+        if not isinstance(allocator, ObservedAllocator):
+            raise RuntimeError(
+                "Elastic KV token KV allocator is not observed; refusing a silent stock fallback"
             )
 
     def guarded_init(self, *args, **kwargs):
@@ -712,22 +757,39 @@ def install():
         )
         validate_mha_geometry(self.model_config)
         original_init(self, *args, **kwargs)
+        require_elastic_components(owner=self)
 
     if modern:
         original_configure = configurator_module.KVCacheConfigurator.configure
 
         def guarded_configure(self, *args, **kwargs):
+            if MODE != "baseline" and (is_minimax_sparse_model(self) or bool(
+                getattr(self.server_args, "enable_hisparse", False)
+                or getattr(getattr(self, "memory_pool_config", None), "enable_hisparse", False)
+            )):
+                raise RuntimeError(
+                    "Elastic KV does not support MiniMax sparse or HiSparse pools; use the pinned MiniMax adapter"
+                )
             validate_server_args(
                 self.server_args,
                 is_hybrid=(
                     getattr(self, "is_hybrid_swa", False)
+                    or getattr(self, "is_hybrid_swa_compress", False)
                     or getattr(self, "mambaish_config", None) is not None
                     or getattr(self, "hybrid_gdn_config", None) is not None
                     or getattr(self, "hybrid_kda_config", None) is not None
                 ),
                 use_mla_backend=self.use_mla_backend,
             )
-            validate_mha_geometry(self.model_config)
+            validate_mha_geometry(
+                self.model_config,
+                extra_pairs=(
+                    (
+                        getattr(self, "swa_head_dim", None),
+                        getattr(self, "swa_v_head_dim", getattr(self, "swa_head_dim", None)),
+                    ),
+                ),
+            )
             bf16 = getattr(torch, "bfloat16", None)
             if bf16 is not None and getattr(self, "kv_cache_dtype", None) != bf16:
                 raise RuntimeError("Elastic KV currently requires BF16 KV cache")
@@ -739,7 +801,12 @@ def install():
                 raise RuntimeError(
                     "Elastic KV cannot be combined with SGLang post-capture KV sizing"
                 )
-            return original_configure(self, *args, **kwargs)
+            result = original_configure(self, *args, **kwargs)
+            require_elastic_components(
+                getattr(result, "token_to_kv_pool", None),
+                getattr(result, "token_to_kv_pool_allocator", None),
+            )
+            return result
 
         pool_type = original_pool if MODE == "baseline" else ElasticPool
         _replace_if_present(memory_pool, "MHATokenToKVPool", pool_type)

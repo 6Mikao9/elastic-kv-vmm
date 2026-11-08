@@ -16,3 +16,6 @@ elastic-future-plan = "adaptive_sparse.future_plan:main"
 [tool.setuptools.packages.find]
 include = ["elastic_kv*", "adaptive_sparse*"]
 namespaces = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

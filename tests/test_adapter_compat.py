@@ -43,7 +43,16 @@ class AdapterCompatibilityTest(unittest.TestCase):
         class Configurator:
             def configure(self, *args, **kwargs):
                 calls.append((args, kwargs))
-                return "configured"
+                modules = sys.modules
+                pool_type = modules["sglang.srt.mem_cache.memory_pool"].MHATokenToKVPool
+                allocator_type = modules[
+                    "sglang.srt.mem_cache.allocator.token"
+                ].TokenToKVPoolAllocator
+                return SimpleNamespace(
+                    marker="configured",
+                    token_to_kv_pool=object.__new__(pool_type),
+                    token_to_kv_pool_allocator=object.__new__(allocator_type),
+                )
 
         modules = {
             "sglang": _module("sglang", __version__="dev"),
@@ -153,10 +162,39 @@ class AdapterCompatibilityTest(unittest.TestCase):
                 model_config=SimpleNamespace(head_dim=128, v_head_dim=128),
             )
             self.assertEqual(
-                guarded(configurator_instance, pre_model_load_memory=1),
+                guarded(configurator_instance, pre_model_load_memory=1).marker,
                 "configured",
             )
             self.assertEqual(calls, [((), {"pre_model_load_memory": 1})])
+
+            configurator_instance.model_config.hf_config = SimpleNamespace(
+                model_type="minimax_m3", architectures=["MiniMaxM3SparseForCausalLM"]
+            )
+            with self.assertRaisesRegex(RuntimeError, "MiniMax sparse"):
+                guarded(configurator_instance, pre_model_load_memory=1)
+            configurator_instance.model_config.hf_config = None
+
+            server_args.enable_hisparse = True
+            with self.assertRaisesRegex(RuntimeError, "HiSparse"):
+                guarded(configurator_instance, pre_model_load_memory=1)
+            server_args.enable_hisparse = False
+
+            configurator_instance.is_hybrid_swa_compress = True
+            with self.assertRaisesRegex(RuntimeError, "Require dense MHA"):
+                guarded(configurator_instance, pre_model_load_memory=1)
+            configurator_instance.is_hybrid_swa_compress = False
+
+            elastic_pool = memory_pool.MHATokenToKVPool
+            memory_pool.MHATokenToKVPool = LegacyMHA
+            with self.assertRaisesRegex(RuntimeError, "non-elastic token KV pool"):
+                guarded(configurator_instance, pre_model_load_memory=1)
+            memory_pool.MHATokenToKVPool = elastic_pool
+
+            elastic_allocator = allocator_module.TokenToKVPoolAllocator
+            allocator_module.TokenToKVPoolAllocator = LegacyAllocator
+            with self.assertRaisesRegex(RuntimeError, "not observed"):
+                guarded(configurator_instance, pre_model_load_memory=1)
+            allocator_module.TokenToKVPoolAllocator = elastic_allocator
 
             server_args.attention_backend = "flashinfer"
             with self.assertRaisesRegex(RuntimeError, "Require dense MHA"):
@@ -191,6 +229,18 @@ class AdapterCompatibilityTest(unittest.TestCase):
             configurator_instance.post_capture_kv_active = True
             with self.assertRaisesRegex(RuntimeError, "post-capture"):
                 guarded(configurator_instance, pre_model_load_memory=1)
+            configurator_instance.post_capture_kv_active = False
+
+            # Baseline remains a stock-primary control and must not be rejected
+            # merely because the model uses a specialized upstream KV pool.
+            configurator_instance.model_config.hf_config = SimpleNamespace(
+                model_type="minimax_m3"
+            )
+            adapter.MODE = "baseline"
+            self.assertEqual(
+                guarded(configurator_instance, pre_model_load_memory=1).marker,
+                "configured",
+            )
 
     def test_installs_on_0_5_17_without_kind_registry(self):
         class LegacyMHA:
@@ -256,6 +306,10 @@ class AdapterCompatibilityTest(unittest.TestCase):
         class ModelRunner:
             def init_memory_pool(self, *args, **kwargs):
                 calls.append((args, kwargs))
+                self.token_to_kv_pool = object.__new__(model_runner.MHATokenToKVPool)
+                self.token_to_kv_pool_allocator = object.__new__(
+                    model_runner.TokenToKVPoolAllocator
+                )
                 return "initialized"
 
         model_runner = _module(
