@@ -278,6 +278,15 @@ class AdapterCompatibilityTest(unittest.TestCase):
             )
             self.assertNotEqual(ModelRunner.init_memory_pool.__name__, "init_memory_pool")
 
+            observed_allocator = model_runner.TokenToKVPoolAllocator
+            allocator_probe = SimpleNamespace(
+                free_slots=SimpleNamespace(count=40),
+                ctrl=SimpleNamespace(
+                    physical_available_tokens=lambda logical: min(logical, 17)
+                ),
+            )
+            self.assertEqual(observed_allocator.available_size(allocator_probe), 17)
+
             runner = ModelRunner()
             runner.server_args = SimpleNamespace(
                 attention_backend="triton",
@@ -340,6 +349,40 @@ class AdapterCompatibilityTest(unittest.TestCase):
         allocator = SimpleNamespace(free_group=[])
         adapter._queue_free_group(allocator, source)
         self.assertEqual(allocator.free_group, [source])
+
+    def test_physical_admission_reserves_prefill_headroom_before_token_budget(self):
+        ctrl = object.__new__(adapter.Residency)
+        ctrl.admission_policy = "physical"
+        ctrl.pool = SimpleNamespace(device="cuda:0")
+        ctrl.arenas = [SimpleNamespace(planes=2)]
+        ctrl.chunk_bytes = 1_000
+        ctrl.slot_bytes = 100
+        ctrl.prefill_headroom_bytes = 500
+        ctrl.retain_chunks = 2
+        ctrl.counts = [0] * 100
+        ctrl.live = adapter.np.zeros(100, dtype=adapter.np.bool_)
+        ctrl.live[0] = True
+        ctrl.precommitted = {20, 21}
+        ctrl.counters = {}
+
+        with patch.object(
+            adapter.torch.cuda, "mem_get_info", return_value=(5_500, 10_000)
+        ):
+            admitted = ctrl.physical_available_tokens(100)
+
+        # 2 new logical chunks + 1 retained free chunk + 2 precommitted
+        # chunks, at 10 tokens per chunk, with 2 planes per VMM commit.
+        self.assertEqual(admitted, 50)
+        self.assertEqual(ctrl.counters["physical_chunk_cost_bytes"], 2_000)
+        self.assertEqual(ctrl.counters["physical_headroom_bytes"], 500)
+        self.assertEqual(ctrl.counters["physical_limited_calls"], 1)
+
+    def test_logical_admission_does_not_query_cuda(self):
+        ctrl = object.__new__(adapter.Residency)
+        ctrl.admission_policy = "logical"
+        with patch.object(adapter.torch.cuda, "mem_get_info") as mem_info:
+            self.assertEqual(ctrl.physical_available_tokens(7), 7)
+        mem_info.assert_not_called()
 
 
 if __name__ == "__main__":

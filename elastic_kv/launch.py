@@ -8,7 +8,13 @@ import os
 import sys
 from typing import Sequence
 
-from .config import ACTIVATION_POLICIES, FUTURE_POLICIES, MODES, ElasticConfig
+from .config import (
+    ACTIVATION_POLICIES,
+    ADMISSION_POLICIES,
+    FUTURE_POLICIES,
+    MODES,
+    ElasticConfig,
+)
 
 
 SPAWN_INSTALL_ENV = "_ELASTIC_KV_INSTALL_ON_IMPORT"
@@ -52,6 +58,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--elastic-chunk-mib", type=int)
     parser.add_argument("--elastic-retain-chunks", type=int)
     parser.add_argument("--elastic-activation-policy", choices=ACTIVATION_POLICIES)
+    parser.add_argument("--elastic-admission-policy", choices=ADMISSION_POLICIES)
     parser.add_argument("--elastic-prefill-headroom-mib", type=int)
     parser.add_argument("--elastic-precommit-chunks", type=int, choices=range(5))
     parser.add_argument("--elastic-precommit-max-chunks", type=int)
@@ -75,6 +82,7 @@ def resolve_config(argv: Sequence[str]) -> tuple[ElasticConfig, list[str], bool]
         chunk_mib=args.elastic_chunk_mib,
         retain_chunks=args.elastic_retain_chunks,
         activation_policy=args.elastic_activation_policy,
+        admission_policy=args.elastic_admission_policy,
         prefill_headroom_mib=args.elastic_prefill_headroom_mib,
         precommit_chunks=args.elastic_precommit_chunks,
         precommit_max_chunks=args.elastic_precommit_max_chunks,

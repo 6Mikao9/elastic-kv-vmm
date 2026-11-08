@@ -12,7 +12,11 @@ changing the attention addressing model:
    demand, including a manually tuned static-pool control.
 4. Coordinate prefill activation workspace with reclaimable KV backing and
    PyTorch cached memory. Separate safe reclamation from unimplemented
-   admission guarantees; never reclaim live KV to manufacture headroom.
+   admission guarantees; never reclaim live KV to manufacture headroom. The
+   V5 physical-admission slice now reports a conservative combined KV-plus-
+   prefill token budget through SGLang's native `available_size()` call. Exact
+   activation ownership, transactional failure and cross-process grants remain
+   open.
 5. Add a vLLM implementation using existing local model snapshots read-only,
    and validate correctness, memory and serving efficiency against vLLM's
    own baseline.

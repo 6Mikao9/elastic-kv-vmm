@@ -17,6 +17,8 @@ python -m elastic_kv --elastic-dry-run \
 python -m elastic_kv \
   --elastic-mode v5 \
   --elastic-retain-chunks 8 \
+  --elastic-admission-policy physical \
+  --elastic-prefill-headroom-mib 1024 \
   --model-path /models/Qwen3-0.6B-Base \
   --attention-backend triton \
   --page-size 1 \
@@ -39,6 +41,7 @@ SGLang or touch CUDA.
 | `--elastic-chunk-mib` | `2` | positive integer |
 | `--elastic-retain-chunks` | `1` | at least the sink chunk |
 | `--elastic-activation-policy` | `off` | requires `v5` unless `off` |
+| `--elastic-admission-policy` | `logical` | `physical` requires `v5` |
 | `--elastic-prefill-headroom-mib` | `0` | nonnegative integer |
 | `--elastic-precommit-chunks` | `0` | bounded chunk lookahead from 0 to 4 |
 | `--elastic-precommit-max-chunks` | `1` | must cover the lookahead |
@@ -50,6 +53,16 @@ SGLang or touch CUDA.
 The CLI currently launches the guarded dense-MHA scope documented in
 [integration](INTEGRATION.md). Unsupported SGLang configurations fail at
 startup rather than silently running with an incorrect backing layout.
+
+With `--elastic-admission-policy physical`, V5's allocator reports a
+conservative physical token budget through SGLang's native `available_size()`
+call. The budget charges the configured prefill headroom and the bytes needed
+to commit a new logical KV chunk before SGLang builds an extend/decode batch.
+It also counts only precommitted and explicitly retained free chunks as already
+backed. Use `--elastic-activation-policy both` to trim unreferenced VMM chunks
+and reclaim PyTorch cache under the same pressure gate. This reduces admission
+before VMM commit; it is not yet a cross-process reservation or a guarantee
+against a concurrent CUDA allocator race.
 
 Set `--elastic-future-stats-path` (or `EKV_FUTURE_STATS_PATH`) to atomically
 export scheduler hook counters from `adaptive_sparse.sglang_future_hook`; these

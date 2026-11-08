@@ -99,6 +99,13 @@ bash scripts/container_case.sh 0 "$MODEL_HUB" "$MODEL_REL" \
 
 Use a fresh output directory for every run. Substitute `baseline` or `v0`–`v4` for ablations. Set `EKV_EXECUTION=graph-pad` for capture batches 1, 2, 4, 8 (including additional 3/5/3-request padding probes), or `graph` for exact batches 1–8. `EKV_RETAIN_CHUNKS=8` selects the warm retention policy. The opt-in `EKV_PRECOMMIT_CHUNKS=1` maps the next logical chunk across every KV plane and starts its required zeroing on an independent CUDA stream; `EKV_PRECOMMIT_MAX_CHUNKS` caps the speculative chunks kept across a mixed workload. These are environment variables on the container script. The Qwen3-4B snapshot revision is recorded in `environment.json`. Never copy weights into this repository.
 
+Set `EKV_ADMISSION_POLICY=physical` (or use the corresponding launcher option)
+with V5 to bound SGLang's allocator `available_size()` by current device free
+memory, the configured prefill headroom and the exact cost of committing a new
+VMM chunk. The scheduler can then reduce an extend or decode batch before KV
+commit. The gate is conservative and remains inside one process; it is not yet
+a cross-instance reservation or a guarantee against concurrent allocator races.
+
 For an existing isolated environment, the primary entry point is `python3 -m elastic_kv` (or `elastic-sglang` after installing `pyproject.toml`). It validates elastic settings before importing SGLang, installs the adapter, and forwards the remaining arguments to SGLang. The launcher now owns precommit lookahead, future-ordering horizon and both telemetry destinations as well as their `EKV_*` environment equivalents, so spawned SGLang workers receive one validated manifest. `python3 -m elastic_kv.launch` remains compatible with the experiment scripts. The module entry point is required so the adapter is installed in the spawned scheduler process as well as the launcher. See [server usage](docs/SERVER.md); `EKV_STATS_PATH` optionally records residency telemetry.
 
 For the separate future-ordering path, set `EKV_FUTURE_POLICY=deadline` and

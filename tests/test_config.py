@@ -22,6 +22,7 @@ class ElasticConfigTest(unittest.TestCase):
                 "EKV_CHUNK_MIB": "4",
                 "EKV_RETAIN_CHUNKS": "8",
                 "EKV_ACTIVATION_POLICY": "both",
+                "EKV_ADMISSION_POLICY": "physical",
                 "EKV_PREFILL_HEADROOM_MIB": "512",
                 "EKV_PRECOMMIT_CHUNKS": "2",
                 "EKV_PRECOMMIT_MAX_CHUNKS": "3",
@@ -33,6 +34,7 @@ class ElasticConfigTest(unittest.TestCase):
         self.assertEqual(config.chunk_mib, 4)
         self.assertEqual(config.retain_chunks, 8)
         self.assertEqual(config.activation_policy, "both")
+        self.assertEqual(config.admission_policy, "physical")
         self.assertEqual(config.prefill_headroom_mib, 512)
         self.assertEqual(config.precommit_chunks, 2)
         self.assertEqual(config.precommit_max_chunks, 3)
@@ -43,6 +45,8 @@ class ElasticConfigTest(unittest.TestCase):
     def test_activation_policy_requires_v5(self):
         with self.assertRaisesRegex(ValueError, "require elastic mode v5"):
             ElasticConfig(mode="v4", activation_policy="telemetry")
+        with self.assertRaisesRegex(ValueError, "physical admission requires"):
+            ElasticConfig(mode="v4", admission_policy="physical")
 
     def test_invalid_integer_is_actionable(self):
         with self.assertRaisesRegex(ValueError, "EKV_CHUNK_MIB must be an integer"):
@@ -65,6 +69,8 @@ class ElasticConfigTest(unittest.TestCase):
                 "v5",
                 "--elastic-retain-chunks",
                 "8",
+                "--elastic-admission-policy",
+                "physical",
                 "--elastic-future-policy",
                 "deadline",
                 "--elastic-precommit-chunks",
@@ -85,13 +91,14 @@ class ElasticConfigTest(unittest.TestCase):
             (
                 config.mode,
                 config.retain_chunks,
+                config.admission_policy,
                 config.future_policy,
                 config.precommit_chunks,
                 config.precommit_max_chunks,
                 config.future_ordering_horizon_ms,
                 config.future_stats_path,
             ),
-            ("v5", 8, "deadline", 2, 4, 1500, "/tmp/future.json"),
+            ("v5", 8, "physical", "deadline", 2, 4, 1500, "/tmp/future.json"),
         )
         self.assertEqual(upstream, ["--model-path", "/models/qwen", "--port", "30000"])
         self.assertFalse(dry_run)

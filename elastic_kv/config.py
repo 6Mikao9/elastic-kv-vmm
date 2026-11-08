@@ -15,11 +15,13 @@ from typing import Mapping
 
 MODES = ("baseline", "v0", "v1", "v2", "v3", "v4", "v5")
 ACTIVATION_POLICIES = ("off", "telemetry", "trim", "recycle", "both")
+ADMISSION_POLICIES = ("logical", "physical")
 FUTURE_POLICIES = ("off", "deadline")
 DEFAULT_MODE = "baseline"
 DEFAULT_CHUNK_MIB = 2
 DEFAULT_RETAIN_CHUNKS = 1
 DEFAULT_ACTIVATION_POLICY = "off"
+DEFAULT_ADMISSION_POLICY = "logical"
 DEFAULT_PREFILL_HEADROOM_MIB = 0
 DEFAULT_FUTURE_POLICY = "off"
 DEFAULT_PRECOMMIT_CHUNKS = 0
@@ -44,6 +46,7 @@ class ElasticConfig:
     chunk_mib: int = DEFAULT_CHUNK_MIB
     retain_chunks: int = DEFAULT_RETAIN_CHUNKS
     activation_policy: str = DEFAULT_ACTIVATION_POLICY
+    admission_policy: str = DEFAULT_ADMISSION_POLICY
     prefill_headroom_mib: int = DEFAULT_PREFILL_HEADROOM_MIB
     precommit_chunks: int = DEFAULT_PRECOMMIT_CHUNKS
     precommit_max_chunks: int = 1
@@ -58,6 +61,10 @@ class ElasticConfig:
         if self.activation_policy not in ACTIVATION_POLICIES:
             raise ValueError(
                 f"unknown activation policy: {self.activation_policy!r}"
+            )
+        if self.admission_policy not in ADMISSION_POLICIES:
+            raise ValueError(
+                f"unknown admission policy: {self.admission_policy!r}"
             )
         if self.chunk_mib < 1:
             raise ValueError("chunk_mib must be positive")
@@ -77,6 +84,8 @@ class ElasticConfig:
             raise ValueError("future_ordering_horizon_ms must be nonnegative")
         if self.activation_policy != "off" and self.mode != "v5":
             raise ValueError("activation policies require elastic mode v5")
+        if self.admission_policy != "logical" and self.mode != "v5":
+            raise ValueError("physical admission requires elastic mode v5")
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> "ElasticConfig":
@@ -100,6 +109,9 @@ class ElasticConfig:
             ),
             activation_policy=env.get(
                 "EKV_ACTIVATION_POLICY", DEFAULT_ACTIVATION_POLICY
+            ),
+            admission_policy=env.get(
+                "EKV_ADMISSION_POLICY", DEFAULT_ADMISSION_POLICY
             ),
             prefill_headroom_mib=_integer(
                 "EKV_PREFILL_HEADROOM_MIB",
@@ -136,6 +148,7 @@ class ElasticConfig:
         chunk_mib: int | None = None,
         retain_chunks: int | None = None,
         activation_policy: str | None = None,
+        admission_policy: str | None = None,
         prefill_headroom_mib: int | None = None,
         precommit_chunks: int | None = None,
         precommit_max_chunks: int | None = None,
@@ -151,6 +164,7 @@ class ElasticConfig:
                 ("chunk_mib", chunk_mib),
                 ("retain_chunks", retain_chunks),
                 ("activation_policy", activation_policy),
+                ("admission_policy", admission_policy),
                 ("prefill_headroom_mib", prefill_headroom_mib),
                 ("precommit_chunks", precommit_chunks),
                 ("precommit_max_chunks", precommit_max_chunks),
@@ -169,6 +183,7 @@ class ElasticConfig:
             "EKV_CHUNK_MIB": str(self.chunk_mib),
             "EKV_RETAIN_CHUNKS": str(self.retain_chunks),
             "EKV_ACTIVATION_POLICY": self.activation_policy,
+            "EKV_ADMISSION_POLICY": self.admission_policy,
             "EKV_PREFILL_HEADROOM_MIB": str(self.prefill_headroom_mib),
             "EKV_PRECOMMIT_CHUNKS": str(self.precommit_chunks),
             "EKV_PRECOMMIT_MAX_CHUNKS": str(self.precommit_max_chunks),
@@ -198,6 +213,7 @@ class ElasticConfig:
             "chunk_mib": self.chunk_mib,
             "retain_chunks": self.retain_chunks,
             "activation_policy": self.activation_policy,
+            "admission_policy": self.admission_policy,
             "prefill_headroom_mib": self.prefill_headroom_mib,
             "precommit_chunks": self.precommit_chunks,
             "precommit_max_chunks": self.precommit_max_chunks,

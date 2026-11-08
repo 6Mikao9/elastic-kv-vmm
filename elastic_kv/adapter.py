@@ -124,6 +124,18 @@ class Residency:
         )
         if not 0 <= self.precommit_limit <= 16:
             raise ValueError("EKV_PRECOMMIT_MAX_CHUNKS must be in [0, 16]")
+        self.admission_policy = os.environ.get(
+            "EKV_ADMISSION_POLICY", "logical"
+        )
+        if self.admission_policy not in ("logical", "physical"):
+            raise ValueError("EKV_ADMISSION_POLICY must be logical or physical")
+        if self.admission_policy != "logical" and MODE != "v5":
+            raise ValueError("physical admission requires EKV_MODE=v5")
+        self.prefill_headroom_bytes = int(
+            os.environ.get("EKV_PREFILL_HEADROOM_MIB", "0")
+        ) << 20
+        if self.prefill_headroom_bytes < 0:
+            raise ValueError("EKV_PREFILL_HEADROOM_MIB must be nonnegative")
         self.precommitted = set()
         self.live = np.zeros(pool.size + pool.page_size, dtype=np.bool_)
         self.live[0] = True
@@ -148,6 +160,86 @@ class Residency:
         if self.slot_bytes > self.chunk_bytes:
             raise ValueError("slot exceeds VMM chunk size")
         return np.concatenate((first, last[last != first]))
+
+    def physical_available_tokens(self, logical_free_tokens):
+        """Bound scheduler admission by the bytes VMM can actually commit.
+
+        Existing mapped but free token slots are intentionally not credited in
+        this first runtime slice. The result is therefore conservative. The
+        configured prefill headroom is charged here, before ``prepare_for_extend``
+        allocates activations, so KV backing and the prefill working set share
+        one physical-device budget at scheduler admission time.
+        """
+
+        if logical_free_tokens < 0:
+            raise ValueError("logical_free_tokens must be nonnegative")
+        if self.admission_policy == "logical":
+            return logical_free_tokens
+        if logical_free_tokens == 0:
+            return 0
+        if self.slot_bytes <= 0 or self.slot_bytes > self.chunk_bytes:
+            raise ValueError("physical admission requires 0 < slot_bytes <= chunk_bytes")
+
+        chunk_cost = sum(
+            self.chunk_bytes * getattr(arena, "planes", 1)
+            for arena in self.arenas
+        )
+        if chunk_cost <= 0:
+            return logical_free_tokens
+
+        self.counters["physical_available_calls"] = (
+            self.counters.get("physical_available_calls", 0) + 1
+        )
+        start = time.perf_counter_ns()
+        free, _ = torch.cuda.mem_get_info(self.pool.device)
+        required_before_commit = self.prefill_headroom_bytes + chunk_cost
+        if free < required_before_commit:
+            start = time.perf_counter_ns()
+            with torch.cuda.device(self.pool.device):
+                torch.cuda.empty_cache()
+            after, _ = torch.cuda.mem_get_info(self.pool.device)
+            self.counters["physical_empty_cache_calls"] = (
+                self.counters.get("physical_empty_cache_calls", 0) + 1
+            )
+            self.counters["physical_empty_cache_freed_bytes"] = (
+                self.counters.get("physical_empty_cache_freed_bytes", 0)
+                + max(0, after - free)
+            )
+            self.counters["physical_empty_cache_ns"] = (
+                self.counters.get("physical_empty_cache_ns", 0)
+                + time.perf_counter_ns()
+                - start
+            )
+            free = after
+
+        usable = max(0, free - self.prefill_headroom_bytes)
+        new_chunks = usable // chunk_cost
+        tokens_per_chunk = self.chunk_bytes // self.slot_bytes
+        retained_free_chunks = 0
+        if not self.live[1:].any():
+            retained_free_chunks = max(
+                0, min(self.retain_chunks, len(self.counts)) - 1
+            )
+        capacity = (
+            new_chunks + retained_free_chunks + len(self.precommitted)
+        ) * tokens_per_chunk
+        admitted = min(logical_free_tokens, capacity)
+        self.counters["physical_headroom_bytes"] = self.prefill_headroom_bytes
+        self.counters["physical_chunk_cost_bytes"] = chunk_cost
+        self.counters["physical_available_tokens_min"] = min(
+            self.counters.get("physical_available_tokens_min", admitted), admitted
+        )
+        self.counters["physical_available_tokens_last"] = admitted
+        if admitted < logical_free_tokens:
+            self.counters["physical_limited_calls"] = (
+                self.counters.get("physical_limited_calls", 0) + 1
+            )
+        self.counters["physical_available_ns"] = (
+            self.counters.get("physical_available_ns", 0)
+            + time.perf_counter_ns()
+            - start
+        )
+        return admitted
 
     def admit(self, ids):
         if len(ids) == 0:
@@ -283,6 +375,7 @@ class Residency:
             for key, value in arena.metrics.items():
                 metrics[key] = metrics.get(key, 0) + value
         result = {**metrics, **self.counters, "mode": MODE, "layout": self.layout,
+                  "admission_policy": self.admission_policy,
                   "chunk_bytes": self.chunk_bytes, "logical_capacity_bytes": self.logical_bytes,
                   "retain_chunks": self.retain_chunks if MODE == "v5" else None,
                   "precommit_lookahead": self.precommit_lookahead,
@@ -434,7 +527,7 @@ def install():
 
         def available_size(self):
             if MODE == "v5":
-                return self.free_slots.count
+                return self.ctrl.physical_available_tokens(self.free_slots.count)
             if MODE in HOST_FREE_MODES and hasattr(self, "host_free"):
                 return int(np.count_nonzero(self.host_free))
             return super().available_size()
