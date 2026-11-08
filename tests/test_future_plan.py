@@ -197,12 +197,45 @@ class FuturePlanTest(unittest.TestCase):
 
         self.assertEqual(result.policy, "online")
         self.assertTrue(result.search_truncated)
+        self.assertEqual(result.fallback_policy, "future")
+        self.assertEqual(len(result.admissions), len(self.workload))
+        self.assertLessEqual(result.peak_memory_bytes, bounded.memory_budget_bytes)
+
+    def test_online_budget_after_commit_labels_hybrid_fallback(self):
+        config = PlannerConfig(
+            memory_budget_bytes=900_000,
+            kv_bytes_per_token=1000,
+            prefill_workspace_bytes_per_token=1,
+            sparse_hot_tokens=64,
+            prefill_tokens_per_ms=8,
+            resident_decode_tokens_per_ms=10,
+            sparse_decode_tokens_per_ms=16,
+            max_active_requests=3,
+            lookahead_ms=40,
+            auto_resident_output_threshold=32,
+            online_max_rollouts=3,
+        )
+        workload = [
+            RequestProfile(
+                "r0", 20, 64, 32, priority=1.0, deadline_ms=140
+            ),
+            RequestProfile(
+                "r1", 30, 320, 64, priority=2.0, deadline_ms=110
+            ),
+            RequestProfile(
+                "r2", 50, 192, 32, priority=0.5, deadline_ms=230
+            ),
+        ]
+
+        result = simulate(workload, config, "online")
+
+        self.assertTrue(result.search_truncated)
+        self.assertGreater(result.search_expansions, 0)
         self.assertEqual(
             result.fallback_policy,
             "online_prefix_then_future",
         )
-        self.assertEqual(len(result.admissions), len(self.workload))
-        self.assertLessEqual(result.peak_memory_bytes, bounded.memory_budget_bytes)
+        self.assertEqual(len(result.admissions), len(workload))
 
     def test_future_policy_can_idle_to_protect_an_imminent_deadline(self):
         workload = [

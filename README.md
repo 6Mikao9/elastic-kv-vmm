@@ -236,10 +236,11 @@ is reached. Search telemetry is exported as `search_expansions`,
 `search_exact` distinguishes a completed search from a capped incumbent. Use
 `online` to evaluate each immediate action by completing the deployable
 `future` heuristic from that branch, then commit only the first action. Its
-`online_max_rollouts` budget makes the search bounded. Exhaustion keeps the
-already committed `online` prefix and completes it with a `future` suffix; the
-`fallback_policy="online_prefix_then_future"` label makes this hybrid explicit.
-Use
+`online_max_rollouts` budget makes the search bounded. If no action has been
+committed, exhaustion returns the ordinary `future` plan. After an `online`
+action is committed, exhaustion keeps that prefix and completes it with a
+`future` suffix; the `fallback_policy="online_prefix_then_future"` label makes
+this hybrid explicit. Use
 `--policies fifo future online oracle` to limit offline work; an emitted policy
 is automatically included and its simulation is reused. Each result also
 carries `oracle_gap` metrics when the comparison includes oracle. A negative

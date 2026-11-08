@@ -256,9 +256,10 @@ GPU trace。
 策略不会把 rollout 中未执行的未来动作当成固定承诺。
 
 `online_max_rollouts` 限制单次 trace 的完成模拟次数。预算不足时，当前状态直接
-完成后缀 `future` 模拟，并输出 `search_truncated=true` 与
-`fallback_policy="online_prefix_then_future"`。该结果保留已提交的 online
-前缀，并非从头运行的普通 `future` 计划。`online` 的 `search_exact` 始终为 false：完整
+完成后缀 `future` 模拟并输出 `search_truncated=true`。若尚未提交任何 online
+动作，结果为普通 `future` 计划并标记 `fallback_policy="future"`；若已提交至少一个
+动作，则保留该前缀并标记 `fallback_policy="online_prefix_then_future"`，不能把它
+误写成从头运行的普通 `future` 计划。`online` 的 `search_exact` 始终为 false：完整
 rollout 等于离线质量诊断；它仍受 `lookahead_ms` 和启发式后缀限制，也不证明
 真实 serving 最优或改变 `PrefillAdder` 的最终准入权。
 

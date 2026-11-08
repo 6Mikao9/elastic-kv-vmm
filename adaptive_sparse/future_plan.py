@@ -1458,7 +1458,11 @@ def _simulate_online(
                 policy="online",
                 search_expansions=rollouts,
                 search_truncated=True,
-                fallback_policy="online_prefix_then_future",
+                fallback_policy=(
+                    "online_prefix_then_future"
+                    if state.admissions
+                    else "future"
+                ),
             )
 
         best_child = None
