@@ -6,9 +6,10 @@ import unittest
 from unittest.mock import Mock, call, patch
 
 from adaptive_sparse.scheduler_budget import (
-    SchedulerBudget, _bounded_demotion_groups, _chunk_release_counts,
-    _rank_demotions, _releasable, _releasable_counts, _releasable_group,
-    _releasable_pair,
+    PhysicalDemandIndex, SchedulerBudget, _bounded_demotion_groups,
+    _chunk_release_counts, _demand_index_demotion_groups,
+    _indexed_demotion_groups, _rank_demotions,
+    _releasable, _releasable_counts, _releasable_group, _releasable_pair,
 )
 from adaptive_sparse.future_prefill import empty_plan
 
@@ -135,6 +136,139 @@ class SchedulerBudgetTest(unittest.TestCase):
         self.assertFalse(truncated)
         self.assertEqual(examined, 4)
         self.assertEqual(rejected, 1)
+
+    def test_physical_demand_index_updates_changed_requests_incrementally(self):
+        index = PhysicalDemandIndex()
+        requests = {
+            "a": (None, {1}, Counter({9: 1}), set()),
+            "b": (None, {2}, Counter({9: 1}), set()),
+        }
+        self.assertEqual(index.sync(requests), 2)
+        self.assertEqual(index.page_owners, {1: {"a"}, 2: {"b"}})
+        self.assertEqual(index.chunk_owners, {9: {"a": 1, "b": 1}})
+        self.assertFalse(index.has_page_overlap)
+        self.assertEqual(index.sync(requests), 0)
+
+        requests["b"] = (None, {1}, Counter({9: 1}), set())
+        self.assertEqual(index.sync(requests), 1)
+        self.assertTrue(index.has_page_overlap)
+        self.assertEqual(index.page_owners[1], {"a", "b"})
+
+        self.assertEqual(index.sync({}), 2)
+        self.assertEqual(index.records, {})
+        self.assertEqual(index.chunk_owners, {})
+        self.assertEqual(index.page_owners, {})
+
+    def test_indexed_group_search_follows_shared_chunk_owners(self):
+        tracker = B(
+            backing=B(mapped_chunks={9}),
+            refs={9: 3},
+            chunk_bytes=10,
+        )
+        requests = {
+            "a": (None, {1}, Counter({9: 1}), set()),
+            "b": (None, {2}, Counter({9: 1}), set()),
+            "c": (None, {3}, Counter({9: 1}), set()),
+        }
+        costs = {"a": 4, "b": 5, "c": 6}
+        index = PhysicalDemandIndex()
+        self.assertEqual(index.sync(requests), 3)
+        groups, chunks, examined, truncated, rejected = _indexed_demotion_groups(
+            index, tracker, requests, costs.__getitem__, max_group=3,
+            byte_cap=20, search_limit=8,
+        )
+        self.assertEqual(groups[("a", "b", "c")], (10, 15))
+        self.assertEqual(chunks[("a", "b", "c")], {9})
+        self.assertEqual(examined, 1)
+        self.assertFalse(truncated)
+        self.assertEqual(rejected, 0)
+
+    def test_indexed_search_uses_exact_fallback_for_overlapping_pages(self):
+        tracker = B(
+            backing=B(mapped_chunks={9}),
+            refs={9: 1},
+            chunk_bytes=10,
+            chunks=lambda _: {9},
+        )
+        requests = {
+            "a": (None, {1}, Counter({9: 1}), set()),
+            "b": (None, {1}, Counter({9: 1}), set()),
+        }
+        index = PhysicalDemandIndex()
+        index.sync(requests)
+        (groups, chunks, indexed_examined, fallback_examined, index_truncated,
+         fallback_truncated, rejected, used_fallback) = (
+            _demand_index_demotion_groups(
+                index,
+                tracker,
+                requests,
+                lambda _: 1,
+                max_group=2,
+                byte_cap=10,
+                search_limit=4,
+            )
+        )
+        self.assertEqual(groups[("a", "b")], (10, 2))
+        self.assertEqual(chunks[("a", "b")], {9})
+        self.assertEqual(indexed_examined, 0)
+        self.assertEqual(fallback_examined, 1)
+        self.assertFalse(index_truncated)
+        self.assertFalse(fallback_truncated)
+        self.assertEqual(rejected, 0)
+        self.assertTrue(used_fallback)
+
+    def test_indexed_search_does_not_miss_disjoint_page_groups(self):
+        random = Random(911)
+        for trial in range(25):
+            request_ids = [f"r{index}" for index in range(8)]
+            per_request = {request_id: Counter() for request_id in request_ids}
+            refs = Counter()
+            for chunk in range(12):
+                owners = random.sample(request_ids, random.randint(2, 4))
+                for request_id in owners:
+                    per_request[request_id][chunk] += 1
+                    refs[chunk] += 1
+            requests = {
+                request_id: (
+                    None,
+                    {int(request_id[1:]) + 1},
+                    per_request[request_id],
+                    set(),
+                )
+                for request_id in request_ids
+            }
+            tracker = B(
+                backing=B(mapped_chunks=set(refs)),
+                refs=refs,
+                chunk_bytes=1,
+            )
+            exhaustive, _, _, _, _ = _bounded_demotion_groups(
+                tracker,
+                requests,
+                lambda _: 1,
+                max_group=4,
+                byte_cap=1 << 30,
+                search_limit=1000,
+            )
+            index = PhysicalDemandIndex()
+            index.sync(requests)
+            (indexed, _, _, fallback_examined, _, _, _, used_fallback) = (
+                _demand_index_demotion_groups(
+                    index,
+                    tracker,
+                    requests,
+                    lambda _: 1,
+                    max_group=4,
+                    byte_cap=1 << 30,
+                    search_limit=256,
+                )
+            )
+            with self.subTest(trial=trial):
+                self.assertTrue(exhaustive)
+                self.assertTrue(indexed)
+                self.assertTrue(set(indexed).issubset(exhaustive))
+                self.assertEqual(fallback_examined, 0)
+                self.assertFalse(used_fallback)
 
     def test_group_search_rotation_reaches_later_shared_pair(self):
         tracker = B(

@@ -1,0 +1,162 @@
+[
+  {
+    "exhaustive": {
+      "candidate_groups": 0,
+      "examined": 256,
+      "groups_preview": [],
+      "groups_preview_truncated": false,
+      "median_ms": 0.730987,
+      "p95_ms": 0.746912,
+      "truncated": true
+    },
+    "indexed": {
+      "candidate_groups": 0,
+      "examined": 0,
+      "groups_preview": [],
+      "groups_preview_truncated": false,
+      "index_updates": 32,
+      "median_ms": 0.090297,
+      "p95_ms": 0.095765,
+      "truncated": false
+    },
+    "repeats": 500,
+    "requests": 32,
+    "scenario": "no-candidate",
+    "search_limit": 256
+  },
+  {
+    "exhaustive": {
+      "candidate_groups": 0,
+      "examined": 256,
+      "groups_preview": [],
+      "groups_preview_truncated": false,
+      "median_ms": 0.7482335,
+      "p95_ms": 0.755584,
+      "truncated": true
+    },
+    "indexed": {
+      "candidate_groups": 1,
+      "examined": 1,
+      "groups_preview": [
+        [
+          "r30",
+          "r31"
+        ]
+      ],
+      "groups_preview_truncated": false,
+      "index_updates": 32,
+      "median_ms": 0.097047,
+      "p95_ms": 0.103888,
+      "truncated": false
+    },
+    "repeats": 500,
+    "requests": 32,
+    "scenario": "shared-tail",
+    "search_limit": 256
+  },
+  {
+    "exhaustive": {
+      "candidate_groups": 118,
+      "examined": 256,
+      "groups_preview": [
+        [
+          "r00",
+          "r01"
+        ],
+        [
+          "r00",
+          "r01",
+          "r02"
+        ],
+        [
+          "r00",
+          "r01",
+          "r02",
+          "r03"
+        ],
+        [
+          "r00",
+          "r01",
+          "r02",
+          "r04"
+        ],
+        [
+          "r00",
+          "r01",
+          "r02",
+          "r05"
+        ],
+        [
+          "r00",
+          "r01",
+          "r02",
+          "r06"
+        ],
+        [
+          "r00",
+          "r01",
+          "r02",
+          "r07"
+        ],
+        [
+          "r00",
+          "r01",
+          "r02",
+          "r08"
+        ]
+      ],
+      "groups_preview_truncated": true,
+      "median_ms": 0.9464984999999999,
+      "p95_ms": 0.958452,
+      "truncated": true
+    },
+    "indexed": {
+      "candidate_groups": 16,
+      "examined": 16,
+      "groups_preview": [
+        [
+          "r00",
+          "r01"
+        ],
+        [
+          "r02",
+          "r03"
+        ],
+        [
+          "r04",
+          "r05"
+        ],
+        [
+          "r06",
+          "r07"
+        ],
+        [
+          "r08",
+          "r09"
+        ],
+        [
+          "r10",
+          "r11"
+        ],
+        [
+          "r12",
+          "r13"
+        ],
+        [
+          "r14",
+          "r15"
+        ]
+      ],
+      "groups_preview_truncated": true,
+      "index_updates": 32,
+      "median_ms": 0.20297300000000001,
+      "p95_ms": 0.210038,
+      "truncated": false
+    },
+    "repeats": 500,
+    "requests": 32,
+    "scenario": "many-pairs",
+    "search_limit": 256
+  }
+]
+

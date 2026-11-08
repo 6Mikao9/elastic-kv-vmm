@@ -1,6 +1,6 @@
 # HiSparse 动态预算的当前边界
 
-调度器在 prefill 分配前检查预算，decode 默认每 16 步观测一次。每次检查以 TP rank 中最大的稀疏主 KV backing 加上适用的 prefill 余量来判定压力。每次边界最多提交一个迁移事务，默认一个请求。启用 `EKV_ADAPTIVE_MAX_GROUP=2..4` 后，可在无单请求可回收候选时选择一个联合降级事务。控制器按请求释放页和 VMM 物理 chunk 引用计数枚举小规模请求组合，只有整块的所有引用都被选中时才计入可回收量；组合的迁移字节仍须通过 byte cap，TP 各 rank 也须同时找到同一组请求。`EKV_ADAPTIVE_GROUP_SEARCH_LIMIT` 默认 256，把组合检查预算分配到 2、3、4 请求三个层级，避免二请求候选挤掉三/四请求组合；达到上限会记录 `group_search_truncated`，后续压力检查会轮换组合起点，且原有 dwell 继续限制迁移频率。实际释放量按 rank 记录。这个预算覆盖主 KV backing，权重、其他 KV 池、CUDA workspace 和整卡压力需另行核算。
+调度器在 prefill 分配前检查预算，decode 默认每 16 步观测一次。每次检查以 TP rank 中最大的稀疏主 KV backing 加上适用的 prefill 余量来判定压力。每次边界最多提交一个迁移事务，默认一个请求。启用 `EKV_ADAPTIVE_MAX_GROUP=2..4` 后，可在无单请求可回收候选时选择一个联合降级事务。控制器维护增量的请求到页/chunk、页到请求和 chunk 到请求索引；只有 chunk 的全部引用都落在候选 owner 集合内时才把该 owner closure 送入精确校验。重叠页场景仍回退到按页 union 的精确枚举。组合的迁移字节须通过 byte cap，TP 各 rank 也须同时找到同一组请求。`EKV_ADAPTIVE_GROUP_SEARCH_LIMIT` 默认 256，限制 owner closure 的精确校验和重叠页回退预算；达到上限会记录 `group_search_truncated`，后续压力检查会轮换起点，且原有 dwell 继续限制迁移频率。实际释放量按 rank 记录。这个预算覆盖主 KV backing，权重、其他 KV 池、CUDA workspace 和整卡压力需另行核算。
 
 联合搜索用于解决“最长请求单独降级也腾不出一个完整物理 chunk”的布局问题。它不假设物理页与请求一一对应，也不依赖前缀树：两个互不共享前缀的请求仍可能因为 VMM 小页拼入同一 2 MiB 物理 chunk 而需要共同释放。当前基线仍是 2 MiB chunk；最终收益取决于 chunk 大小、请求尾页和并发布局，必须与单请求策略做配对实测，不能由控制面候选数直接推断。
 

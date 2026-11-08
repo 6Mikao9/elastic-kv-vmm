@@ -1,6 +1,6 @@
 """MiniMax eager scheduler integration for budget-triggered demotion."""
 
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import replace
 from functools import wraps
 from fractions import Fraction
@@ -122,6 +122,189 @@ def _bounded_demotion_groups(tracker, requests, cost, *, max_group,
     return groups, chunks, examined, truncated, rejected_by_cap
 
 
+class PhysicalDemandIndex:
+    """Incrementally index request pages and the physical chunks they release.
+
+    The scheduler already computes page ownership for candidates.  This index
+    reuses those values across pressure ticks, so a changed request updates
+    only its own page/chunk entries instead of rebuilding a chunk-to-owner map
+    for every request on every scheduler boundary.
+    """
+
+    def __init__(self):
+        self.records = {}
+        self.page_owners = {}
+        self.chunk_owners = {}
+
+    def sync(self, requests):
+        active = set(requests)
+        changed = 0
+        for request_id in tuple(self.records):
+            if request_id not in active:
+                self._remove(request_id)
+                changed += 1
+        for request_id, entry in requests.items():
+            pages = frozenset(entry[1])
+            chunks = Counter({chunk: count for chunk, count in entry[2].items() if count})
+            record = (pages, chunks)
+            if self.records.get(request_id) == record:
+                continue
+            if request_id in self.records:
+                self._remove(request_id)
+            self._add(request_id, pages, chunks)
+            changed += 1
+        return changed
+
+    def _add(self, request_id, pages, chunks):
+        self.records[request_id] = (pages, Counter(chunks))
+        for page in pages:
+            self.page_owners.setdefault(page, set()).add(request_id)
+        for chunk, count in chunks.items():
+            self.chunk_owners.setdefault(chunk, {})[request_id] = count
+
+    def _remove(self, request_id):
+        pages, chunks = self.records.pop(request_id)
+        for page in pages:
+            owners = self.page_owners[page]
+            owners.remove(request_id)
+            if not owners:
+                del self.page_owners[page]
+        for chunk in chunks:
+            owners = self.chunk_owners[chunk]
+            del owners[request_id]
+            if not owners:
+                del self.chunk_owners[chunk]
+
+    @property
+    def has_page_overlap(self):
+        return any(len(owners) > 1 for owners in self.page_owners.values())
+
+    def _candidate_groups(self, tracker, *, max_group, candidate_limit, rotation):
+        request_ids = sorted(self.records)
+        if request_ids:
+            rotation %= len(request_ids)
+            request_ids = request_ids[rotation:] + request_ids[:rotation]
+        order = {request_id: index for index, request_id in enumerate(request_ids)}
+        queue = deque((request_id,) for request_id in request_ids)
+        seen = set()
+        candidates = set()
+        truncated = False
+        while queue:
+            group = tuple(sorted(queue.popleft()))
+            if group in seen:
+                continue
+            seen.add(group)
+            if len(group) >= max_group:
+                if len(group) >= 2:
+                    candidates.add(group)
+                continue
+            chunks = set().union(
+                *(self.records[request_id][1] for request_id in group)
+            )
+            expanded_any = False
+            for chunk in chunks:
+                owner_counts = self.chunk_owners.get(chunk, {})
+                if sum(owner_counts.values()) != tracker.refs.get(chunk):
+                    continue
+                expanded = tuple(sorted(set(group) | set(owner_counts)))
+                if len(expanded) <= max_group and expanded != group:
+                    queue.append(expanded)
+                    expanded_any = True
+            if len(group) >= 2:
+                candidates.add(group)
+            if not expanded_any and len(seen) >= candidate_limit:
+                truncated = True
+                break
+            if len(seen) >= candidate_limit:
+                truncated = True
+                break
+        ordered = sorted(
+            (group for group in candidates if len(group) >= 2),
+            key=lambda group: tuple(order[request_id] for request_id in group),
+        )
+        return ordered, truncated
+
+
+def _indexed_demotion_groups(index, tracker, requests, cost, *, max_group,
+                             byte_cap, search_limit, rotation=0):
+    """Search owner closures before falling back to bounded enumeration."""
+    if search_limit < 1:
+        raise ValueError("search_limit must be positive")
+    candidate_limit = max(32, search_limit * 4)
+    candidates, candidate_truncated = index._candidate_groups(
+        tracker,
+        max_group=max_group,
+        candidate_limit=candidate_limit,
+        rotation=rotation,
+    )
+    groups = {}
+    chunks = {}
+    examined = rejected_by_cap = 0
+    truncated = candidate_truncated
+    for group in candidates:
+        if examined >= search_limit:
+            truncated = True
+            break
+        examined += 1
+        transfer = sum(cost(request_id) for request_id in group)
+        if transfer > byte_cap:
+            rejected_by_cap += 1
+            continue
+        released = _releasable_group(
+            tracker,
+            (
+                (requests[request_id][1], requests[request_id][2])
+                for request_id in group
+            ),
+        )
+        if released:
+            groups[group] = (len(released) * tracker.chunk_bytes, transfer)
+            chunks[group] = released
+    return groups, chunks, examined, truncated, rejected_by_cap
+
+
+def _demand_index_demotion_groups(index, tracker, requests, cost, *, max_group,
+                                  byte_cap, search_limit, rotation=0):
+    """Use indexed owner closures and exact fallback for overlapping pages."""
+    groups, chunks, indexed_examined, truncated, rejected = (
+        _indexed_demotion_groups(
+            index,
+            tracker,
+            requests,
+            cost,
+            max_group=max_group,
+            byte_cap=byte_cap,
+            search_limit=search_limit,
+            rotation=rotation,
+        )
+    )
+    if groups or not index.has_page_overlap:
+        return (
+            groups, chunks, indexed_examined, 0, truncated, False,
+            rejected, False,
+        )
+    (groups, chunks, fallback_examined, fallback_truncated,
+     fallback_rejected) = _bounded_demotion_groups(
+        tracker,
+        requests,
+        cost,
+        max_group=max_group,
+        byte_cap=byte_cap,
+        search_limit=search_limit,
+        rotation=rotation,
+    )
+    return (
+        groups,
+        chunks,
+        indexed_examined,
+        fallback_examined,
+        truncated,
+        fallback_truncated,
+        rejected + fallback_rejected,
+        True,
+    )
+
+
 def _rank_demotions(rank_candidates):
     ranks = tuple(rank_candidates)
     if not ranks:
@@ -159,6 +342,7 @@ class SchedulerBudget:
         self.group_search_limit = group_search_limit
         self.capture_plans = capture_plans
         self.trim_low_water = trim_low_water
+        self.demand_index = PhysicalDemandIndex()
         self.plan_snapshots = []
         self.plan_keys = set()
         self.residency_since = {}
@@ -171,6 +355,9 @@ class SchedulerBudget:
                       "group_requests_demoted": 0,
                       "group_search_ticks": 0, "group_search_evaluated": 0,
                       "group_search_truncated": 0,
+                      "group_index_updates": 0, "group_index_ticks": 0,
+                      "group_index_evaluated": 0, "group_index_truncated": 0,
+                      "group_index_fallbacks": 0,
                       "slack_reclaim_actions": 0, "slack_reclaim_bytes": 0,
                       "low_water_slack_actions": 0, "low_water_slack_bytes": 0,
                       "broker_rejected_promotions": 0,
@@ -385,17 +572,26 @@ class SchedulerBudget:
             chosen = (ranked[0],)
             chunks = requests[chosen[0]][3]
         elif self.max_group > 1 and not force and len(requests) > 1:
-            (groups, group_chunks, examined, truncated,
-             rejected_by_cap) = _bounded_demotion_groups(
-                tracker, requests, cost,
+            index_updates = self.demand_index.sync(requests)
+            self.stats["group_index_updates"] += index_updates
+            self.stats["group_index_ticks"] += 1
+            (groups, group_chunks, examined, fallback_examined, index_truncated,
+             fallback_truncated, rejected_by_cap,
+             used_fallback) = _demand_index_demotion_groups(
+                self.demand_index, tracker, requests, cost,
                 max_group=self.max_group, byte_cap=self.byte_cap,
                 search_limit=self.group_search_limit,
                 rotation=self.stats["group_search_ticks"],
             )
             self.stats["group_search_ticks"] += 1
-            self.stats["group_search_evaluated"] += examined
-            self.stats["group_search_truncated"] += int(truncated)
+            self.stats["group_search_evaluated"] += examined + fallback_examined
+            self.stats["group_search_truncated"] += int(
+                index_truncated or fallback_truncated
+            )
+            self.stats["group_index_evaluated"] += examined
+            self.stats["group_index_truncated"] += int(index_truncated)
             self.stats["rejected_cap"] += rejected_by_cap
+            self.stats["group_index_fallbacks"] += int(used_fallback)
             ranked_groups = _rank_demotions(exchange(groups))
             chosen = ranked_groups[0] if ranked_groups else ()
             chunks = group_chunks.get(chosen, set())

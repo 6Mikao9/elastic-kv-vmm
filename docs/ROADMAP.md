@@ -100,15 +100,17 @@ acceptance goals, not demonstrated results or an assumed speedup threshold.
 
 Physical chunk co-occupancy is an implementation issue to optimize, not
 prefix sharing: the 240 MiB/rank joint-reclaim example used independent
-request pages and disabled radix caching. Investigate request-affine
-placement without excessive tail waste. For cheaper candidate selection,
-maintain request-to-chunk and chunk-to-live-page/owner indexes on allocation,
-release and migration events; update only affected candidates. Rank by
-reclaimable whole chunks after retained hot pages and live references, then
-account for transfer and temporary-allocation costs. Keep a small cached
-shortlist, search bounded groups of co-occupants only when needed, and use
-the current exact planner plus TP agreement before committing. Validate
-incremental scores against exact occupancy and measure bookkeeping cost.
+request pages and disabled radix caching. The scheduler now maintains
+incremental request-to-page/chunk and chunk-to-owner indexes for pressure
+candidates. Shared-chunk owner closures seed a bounded two-to-four-request
+search; overlapping-page cases retain the exact page-union fallback. Candidate
+ranking includes whole-chunk release benefit and transfer cost, followed by the
+existing TP agreement and exact pre-commit checks. The [initial CPU
+microbenchmark](GROUP_INDEX_MICROBENCH.md) reduced a 32-request synthetic
+search from 256 examined combinations to 0–16 owner closures. The next step is
+to measure index maintenance on real allocator callbacks and run a paired
+serving trace against exhaustive search. Request-affine placement without
+excessive tail waste remains open.
 
 Separately, explore reuse of identical prefix KV that another request still
 holds on the GPU. A HiSparse Top-K lookup could first resolve a compatible
