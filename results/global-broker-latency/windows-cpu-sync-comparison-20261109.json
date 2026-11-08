@@ -1,0 +1,27 @@
+{
+  "environment": "Windows CPU temporary-directory SQLite benchmark; no CUDA or model execution",
+  "iterations_per_run": 1000,
+  "runs_per_setting": 3,
+  "metric": "claim+shrink+release wall time",
+  "off": {
+    "full_median_us": 1727.35,
+    "normal_median_us": 114.3,
+    "full_p95_us": 1962.01,
+    "normal_p95_us": 177.62,
+    "median_speedup": 15.11
+  },
+  "observe": {
+    "full_median_us": 1756.4,
+    "normal_median_us": 119.5,
+    "full_p95_us": 1991.41,
+    "normal_p95_us": 189.81,
+    "median_speedup": 14.70
+  },
+  "enforce": {
+    "full_median_us": 1749.45,
+    "normal_median_us": 121.2,
+    "full_p95_us": 1971.785,
+    "normal_p95_us": 178.465,
+    "median_speedup": 14.43
+  }
+}

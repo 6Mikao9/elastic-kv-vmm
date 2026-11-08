@@ -273,3 +273,16 @@ TTFT。改造前、后原始文件分别为
 收益与代价仍需在目标 Linux/tmpfs 上结合 TTFT 和 claim denial 一起测量；当前数字只
 证明实现没有引入毫秒级以上的控制面退化，不能单独证明端到端收益。原始结果见
 [缩容基准](../results/global-broker-latency/windows-cpu-claims-shrink-20261109.json)。
+
+准入记录是进程存活期间的临时 GPU 容量承诺，机器断电后对应的 CUDA 映射也必然
+消失，因此 broker 的 WAL 连接使用 `PRAGMA synchronous=NORMAL`。应用崩溃下仍保持
+一致性；相比默认 `FULL`，它避免每个 claim、shrink 和 release 都等待物理 fsync。
+在同一个 Windows CPU 临时目录上，将 `full` 与 `normal` 各自重复三轮、每轮 1,000
+次后，`claim+shrink+release` 的三轮中位中位数在 `off/observe/enforce` 下由
+1.727/1.756/1.749 ms 降至 0.114/0.120/0.121 ms，约快 15.1/14.7/14.4 倍；
+对应 p95 由 1.962/1.991/1.972 ms 降至 0.178/0.190/0.178 ms。摘要见
+[`windows-cpu-sync-comparison-20261109.json`](../results/global-broker-latency/windows-cpu-sync-comparison-20261109.json)，
+原始运行保存在同目录的 `windows-cpu-sync-full-r*-20261109.json` 与
+`windows-cpu-sync-normal-explicit-r*-20261109.json`。该结果仍只证明 Windows CPU
+控制面开销，最终收益必须在目标 Linux/tmpfs 文件系统上通过 prefill 边界 TTFT、
+claim denial 和真实竞争负载验证；不能把约 1.6 ms 的下降直接写成 serving 吞吐收益。

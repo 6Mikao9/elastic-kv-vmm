@@ -23,7 +23,7 @@ def _percentile(values, fraction):
     return ordered[low] * (1.0 - weight) + ordered[high] * weight
 
 
-def _run_mode(mode, iterations, directory):
+def _run_mode(mode, iterations, directory, synchronous="NORMAL"):
     capacity = 1 << 30
     chunk = 64 << 10
     path = Path(directory) / f"broker-{mode}.sqlite"
@@ -43,6 +43,8 @@ def _run_mode(mode, iterations, directory):
         heartbeat_seconds=None, **second_kwargs,
     )
     owners = (first, second)
+    for owner in owners:
+        owner._connect().execute(f"PRAGMA synchronous={synchronous.upper()}")
     samples_us = []
     claim_samples_us = []
     claim_shrink_samples_us = []
@@ -93,6 +95,7 @@ def _run_mode(mode, iterations, directory):
         second.close()
     return {
         "fair_mode": mode,
+        "synchronous": synchronous.upper(),
         "iterations": iterations,
         "median_reserve_release_us": statistics.median(samples_us),
         "p95_reserve_release_us": _percentile(samples_us, 0.95),
@@ -116,13 +119,19 @@ def _run_mode(mode, iterations, directory):
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--iterations", type=int, default=1000)
+    parser.add_argument(
+        "--synchronous",
+        choices=("normal", "full"),
+        default="normal",
+        help="SQLite synchronous level used by the benchmark connections",
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
     if args.iterations < 1:
         parser.error("--iterations must be positive")
     with tempfile.TemporaryDirectory() as directory:
         payload = {
-            mode: _run_mode(mode, args.iterations, directory)
+            mode: _run_mode(mode, args.iterations, directory, args.synchronous)
             for mode in ("off", "observe", "enforce")
         }
     rendered = json.dumps(payload, indent=2, sort_keys=True)

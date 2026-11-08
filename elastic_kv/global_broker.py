@@ -196,6 +196,11 @@ class GlobalAdmissionBroker:
             connection.execute(
                 f"PRAGMA busy_timeout = {int(self.timeout_seconds * 1000)}"
             )
+            # The broker stores volatile GPU-capacity reservations.  WAL with
+            # NORMAL keeps process-crash consistency while avoiding a physical
+            # fsync on every prefill claim, shrink and release.  A host power
+            # loss also destroys the owning GPU processes and their mappings.
+            connection.execute("PRAGMA synchronous=NORMAL")
             self._local.connection = connection
             with self._connections_lock:
                 self._connections.add(connection)

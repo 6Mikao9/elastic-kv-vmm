@@ -59,7 +59,9 @@ class GlobalAdmissionBrokerTest(unittest.TestCase):
     def test_reuses_a_connection_within_one_thread(self):
         broker = self.broker("owner")
         try:
-            self.assertIs(broker._connect(), broker._connect())
+            connection = broker._connect()
+            self.assertIs(connection, broker._connect())
+            self.assertEqual(connection.execute("PRAGMA synchronous").fetchone()[0], 1)
             self.assertTrue(broker.claim("prefill-0", 1).admit)
             self.assertEqual(broker.release_claim("prefill-0"), 1)
         finally:

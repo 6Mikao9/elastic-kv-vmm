@@ -1,0 +1,50 @@
+{
+  "enforce": {
+    "fair_mode": "enforce",
+    "iterations": 500,
+    "max_claim_release_us": 1904.9,
+    "max_claim_shrink_release_us": 3011.3,
+    "max_reserve_release_us": 2321.6,
+    "max_snapshot_us": 250.7,
+    "median_claim_release_us": 1217.9499999999998,
+    "median_claim_shrink_release_us": 1779.1,
+    "median_reserve_release_us": 1242.3000000000002,
+    "median_snapshot_us": 63.75,
+    "p95_claim_release_us": 1371.8149999999996,
+    "p95_claim_shrink_release_us": 1938.1299999999997,
+    "p95_reserve_release_us": 1412.81,
+    "p95_snapshot_us": 76.84999999999995
+  },
+  "observe": {
+    "fair_mode": "observe",
+    "iterations": 500,
+    "max_claim_release_us": 1747.7,
+    "max_claim_shrink_release_us": 6577.2,
+    "max_reserve_release_us": 1931.3,
+    "max_snapshot_us": 213.0,
+    "median_claim_release_us": 1202.4,
+    "median_claim_shrink_release_us": 1733.3,
+    "median_reserve_release_us": 1227.5500000000002,
+    "median_snapshot_us": 60.95,
+    "p95_claim_release_us": 1359.915,
+    "p95_claim_shrink_release_us": 2016.6049999999996,
+    "p95_reserve_release_us": 1407.5099999999998,
+    "p95_snapshot_us": 75.80999999999999
+  },
+  "off": {
+    "fair_mode": "off",
+    "iterations": 500,
+    "max_claim_release_us": 2938.9,
+    "max_claim_shrink_release_us": 3066.9,
+    "max_reserve_release_us": 2833.4,
+    "max_snapshot_us": 1865.6,
+    "median_claim_release_us": 1200.05,
+    "median_claim_shrink_release_us": 1751.65,
+    "median_reserve_release_us": 1232.25,
+    "median_snapshot_us": 51.349999999999994,
+    "p95_claim_release_us": 1378.685,
+    "p95_claim_shrink_release_us": 2013.9449999999997,
+    "p95_reserve_release_us": 1426.8599999999997,
+    "p95_snapshot_us": 63.0
+  }
+}
