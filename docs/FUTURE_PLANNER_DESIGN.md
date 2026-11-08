@@ -5,7 +5,8 @@ SGLang 的准入顺序和 VMM 驻留决策。第一阶段以正确、可离线�
 GPU 结果出来前，不把规划收益写成已证实的性能收益。
 
 当前实现状态：`adaptive_sparse/future_plan.py` 已提供不依赖 SGLang/CUDA 的
-确定性事件模拟，比较 `fifo`、`longest`、`mode-aware` 和 `future` 四种策略；
+确定性事件模拟，比较 `fifo`、`longest`、`mode-aware`、`future` 和有界
+`oracle` 五种策略；
 `adaptive_sparse/sglang_future_hook.py` 已实现默认关闭的 scheduler 排序 hook。
 在带原生 `kv_hints` 的 SGLang revision 上它直接复用上游传输；在 0.5.2 上则
 由 `adaptive_sparse/kv_hints_compat.py` 在 HTTP 请求类、tokenizer 和 scheduler
@@ -187,6 +188,28 @@ decode_time  = expected_output_tokens / decode_tokens_per_s
 初值来自配置，之后只用真实完成样本更新。estimator 必须带置信区间或保守倍率；
 没有样本时宁可使用宽裕估计，也不要声称能精确满足 deadline。
 
+### 4.0 已知未来的有界 oracle
+
+`oracle` 用于离线研究和在线调度器的上界参照。它在每个可决策边界枚举：
+
+- 已到达请求及其可行的 `resident` / `hi-sparse` 驻留模式；
+- 为等待 active 请求释放预算或保护即将到达的硬期限请求而主动 idle；
+- 下一次到达、prefill 完成和 active 完成等事件推进。
+
+目标按字典序比较：期限 miss 数、加权完成时间、makespan、HiSparse 请求数，
+最后按 request ID 和开始时间确定稳定平局。完全相同的请求在资源与期限字段上
+属于对称节点；只展开其中 ID 最小的一个，能够去掉工具批次的阶乘重复，同时
+保持上述确定性平局结果。
+
+搜索受 `oracle_max_expansions` 限制。实现先把现有 `future` 计划作为 incumbent，
+因此达到上限或搜索失败时不会产生比启发式更差的计划；此时输出
+`search_truncated=true`、`search_exact=false`、`fallback_policy="future"`。
+只有搜索完整且产生了搜索 incumbent 时才报告 `search_exact=true`。这套 bounded
+oracle 只验证离线决策质量，不会在 scheduler 热路径运行，也不能绕过
+`PrefillAdder`。请求的 `priority` 是历史 JSON 字段名，表示离线目标中的软业务
+权重；`plan_rollout()` 只把它写成 `FutureHint.weight`，不会赋值给 SGLang 的
+`request.priority`，因此原生硬优先级层级仍由 SGLang 所有。
+
 ### 4.1 受控 rollout 的可执行计划
 
 `plan_rollout()` 把离线策略结果转换成 orchestrator 可执行的动作。每个 action
@@ -196,10 +219,11 @@ hint 使用 `release_after_ms=0`，并把绝对 deadline 换算成相对 schedul
 接收时刻的 `deadline_after_ms`。
 
 ```bash
-python scripts/future_plan_compare.py \
+python3 scripts/future_plan_compare.py \
   benchmarks/workloads/known-future-rollout.json \
-  --emit-policy future \
-  --output results/future-planning/known-future-rollout.json
+  --policies fifo future oracle \
+  --emit-policy oracle \
+  --output results/future-planning/oracle-comparison.json
 ```
 
 `adaptive_sparse/rollout_executor.py` 是这个计划与真实 SGLang HTTP 服务之间的
@@ -281,8 +305,12 @@ orchestrator 的真实提交时刻；runtime hook 中的 `release_after_ms` 仍�
 
 仓库内合成样例只用于回归 harness。该样例中 FIFO、mode-aware、future 分别记录
 3、2、0 个 deadline miss，future 的模拟 makespan 为 1,988 ms，峰值预算为
-4,008,192 bytes。它是固定输入上的策略行为证据，不是模型、GPU 或生产负载上的
-性能结论；真实效果必须用同一模型、权重、请求体和 TP 配置重新测量。
+4,008,192 bytes。默认 100,000 次展开的有界 oracle 在该七请求 trace 上触发上限，
+并按契约保留 future incumbent；这不表示真实服务应在线运行 oracle。构造性小
+样例会在单元测试中证明 oracle 能找到 FIFO 漏掉的期限可行方案，并验证主动
+idle 和两种驻留模式都会被搜索。以上都是固定输入上的策略行为证据，不是模型、
+GPU 或生产负载上的性能结论；真实效果必须用同一模型、权重、请求体和 TP 配置
+重新测量。
 
 ## 5. VMM 驻留计划
 

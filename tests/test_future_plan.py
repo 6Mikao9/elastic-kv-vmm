@@ -9,6 +9,7 @@ from adaptive_sparse.future_plan import (
     PlannerConfig,
     RequestProfile,
     ResidencyMode,
+    compare,
     main,
     plan_rollout,
     simulate,
@@ -56,6 +57,76 @@ class FuturePlanTest(unittest.TestCase):
         self.assertGreater(fifo.deadline_misses, future.deadline_misses)
         self.assertEqual(future.deadline_misses, 0)
         self.assertGreaterEqual(future.weighted_completion_ms, 0)
+
+    def test_oracle_beats_fifo_and_explores_both_residency_modes(self):
+        fifo = simulate(self.workload, self.config, "fifo")
+        oracle = simulate(self.workload, self.config, "oracle")
+
+        self.assertGreater(fifo.deadline_misses, 0)
+        self.assertEqual(oracle.deadline_misses, 0)
+        self.assertLess(
+            (oracle.deadline_misses, oracle.weighted_completion_ms),
+            (fifo.deadline_misses, fifo.weighted_completion_ms),
+        )
+        self.assertEqual(
+            {item.mode for item in oracle.admissions},
+            {ResidencyMode.RESIDENT, ResidencyMode.HI_SPARSE},
+        )
+        self.assertGreater(oracle.search_expansions, 0)
+        self.assertFalse(oracle.search_truncated)
+        self.assertTrue(oracle.search_exact)
+
+    def test_oracle_can_intentionally_idle_to_protect_deadline(self):
+        config = PlannerConfig(
+            memory_budget_bytes=20_000_000,
+            kv_bytes_per_token=1000,
+            prefill_workspace_bytes_per_token=0,
+            sparse_hot_tokens=200,
+            prefill_tokens_per_ms=1,
+            resident_decode_tokens_per_ms=1,
+            sparse_decode_tokens_per_ms=1,
+            max_active_requests=2,
+            lookahead_ms=50,
+        )
+        workload = [
+            RequestProfile(
+                "background",
+                arrival_ms=0,
+                prompt_tokens=80,
+                output_tokens=10,
+            ),
+            RequestProfile(
+                "tool",
+                arrival_ms=10,
+                prompt_tokens=10,
+                output_tokens=100,
+                priority=2,
+                deadline_ms=130,
+            ),
+        ]
+
+        oracle = simulate(workload, config, "oracle")
+
+        self.assertEqual(oracle.deadline_misses, 0)
+        by_id = {item.request_id: item for item in oracle.admissions}
+        self.assertEqual(by_id["tool"].start_ms, 10)
+        self.assertGreaterEqual(by_id["background"].start_ms, 10)
+
+    def test_oracle_expansion_cap_returns_deployable_fallback(self):
+        bounded = PlannerConfig(
+            **{
+                **self.config.as_dict(),
+                "oracle_max_expansions": 1,
+            }
+        )
+        result = simulate(self.workload, bounded, "oracle")
+
+        self.assertEqual(result.policy, "oracle")
+        self.assertTrue(result.search_truncated)
+        self.assertFalse(result.search_exact)
+        self.assertEqual(result.fallback_policy, "future")
+        self.assertEqual(len(result.admissions), len(self.workload))
+        self.assertLessEqual(result.peak_memory_bytes, bounded.memory_budget_bytes)
 
     def test_future_policy_can_idle_to_protect_an_imminent_deadline(self):
         workload = [
@@ -397,7 +468,51 @@ class FuturePlanTest(unittest.TestCase):
             self.config.sparse_hot_tokens,
         )
         with self.assertRaisesRegex(ValueError, "unknown planning policy"):
-            plan_rollout(self.workload, self.config, "oracle")
+            plan_rollout(self.workload, self.config, "missing")
+
+    def test_compare_and_rollout_support_oracle(self):
+        raw = {
+            "config": self.config.as_dict(),
+            "requests": [
+                {
+                    "request_id": item.request_id,
+                    "arrival_ms": item.arrival_ms,
+                    "prompt_tokens": item.prompt_tokens,
+                    "output_tokens": item.output_tokens,
+                    "kind": item.kind,
+                    "priority": item.priority,
+                    "deadline_ms": item.deadline_ms,
+                }
+                for item in self.workload
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            workload = Path(directory) / "workload.json"
+            workload.write_text(json.dumps(raw), encoding="utf-8")
+            comparisons = compare(workload, ("fifo", "oracle"))
+        self.assertEqual(set(comparisons), {"fifo", "oracle"})
+        self.assertEqual(comparisons["oracle"]["policy"], "oracle")
+        oracle_simulation = simulate(self.workload, self.config, "oracle")
+        self.assertEqual(
+            len(
+                plan_rollout(
+                    self.workload,
+                    self.config,
+                    "oracle",
+                    simulation=oracle_simulation,
+                ).submissions
+            ),
+            len(self.workload),
+        )
+
+    def test_planner_priority_is_emitted_only_as_a_soft_hint_weight(self):
+        rollout = plan_rollout(self.workload, self.config, "future")
+        tool = next(
+            item for item in rollout.submissions if item.request_id == "short-0"
+        )
+
+        self.assertEqual(tool.hint["weight"], 2)
+        self.assertNotIn("priority", tool.hint)
 
     def test_cli_can_emit_a_selected_rollout(self):
         raw = {
@@ -435,13 +550,15 @@ class FuturePlanTest(unittest.TestCase):
             workload.write_text(json.dumps(raw), encoding="utf-8")
             self.assertEqual(
                 main([
-                    str(workload), "--emit-policy", "future",
+                    str(workload), "--policies", "fifo",
+                    "--emit-policy", "future",
                     "--output", str(output),
                 ]),
                 0,
             )
             payload = json.loads(output.read_text(encoding="utf-8"))
         self.assertEqual(payload["rollout"]["policy"], "future")
+        self.assertEqual(set(payload) - {"rollout"}, {"fifo", "future"})
         self.assertEqual(
             payload["rollout"]["planner_config"]["kv_bytes_per_token"],
             self.config.kv_bytes_per_token,

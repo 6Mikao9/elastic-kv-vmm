@@ -219,7 +219,7 @@ def main():
     parser.add_argument("--future-workload", type=Path,
                         help="plan and execute a known-future workload")
     parser.add_argument("--future-planning-policy",
-                        choices=("fifo", "longest", "mode-aware", "future"),
+                        choices=("fifo", "longest", "mode-aware", "future", "oracle"),
                         default="future")
     parser.add_argument("--future-no-hints", action="store_true")
     parser.add_argument("--future-start-tolerance-ms", type=float, default=100.0)

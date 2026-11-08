@@ -14,7 +14,7 @@ boundary and must validate the resulting reservation against physical backing.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 import json
 import math
@@ -24,7 +24,7 @@ from typing import Iterable, Sequence
 from .future_residency import RESIDENCE_HINTS
 
 
-POLICIES = ("fifo", "longest", "mode-aware", "future")
+POLICIES = ("fifo", "longest", "mode-aware", "future", "oracle")
 RUNTIME_HINT_MAX_MS = 86_400_000
 
 
@@ -39,6 +39,10 @@ class ResidencyMode(str, Enum):
 class RequestProfile:
     """Known request metadata available in a controlled rollout.
 
+    ``priority`` is the legacy JSON field name for a positive soft business
+    weight used by the offline objective. ``plan_rollout`` emits it only as
+    SGLang's ``FutureHint.weight`` and never assigns ``request.priority``;
+    native SGLang hard-priority tiers therefore remain owned by SGLang.
     ``prefix_group`` and ``shared_prefix_tokens`` describe reusable content.
     The initial planner reports their availability but does not yet deduct
     cross-request shared backing; that requires physical page identity from the
@@ -135,6 +139,7 @@ class PlannerConfig:
     max_active_requests: int = 8
     lookahead_ms: int = 0
     auto_resident_output_threshold: int = 1
+    oracle_max_expansions: int = 100_000
 
     def __post_init__(self) -> None:
         positive_ints = {
@@ -143,6 +148,7 @@ class PlannerConfig:
             "sparse_hot_tokens": self.sparse_hot_tokens,
             "max_active_requests": self.max_active_requests,
             "auto_resident_output_threshold": self.auto_resident_output_threshold,
+            "oracle_max_expansions": self.oracle_max_expansions,
         }
         for name, value in positive_ints.items():
             _bounded_int(value, name, minimum=1)
@@ -180,6 +186,7 @@ class PlannerConfig:
             "max_active_requests": self.max_active_requests,
             "lookahead_ms": self.lookahead_ms,
             "auto_resident_output_threshold": self.auto_resident_output_threshold,
+            "oracle_max_expansions": self.oracle_max_expansions,
         }
 
 
@@ -230,6 +237,19 @@ class PlanResult:
     deadline_misses: int
     sparse_requests: int
     mode_switches: int
+    search_expansions: int = 0
+    search_truncated: bool = False
+    fallback_policy: str | None = None
+
+    @property
+    def search_exact(self) -> bool:
+        """Whether a bounded oracle proved its returned schedule optimal."""
+
+        return (
+            self.policy == "oracle"
+            and not self.search_truncated
+            and self.fallback_policy is None
+        )
 
     @property
     def throughput_requests_per_second(self) -> float:
@@ -245,6 +265,10 @@ class PlanResult:
             "deadline_misses": self.deadline_misses,
             "sparse_requests": self.sparse_requests,
             "mode_switches": self.mode_switches,
+            "search_expansions": self.search_expansions,
+            "search_truncated": self.search_truncated,
+            "search_exact": self.search_exact,
+            "fallback_policy": self.fallback_policy,
             "throughput_requests_per_second": self.throughput_requests_per_second,
             "admissions": [
                 {
@@ -488,7 +512,7 @@ def _defer_for_imminent_work(
             and item.arrival_ms + future_duration <= item.deadline_ms
         )
         # Idle only to protect a hard latency objective.  Merely having a
-        # higher-priority request in the horizon should not leave otherwise
+        # higher-weight request in the horizon should not leave otherwise
         # useful prefill capacity idle: native priority handles that case when
         # the request actually arrives.
         if not (memory_blocked or deadline_blocked):
@@ -612,6 +636,294 @@ def _select(
     return choice, mode, reason
 
 
+@dataclass(frozen=True, slots=True)
+class _OracleState:
+    """One immutable node in the bounded known-future search."""
+
+    now_ms: int
+    prefill_busy_until: int
+    remaining_ids: tuple[str, ...]
+    active: tuple[_Active, ...]
+    admissions: tuple[Admission, ...]
+    peak_memory_bytes: int
+
+
+def _feasible_modes(
+    request: RequestProfile,
+    active: Sequence[_Active],
+    config: PlannerConfig,
+) -> tuple[tuple[ResidencyMode, str], ...]:
+    """Return every policy-compatible placement for an oracle branch."""
+
+    modes: list[tuple[ResidencyMode, str]] = []
+    seen: set[ResidencyMode] = set()
+    for preferred in (ResidencyMode.RESIDENT, ResidencyMode.HI_SPARSE):
+        selected = _feasible_mode(request, active, config, preferred=preferred)
+        if selected is None or selected[0] in seen:
+            continue
+        modes.append(selected)
+        seen.add(selected[0])
+    return tuple(modes)
+
+
+def _normalize_active(
+    active: Sequence[_Active], now_ms: int
+) -> tuple[_Active, ...]:
+    return tuple(item for item in active if item.admission.finish_ms > now_ms)
+
+
+def _oracle_admission_child(
+    state: _OracleState,
+    request: RequestProfile,
+    mode: ResidencyMode,
+    reason: str,
+    config: PlannerConfig,
+) -> _OracleState:
+    active = _normalize_active(state.active, state.now_ms)
+    base = sum(item.admission.resident_kv_bytes for item in active)
+    hold = _hold_bytes(request, mode, config)
+    workspace = request.prompt_tokens * config.prefill_workspace_bytes_per_token
+    prefill = _ceil_duration(request.prompt_tokens, config.prefill_tokens_per_ms)
+    admission = Admission(
+        request_id=request.request_id,
+        arrival_ms=request.arrival_ms,
+        start_ms=state.now_ms,
+        finish_ms=state.now_ms + _duration_ms(request, mode, config),
+        mode=mode,
+        kind=request.kind,
+        resident_kv_bytes=hold,
+        prefill_workspace_bytes=workspace,
+        reason=f"oracle:{reason}",
+    )
+    return _OracleState(
+        now_ms=state.now_ms + prefill,
+        prefill_busy_until=state.now_ms + prefill,
+        remaining_ids=tuple(
+            item for item in state.remaining_ids if item != request.request_id
+        ),
+        active=(*active, _Active(request, admission)),
+        admissions=(*state.admissions, admission),
+        peak_memory_bytes=max(state.peak_memory_bytes, base + hold + workspace),
+    )
+
+
+def _oracle_idle_child(
+    state: _OracleState,
+    requests_by_id: dict[str, RequestProfile],
+) -> _OracleState | None:
+    active = _normalize_active(state.active, state.now_ms)
+    wake_times = [
+        requests_by_id[request_id].arrival_ms
+        for request_id in state.remaining_ids
+        if requests_by_id[request_id].arrival_ms > state.now_ms
+    ]
+    wake_times.extend(
+        item.admission.finish_ms
+        for item in active
+        if item.admission.finish_ms > state.now_ms
+    )
+    if not wake_times:
+        return None
+    return replace(
+        state,
+        now_ms=min(wake_times),
+        active=active,
+    )
+
+
+def _oracle_objective(result: PlanResult) -> tuple[object, ...]:
+    # The order matches the research contract: hard deadlines first, then user
+    # and batch completion, followed by lower-cost sparse placement.  The last
+    # component makes equal-cost plans deterministic across Python versions.
+    signature = tuple(
+        (item.request_id, item.start_ms, item.mode.value)
+        for item in sorted(result.admissions, key=lambda item: item.request_id)
+    )
+    return (
+        result.deadline_misses,
+        result.weighted_completion_ms,
+        result.makespan_ms,
+        result.sparse_requests,
+        signature,
+    )
+
+
+def _oracle_symmetry_key(request: RequestProfile) -> tuple[object, ...]:
+    """Identify requests whose schedules are interchangeable.
+
+    The final objective sorts equal plans by request ID.  Once pending
+    requests have identical resource and timing fields, admitting a later ID
+    before the lexicographically first one can only worsen that tie-break.
+    Collapsing those permutations is exact and prevents factorial blow-up in
+    rollout batches containing repeated tool or evaluation prompts.
+    """
+
+    return (
+        request.arrival_ms,
+        request.prompt_tokens,
+        request.output_tokens,
+        request.kind,
+        request.priority,
+        request.deadline_ms,
+        request.prefix_group,
+        request.shared_prefix_tokens,
+        request.residence_hint,
+    )
+
+
+def _result_from_admissions(
+    policy: str,
+    workload: Sequence[RequestProfile],
+    admissions: Sequence[Admission],
+    peak_memory_bytes: int,
+    *,
+    search_expansions: int = 0,
+    search_truncated: bool = False,
+    fallback_policy: str | None = None,
+) -> PlanResult:
+    admission_by_id = {item.request_id: item for item in admissions}
+    weight = sum(item.priority for item in workload)
+    weighted_completion = sum(
+        item.priority * admission_by_id[item.request_id].finish_ms
+        for item in workload
+    ) / weight
+    misses = sum(
+        item.deadline_ms is not None
+        and admission_by_id[item.request_id].finish_ms > item.deadline_ms
+        for item in workload
+    )
+    ordered = tuple(
+        sorted(admissions, key=lambda item: (item.start_ms, item.request_id))
+    )
+    return PlanResult(
+        policy=policy,
+        admissions=ordered,
+        peak_memory_bytes=peak_memory_bytes,
+        peak_backed_bytes=peak_memory_bytes,
+        makespan_ms=max(item.finish_ms for item in admissions),
+        weighted_completion_ms=weighted_completion,
+        deadline_misses=misses,
+        sparse_requests=sum(
+            item.mode is ResidencyMode.HI_SPARSE for item in admissions
+        ),
+        mode_switches=0,
+        search_expansions=search_expansions,
+        search_truncated=search_truncated,
+        fallback_policy=fallback_policy,
+    )
+
+
+def _simulate_oracle(
+    workload: Sequence[RequestProfile],
+    config: PlannerConfig,
+) -> PlanResult:
+    """Search known-future schedules under a deterministic expansion cap.
+
+    Every node may admit any currently eligible request in either feasible
+    residency mode or deliberately advance to the next arrival/completion.  A
+    cap makes this usable as a research oracle and guarantees a deployable
+    heuristic fallback for traces that are too large to enumerate.
+    """
+
+    requests_by_id = {item.request_id: item for item in workload}
+    initial = _OracleState(
+        now_ms=min(item.arrival_ms for item in workload),
+        prefill_busy_until=-1,
+        remaining_ids=tuple(item.request_id for item in workload),
+        active=(),
+        admissions=(),
+        peak_memory_bytes=0,
+    )
+    stack = [initial]
+    best = replace(
+        _simulate_greedy(workload, config, "future"),
+        policy="oracle",
+        fallback_policy="future",
+    )
+    best_from_search = False
+    expansions = 0
+    truncated = False
+
+    while stack:
+        if expansions >= config.oracle_max_expansions:
+            truncated = True
+            break
+        state = stack.pop()
+        expansions += 1
+        active = _normalize_active(state.active, state.now_ms)
+        state = replace(state, active=active)
+
+        if not state.remaining_ids:
+            result = _result_from_admissions(
+                "oracle",
+                workload,
+                state.admissions,
+                state.peak_memory_bytes,
+            )
+            if _oracle_objective(result) < _oracle_objective(best):
+                best = result
+                best_from_search = True
+            continue
+
+        if state.prefill_busy_until > state.now_ms:
+            wake_times = [state.prefill_busy_until]
+            wake_times.extend(
+                requests_by_id[request_id].arrival_ms
+                for request_id in state.remaining_ids
+                if requests_by_id[request_id].arrival_ms > state.now_ms
+            )
+            wake_times.extend(
+                item.admission.finish_ms
+                for item in active
+                if item.admission.finish_ms > state.now_ms
+            )
+            stack.append(replace(state, now_ms=min(wake_times)))
+            continue
+
+        pending = sorted(
+            (
+                requests_by_id[request_id]
+                for request_id in state.remaining_ids
+                if requests_by_id[request_id].arrival_ms <= state.now_ms
+            ),
+            key=lambda item: (item.arrival_ms, item.request_id),
+        )
+        children: list[_OracleState] = []
+        seen_symmetry: set[tuple[object, ...]] = set()
+        for request in pending:
+            symmetry = _oracle_symmetry_key(request)
+            if symmetry in seen_symmetry:
+                continue
+            seen_symmetry.add(symmetry)
+            for mode, reason in _feasible_modes(request, active, config):
+                children.append(
+                    _oracle_admission_child(state, request, mode, reason, config)
+                )
+
+        # Explore useful work before spending the expansion budget on an idle
+        # branch.  Exhaustive runs still compare both, while truncated runs
+        # retain a concrete admission policy.
+        children.sort(
+            key=lambda item: (
+                -item.admissions[-1].resident_kv_bytes,
+                item.admissions[-1].request_id,
+                item.admissions[-1].mode.value,
+            )
+        )
+        idle = _oracle_idle_child(state, requests_by_id)
+        if idle is not None:
+            stack.append(idle)
+        stack.extend(reversed(children))
+
+    return replace(
+        best,
+        policy="oracle",
+        search_expansions=expansions,
+        search_truncated=truncated,
+        fallback_policy=None if best_from_search else "future",
+    )
+
+
 def simulate(
     requests: Iterable[RequestProfile],
     config: PlannerConfig,
@@ -625,18 +937,42 @@ def simulate(
     policy harness, not measured SGLang timing.
     """
 
-    if policy not in POLICIES:
-        raise ValueError(f"unknown planning policy: {policy!r}")
     workload = tuple(requests)
+    _validate_workload(workload, config, policy)
     if not workload:
         return PlanResult(policy, (), 0, 0, 0, 0.0, 0, 0, 0)
+    if policy == "oracle":
+        return _simulate_oracle(workload, config)
+    return _simulate_greedy(workload, config, policy)
+
+
+def _validate_workload(
+    workload: Sequence[RequestProfile],
+    config: PlannerConfig,
+    policy: str,
+) -> None:
+    if policy not in POLICIES:
+        raise ValueError(f"unknown planning policy: {policy!r}")
     ids = [item.request_id for item in workload]
     if len(set(ids)) != len(ids):
         raise ValueError("request IDs must be unique")
     for item in workload:
         sparse = _feasible_mode(item, (), config, preferred=ResidencyMode.HI_SPARSE)
         if sparse is None:
-            raise ValueError(f"{item.request_id}: no residency mode fits the configured budget")
+            raise ValueError(
+                f"{item.request_id}: no residency mode fits the configured budget"
+            )
+
+
+def _simulate_greedy(
+    workload: tuple[RequestProfile, ...],
+    config: PlannerConfig,
+    policy: str,
+) -> PlanResult:
+    """Run the existing deterministic event simulation for online policies."""
+
+    if policy not in ("fifo", "longest", "mode-aware", "future"):
+        raise ValueError(f"unknown greedy planning policy: {policy!r}")
 
     unstarted = {item.request_id: item for item in workload}
     active: list[_Active] = []
@@ -699,25 +1035,11 @@ def simulate(
 
     if len(admissions) != len(workload):
         raise RuntimeError("planner did not admit every request")
-    admission_by_id = {item.request_id: item for item in admissions}
-    finish_by_id = {item.request_id: item.finish_ms for item in admissions}
-    weight = sum(item.priority for item in workload)
-    weighted_completion = sum(item.priority * finish_by_id[item.request_id] for item in workload) / weight
-    misses = sum(
-        item.deadline_ms is not None and admission_by_id[item.request_id].finish_ms > item.deadline_ms
-        for item in workload
-    )
-    ordered = tuple(sorted(admissions, key=lambda item: (item.start_ms, item.request_id)))
-    return PlanResult(
-        policy=policy,
-        admissions=ordered,
-        peak_memory_bytes=peak,
-        peak_backed_bytes=peak,
-        makespan_ms=max(item.finish_ms for item in admissions),
-        weighted_completion_ms=weighted_completion,
-        deadline_misses=misses,
-        sparse_requests=sum(item.mode is ResidencyMode.HI_SPARSE for item in admissions),
-        mode_switches=0,
+    return _result_from_admissions(
+        policy,
+        workload,
+        admissions,
+        peak,
     )
 
 
@@ -725,6 +1047,8 @@ def plan_rollout(
     requests: Iterable[RequestProfile],
     config: PlannerConfig,
     policy: str = "future",
+    *,
+    simulation: PlanResult | None = None,
 ) -> RolloutPlan:
     """Convert a simulated policy into delayed submissions and runtime hints.
 
@@ -738,7 +1062,16 @@ def plan_rollout(
     workload = tuple(requests)
     if policy not in POLICIES:
         raise ValueError(f"unknown planning policy: {policy!r}")
-    simulation = simulate(workload, config, policy)
+    if simulation is None:
+        simulation = simulate(workload, config, policy)
+    elif simulation.policy != policy:
+        raise ValueError(
+            f"simulation policy {simulation.policy!r} does not match {policy!r}"
+        )
+    workload_ids = {item.request_id for item in workload}
+    admission_ids = {item.request_id for item in simulation.admissions}
+    if workload_ids != admission_ids or len(workload_ids) != len(simulation.admissions):
+        raise ValueError("simulation requests do not match the rollout workload")
     requests_by_id = {item.request_id: item for item in workload}
     submissions = []
     for admission in simulation.admissions:
@@ -774,13 +1107,38 @@ def plan_rollout(
     return RolloutPlan(simulation, tuple(submissions), config)
 
 
-def compare(request_path: str | Path) -> dict[str, dict[str, object]]:
-    """Load ``{config, requests}`` JSON and simulate every built-in policy."""
-
+def _load_workload(
+    request_path: str | Path,
+) -> tuple[PlannerConfig, tuple[RequestProfile, ...]]:
     payload = json.loads(Path(request_path).read_text(encoding="utf-8"))
     config = PlannerConfig(**payload["config"])
-    workload = [RequestProfile(**item) for item in payload["requests"]]
-    return {policy: simulate(workload, config, policy).as_dict() for policy in POLICIES}
+    workload = tuple(RequestProfile(**item) for item in payload["requests"])
+    return config, workload
+
+
+def _compare_workload(
+    config: PlannerConfig,
+    workload: Sequence[RequestProfile],
+    policies: Sequence[str],
+) -> dict[str, PlanResult]:
+    requested = tuple(dict.fromkeys(policies))
+    unknown = tuple(policy for policy in requested if policy not in POLICIES)
+    if unknown:
+        raise ValueError(f"unknown planning policy: {unknown[0]!r}")
+    return {policy: simulate(workload, config, policy) for policy in requested}
+
+
+def compare(
+    request_path: str | Path,
+    policies: Sequence[str] = POLICIES,
+) -> dict[str, dict[str, object]]:
+    """Load ``{config, requests}`` JSON and simulate selected policies."""
+
+    config, workload = _load_workload(request_path)
+    return {
+        policy: result.as_dict()
+        for policy, result in _compare_workload(config, workload, policies).items()
+    }
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -790,15 +1148,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("workload", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--emit-policy", choices=POLICIES)
+    parser.add_argument(
+        "--policies",
+        nargs="+",
+        choices=POLICIES,
+        help="simulate only these policies (default: all built-in policies)",
+    )
     args = parser.parse_args(argv)
 
-    payload: dict[str, object] = compare(args.workload)
+    config, workload = _load_workload(args.workload)
+    policies = tuple(args.policies or POLICIES)
+    if args.emit_policy is not None and args.emit_policy not in policies:
+        policies = (*policies, args.emit_policy)
+    simulations = _compare_workload(config, workload, policies)
+    payload: dict[str, object] = {
+        policy: simulation.as_dict()
+        for policy, simulation in simulations.items()
+    }
     if args.emit_policy is not None:
-        raw = json.loads(args.workload.read_text(encoding="utf-8"))
-        config = PlannerConfig(**raw["config"])
-        workload = [RequestProfile(**item) for item in raw["requests"]]
         payload["rollout"] = plan_rollout(
-            workload, config, args.emit_policy
+            workload,
+            config,
+            args.emit_policy,
+            simulation=simulations[args.emit_policy],
         ).as_dict()
     rendered = json.dumps(payload, indent=2, sort_keys=True)
     if args.output is None:
