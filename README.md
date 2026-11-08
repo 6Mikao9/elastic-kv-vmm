@@ -101,6 +101,8 @@ bash scripts/container_case.sh 0 "$MODEL_HUB" "$MODEL_REL" \
 
 Use a fresh output directory for every run. Substitute `baseline` or `v0`–`v4` for ablations. Set `EKV_EXECUTION=graph-pad` for capture batches 1, 2, 4, 8 (including additional 3/5/3-request padding probes), or `graph` for exact batches 1–8. `EKV_RETAIN_CHUNKS=8` selects the warm retention policy. The opt-in `EKV_PRECOMMIT_CHUNKS=1` maps the next logical chunk across every KV plane and starts its required zeroing on an independent CUDA stream; `EKV_PRECOMMIT_MAX_CHUNKS` caps the speculative chunks kept across a mixed workload. These are environment variables on the container script. The Qwen3-4B snapshot revision is recorded in `environment.json`. Never copy weights into this repository.
 
+V5 can also consume the bounded future-prefill plan for predictive physical prewarming. `EKV_PREDICTIVE_PREWARM_MODE=dry_run|enforce`, `EKV_PREDICTIVE_PREWARM_TTL_MS`, and `EKV_PREDICTIVE_PREWARM_MAX_CHUNKS` bound speculative `cuMemCreate`/zeroing for slots that SGLang still reports as free. The plan never claims a logical token or queue position, native `PrefillAdder` remains authoritative, and an idle lease is reclaimed when its TTL expires. Default is `off`; the telemetry separates candidate, mapped, consumed-hit and expired chunks.
+
 Set `EKV_ADMISSION_POLICY=physical` (or use the corresponding launcher option)
 with V5 to bound SGLang's allocator `available_size()` by current device free
 memory, the configured prefill headroom and the exact cost of committing a new

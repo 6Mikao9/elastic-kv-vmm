@@ -588,6 +588,27 @@ deferred/missing/invalid/unestimated/capped/TP-fallback 计数。当前只有 CP
 `enforce` 三组，并同时观察 TTFT、TPOT、吞吐、OOM/retraction、迁移字节和整卡
 NVML。
 
+上层 headroom reservation 之外，V5 还提供一个独立的物理预热开关。它只在
+`EKV_PREDICTIVE_PREWARM_MODE=dry_run|enforce` 时运行，从聚合计划的
+`kv_bytes` 推导一个受 `EKV_PREDICTIVE_PREWARM_MAX_CHUNKS` 限制的候选 chunk
+前缀，并只选择 SGLang 当前仍报告为 free 的逻辑槽。`dry_run` 记录候选而不映射；
+`enforce` 调用现有异步 `precommit` 路径，完成 `cuMemCreate`、`cuMemMap` 和清零
+启动，真实 admission 仍需在第一次 `ensure` 上等待清零完成。预热不会 claim
+逻辑槽、不会改变 waiting queue，也不会绕过原生 `PrefillAdder`。
+
+每条新 lease 使用固定 `EKV_PREDICTIVE_PREWARM_TTL_MS`，重复 planning 不会延长
+已有 lease。真实 `admit`/`admit_ranges` 消费命中 chunk 时记录 hit；TTL 到期且
+引用数仍为零时，在单个 CUDA synchronize 后回收。池暂时 drain 时也会保留这些
+有界 prewarm lease，直到真实分配或 TTL 到期。telemetry 包含 candidate、mapped、
+dry-run、hit、expired、active chunk 数及对应 hit/expired bytes。该机制默认
+关闭；开启后可能占用 global broker 的物理容量，因此真实系统必须用
+`dry_run`、短 TTL 和独占 GPU 对照验证净收益，不能用候选字节代替命中收益。
+
+可用 `scripts/container_predictive_smoke.sh GPU OUTPUT_DIRECTORY` 在单张独占卡上
+运行模型无关的 CUDA VMM 冒烟：检查预热前后 free-slot/live-token 不变、命中后地址
+可读写、释放与 TTL 回收后 backing 回到 sink chunk，并输出原生 CUDA API 与控制器
+计数器。该脚本不提供 serving 延迟或吞吐结论。
+
 ### 5.4 请求准入的最短期未来预留
 
 滚动执行器现在会在决定一个请求能否占用完整 KV 前，查看同一已知 plan 中有限

@@ -64,6 +64,12 @@ NVML 中本身为 `Unknown Error`。因此没有生成 serving 延迟或显存�
 启动失败记成算法收益。机器可读的三卡尝试、原始日志哈希和服务错误摘录保存在
 [`results/future-smoke/5090-gpu-blocker`](../results/future-smoke/5090-gpu-blocker/)。
 
+随后新增的模型无关预测预热冒烟
+（`scripts/container_predictive_smoke.sh`）也在同一台 5090 GPU0 上复现了
+`CUDA unknown error`。Linux/SGLang 容器中的全套 CPU 测试为 400 passed、
+2 skipped，因此该轮只完成了 CPU 部分的验证，
+没有把未执行的 CUDA 映射生命周期记成通过。
+
 恢复 GPU runtime 后，先复跑 baseline，再以相同模型和输出目录版本运行 VMM：
 
 ```bash

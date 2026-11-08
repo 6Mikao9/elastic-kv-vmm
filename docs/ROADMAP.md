@@ -98,6 +98,15 @@ allocates for future requests and SGLang's `PrefillAdder` remains authoritative.
 The activation coefficient defaults to zero until calibrated because no
 source-level estimate has yet been validated on the target MiniMax workload.
 
+V5 can now turn that same bounded plan into optional physical prewarming. It
+selects only chunks backing currently free logical slots, starts the existing
+asynchronous VMM mapping/zeroing path, and records TTL hit and expiry outcomes.
+The default is off; `dry_run` observes candidate chunks and `enforce` maps them.
+Because speculative mappings consume physical and global-broker capacity, they
+remain bounded by TTL and a chunk cap, never claim logical slots, and leave the
+native `PrefillAdder` authoritative. Real paired GPU runs are still required to
+establish whether avoided mapping latency exceeds the false-prewarm cost.
+
 Controlled-rollout planning now emits an executable submission schedule from
 the offline policy.  Each request carries its planned arrival, type, expected
 output length, relative deadline and selected resident/host-backed mode, so a

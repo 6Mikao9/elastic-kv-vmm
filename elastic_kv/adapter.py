@@ -7,6 +7,7 @@ attention, dense MHA, no overlap/radix/speculation/PD.
 """
 import json
 import logging
+import math
 import os
 import time
 from pathlib import Path
@@ -14,8 +15,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .backing import Backing
 from . import activation
+from .backing import Backing
 from .slots import FreeSlots
 
 MODE = os.environ.get("EKV_MODE", "baseline")
@@ -25,6 +26,7 @@ ALLOW_OVERLAP_SCHEDULE = os.environ.get(
 OVERLAP_SCHEDULE_ACTIVE = False
 VALID_MODES = ("baseline", "v0", "v1", "v2", "v3", "v4", "v5")
 HOST_FREE_MODES = ("v2", "v3", "v4")
+PREDICTIVE_PREWARM_MODES = ("off", "dry_run", "enforce")
 CONTROLLERS = []
 _installed = False
 
@@ -137,6 +139,36 @@ class Residency:
         )
         if not 0 <= self.precommit_limit <= 16:
             raise ValueError("EKV_PRECOMMIT_MAX_CHUNKS must be in [0, 16]")
+        self.predictive_prewarm_mode = os.environ.get(
+            "EKV_PREDICTIVE_PREWARM_MODE", "off"
+        ).strip().lower()
+        if self.predictive_prewarm_mode not in PREDICTIVE_PREWARM_MODES:
+            raise ValueError(
+                "EKV_PREDICTIVE_PREWARM_MODE must be off, dry_run or enforce"
+            )
+        if self.predictive_prewarm_mode != "off" and MODE != "v5":
+            raise ValueError("predictive prewarm requires EKV_MODE=v5")
+        self.predictive_prewarm_ttl_ms = int(os.environ.get(
+            "EKV_PREDICTIVE_PREWARM_TTL_MS", "2000"
+        ))
+        self.predictive_prewarm_max_chunks = int(os.environ.get(
+            "EKV_PREDICTIVE_PREWARM_MAX_CHUNKS", "8"
+        ))
+        if self.predictive_prewarm_ttl_ms < 0:
+            raise ValueError(
+                "EKV_PREDICTIVE_PREWARM_TTL_MS must be nonnegative"
+            )
+        if not 0 <= self.predictive_prewarm_max_chunks <= 64:
+            raise ValueError(
+                "EKV_PREDICTIVE_PREWARM_MAX_CHUNKS must be in [0, 64]"
+            )
+        if self.predictive_prewarm_mode != "off" and (
+            self.predictive_prewarm_ttl_ms < 1
+            or self.predictive_prewarm_max_chunks < 1
+        ):
+            raise ValueError(
+                "predictive prewarm requires positive TTL and max chunks"
+            )
         self.admission_policy = os.environ.get(
             "EKV_ADMISSION_POLICY", "logical"
         )
@@ -150,12 +182,29 @@ class Residency:
         if self.prefill_headroom_bytes < 0:
             raise ValueError("EKV_PREFILL_HEADROOM_MIB must be nonnegative")
         self.precommitted = set()
+        self._predictive_precommitted = set()
+        self._predictive_prewarm_deadlines = {}
         self.live = np.zeros(pool.size + pool.page_size, dtype=np.bool_)
         self.live[0] = True
         self.counts = np.zeros((len(self.live) * slot_bytes + self.chunk_bytes - 1)
                                // self.chunk_bytes, dtype=np.int64)
         self.counts[0] = 1  # permanent dummy/sink slot
-        self.counters = dict(alloc_calls=0, free_calls=0, index_d2h_ns=0, hook_ns=0)
+        self.counters = dict(
+            alloc_calls=0,
+            free_calls=0,
+            index_d2h_ns=0,
+            hook_ns=0,
+            predictive_prewarm_ticks=0,
+            predictive_prewarm_demand_bytes=0,
+            predictive_prewarm_candidate_chunks=0,
+            predictive_prewarm_mapped_chunks=0,
+            predictive_prewarm_dry_run_chunks=0,
+            predictive_prewarm_hit_chunks=0,
+            predictive_prewarm_hit_bytes=0,
+            predictive_prewarm_expired_chunks=0,
+            predictive_prewarm_expired_bytes=0,
+            predictive_prewarm_active_chunks=0,
+        )
         self.counters["overlap_schedule_enabled"] = int(
             OVERLAP_SCHEDULE_ACTIVE
         )
@@ -176,6 +225,170 @@ class Residency:
         if self.slot_bytes > self.chunk_bytes:
             raise ValueError("slot exceeds VMM chunk size")
         return np.concatenate((first, last[last != first]))
+
+    def _predictive_prewarm_chunk_bytes(self):
+        return self.chunk_bytes * sum(
+            getattr(arena, "planes", 1) for arena in self.arenas
+        )
+
+    def _record_predictive_prewarm_hits(self, consumed):
+        predictive = getattr(self, "_predictive_precommitted", set())
+        hits = set(consumed) & predictive
+        if not hits:
+            return
+        predictive.difference_update(hits)
+        for chunk in hits:
+            self._predictive_prewarm_deadlines.pop(chunk, None)
+        self.counters["predictive_prewarm_hit_chunks"] += len(hits)
+        self.counters["predictive_prewarm_hit_bytes"] += (
+            len(hits) * self._predictive_prewarm_chunk_bytes()
+        )
+        self.counters["predictive_prewarm_active_chunks"] = len(
+            predictive
+        )
+
+    def expire_predictive_prewarm(self, *, now_s=None):
+        """Reclaim idle predictive mappings whose bounded TTL has elapsed."""
+
+        predictive = getattr(self, "_predictive_precommitted", set())
+        if (
+            getattr(self, "predictive_prewarm_mode", "off") != "enforce"
+            or not predictive
+        ):
+            return 0
+        now = time.monotonic() if now_s is None else float(now_s)
+        expired = {
+            chunk
+            for chunk in predictive
+            if self._predictive_prewarm_deadlines.get(chunk, now + 1) <= now
+            and self.counts[chunk] == 0
+        }
+        if not expired:
+            return 0
+        start = time.perf_counter_ns()
+        torch.cuda.synchronize(self.pool.device)
+        for arena in self.arenas:
+            indices = expired & arena.allocated_chunks
+            if indices:
+                arena.reclaim(indices, synchronize=False)
+        self.precommitted.difference_update(expired)
+        predictive.difference_update(expired)
+        for chunk in expired:
+            self._predictive_prewarm_deadlines.pop(chunk, None)
+        self.counters.setdefault("predictive_prewarm_expire_ns", 0)
+        self.counters["predictive_prewarm_expire_ns"] += (
+            time.perf_counter_ns() - start
+        )
+        self.counters["predictive_prewarm_expired_chunks"] += len(expired)
+        self.counters["predictive_prewarm_expired_bytes"] += (
+            len(expired) * self._predictive_prewarm_chunk_bytes()
+        )
+        self.counters["predictive_prewarm_active_chunks"] = len(
+            predictive
+        )
+        self.backed = sum(arena.backed_bytes for arena in self.arenas)
+        self.publish(force=True)
+        return len(expired)
+
+    def predictive_prewarm(self, demand_bytes, *, now_s=None):
+        """Pre-map a bounded prefix of currently free slots for future prefill.
+
+        This method only changes physical backing for slots that SGLang already
+        exposes as free. It never claims a logical slot, changes queue order, or
+        acts as a replacement for ``PrefillAdder``. New leases use a fixed TTL;
+        repeated plans never extend an existing lease.
+        """
+
+        if (
+            isinstance(demand_bytes, bool)
+            or not isinstance(demand_bytes, int)
+            or demand_bytes < 0
+        ):
+            raise ValueError("predictive prewarm demand must be nonnegative")
+        demand = demand_bytes
+        now = time.monotonic() if now_s is None else float(now_s)
+        if not math.isfinite(now):
+            raise ValueError("predictive prewarm time must be finite")
+        self.counters["predictive_prewarm_ticks"] += 1
+        self.counters["predictive_prewarm_demand_bytes"] = demand
+        if self.predictive_prewarm_mode == "off" or demand == 0:
+            return 0
+        if self.predictive_prewarm_mode == "enforce":
+            self.expire_predictive_prewarm(now_s=now)
+
+        # The cap is a global outstanding-lease budget. Repeated plans must not
+        # walk past existing speculative mappings and accumulate another full
+        # per-call allowance on every scheduler tick.
+        candidate_capacity = (
+            self.predictive_prewarm_max_chunks
+            - len(self._predictive_precommitted)
+        )
+        if candidate_capacity <= 0:
+            self.counters["predictive_prewarm_candidate_chunks"] = 0
+            self.counters["predictive_prewarm_active_chunks"] = len(
+                self._predictive_precommitted
+            )
+            return 0
+
+        max_bytes = candidate_capacity * self.chunk_bytes
+        target_bytes = min(demand, max_bytes)
+        target_slots = min(
+            self.free_slots.count,
+            max(1, (target_bytes + self.slot_bytes - 1) // self.slot_bytes),
+        )
+        ranges = self.free_slots.peek(target_slots)
+        if not ranges:
+            return 0
+        arena_chunks = [set(arena.allocated_chunks) for arena in self.arenas]
+        fully_allocated = (
+            set.intersection(*arena_chunks) if arena_chunks else set()
+        )
+        candidates = []
+        seen = set()
+        for start, stop in ranges:
+            for slot in range(start, stop):
+                for chunk in self.chunks_for(np.asarray([slot], dtype=np.int64)):
+                    chunk = int(chunk)
+                    if (
+                        chunk < 1
+                        or chunk in seen
+                        or self.counts[chunk] != 0
+                        or chunk in self.precommitted
+                        or chunk in fully_allocated
+                    ):
+                        continue
+                    seen.add(chunk)
+                    candidates.append(chunk)
+                    if len(candidates) >= candidate_capacity:
+                        break
+                if len(candidates) >= candidate_capacity:
+                    break
+            if len(candidates) >= candidate_capacity:
+                break
+        self.counters["predictive_prewarm_candidate_chunks"] = len(candidates)
+        if not candidates:
+            return 0
+        if self.predictive_prewarm_mode == "dry_run":
+            self.counters["predictive_prewarm_dry_run_chunks"] += len(candidates)
+            self.publish()
+            return len(candidates)
+
+        for arena in self.arenas:
+            missing = set(candidates) - arena.allocated_chunks
+            if missing:
+                arena.precommit(missing)
+        self.precommitted.update(candidates)
+        self._predictive_precommitted.update(candidates)
+        deadline = now + self.predictive_prewarm_ttl_ms / 1000.0
+        for chunk in candidates:
+            self._predictive_prewarm_deadlines[chunk] = deadline
+        self.counters["predictive_prewarm_mapped_chunks"] += len(candidates)
+        self.counters["predictive_prewarm_active_chunks"] = len(
+            self._predictive_precommitted
+        )
+        self.backed = sum(arena.backed_bytes for arena in self.arenas)
+        self.publish()
+        return len(candidates)
 
     def physical_available_tokens(self, logical_free_tokens, free_ranges):
         """Bound scheduler admission by the bytes VMM can actually commit.
@@ -342,6 +555,7 @@ class Residency:
     def admit(self, ids):
         if len(ids) == 0:
             return
+        self.expire_predictive_prewarm()
         if np.any(self.live[ids]) or np.any(ids < 1) or np.any(ids > self.pool.size):
             raise RuntimeError("invalid or already-live token slot")
         chunks = self.chunks_for(ids)
@@ -352,6 +566,7 @@ class Residency:
             needed = sorted({j for c in needed for j in (c // 2 * 2, c // 2 * 2 + 1) if j < limit})
         for arena in self.arenas:
             arena.ensure(needed)
+        self._record_predictive_prewarm_hits(needed)
         np.add.at(self.counts, chunks, 1)
         self.live[ids] = True
         self.counters["alloc_calls"] += 1
@@ -371,11 +586,13 @@ class Residency:
             first = start * self.slot_bytes // self.chunk_bytes
             last = (stop * self.slot_bytes - 1) // self.chunk_bytes
             needed.update(range(first, last + 1))
+        self.expire_predictive_prewarm()
         activation.before_admit(self, ranges)
         for arena in self.arenas:
             if not needed.issubset(arena.mapped_chunks):
                 arena.ensure(needed)
                 self.backed = sum(a.backed_bytes for a in self.arenas)
+        self._record_predictive_prewarm_hits(needed)
         self.precommitted.difference_update(needed)
         self._precommit_after(ranges)
         for start, stop in ranges:
@@ -422,8 +639,18 @@ class Residency:
     def reclaim_idle(self):
         if self.live_count:
             return
-        candidates = [(arena, {i for i in arena.allocated_chunks if i >= self.retain_chunks})
-                      for arena in self.arenas]
+        keep_prewarm = set(getattr(self, "_predictive_precommitted", set()))
+        candidates = [
+            (
+                arena,
+                {
+                    i
+                    for i in arena.allocated_chunks
+                    if i >= self.retain_chunks and i not in keep_prewarm
+                },
+            )
+            for arena in self.arenas
+        ]
         if any(indices for _, indices in candidates):
             start = time.perf_counter_ns()
             torch.cuda.synchronize()
@@ -432,7 +659,8 @@ class Residency:
             for arena, indices in candidates:
                 arena.reclaim(indices, synchronize=False)
             self.backed = sum(arena.backed_bytes for arena in self.arenas)
-            self.precommitted.clear()
+            reclaimed = set().union(*(indices for _, indices in candidates))
+            self.precommitted.difference_update(reclaimed)
 
     def release(self, ids):
         if len(ids) == 0:
@@ -449,6 +677,9 @@ class Residency:
         if MODE not in HOST_FREE_MODES or not self.live[1:].any():
             keep = {0, 1} if MODE == "v2" else {0}
             dead = {int(i) for i in np.flatnonzero(self.counts == 0)} - keep
+            dead.difference_update(
+                getattr(self, "_predictive_precommitted", set())
+            )
             candidates = [(arena, dead & arena.mapped_chunks) for arena in self.arenas]
             if any(indices for _, indices in candidates):
                 start = time.perf_counter_ns()
@@ -479,6 +710,9 @@ class Residency:
                   "precommit_lookahead": self.precommit_lookahead,
                   "precommit_limit": self.precommit_limit,
                   "precommitted_chunks": len(self.precommitted),
+                  "predictive_prewarm_mode": self.predictive_prewarm_mode,
+                  "predictive_prewarm_ttl_ms": self.predictive_prewarm_ttl_ms,
+                  "predictive_prewarm_limit_chunks": self.predictive_prewarm_max_chunks,
                   "backed_bytes": backed, "peak_backed_bytes": self.peak,
                   "live_tokens": self.live_count if MODE == "v5" else int(np.count_nonzero(self.live)) - 1}
         target = Path(self.stats_path)
@@ -505,8 +739,10 @@ def install():
     configurator_module = None
     if modern:
         try:
+            from sglang.srt.mem_cache import (
+                kv_cache_configurator as configurator_module,
+            )
             from sglang.srt.mem_cache import memory_pool
-            from sglang.srt.mem_cache import kv_cache_configurator as configurator_module
             from sglang.srt.mem_cache.allocator import token as token_allocator_module
         except ImportError as exc:
             raise RuntimeError(

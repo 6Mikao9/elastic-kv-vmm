@@ -1,6 +1,7 @@
 """Slot ownership tests that do not need a CUDA device."""
 
 import os
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -9,7 +10,6 @@ import numpy as np
 import torch
 
 from elastic_kv import adapter
-
 
 CHUNK = 2 << 20
 SLOT = 3 * CHUNK // 4
@@ -60,7 +60,13 @@ class ResidencyTest(unittest.TestCase):
         self.synchronize = synchronization.start()
         self.addCleanup(synchronization.stop)
         pool = SimpleNamespace(
-            size=8192, page_size=1, head_num=1, head_dim=1, dtype=torch.float16, layer_num=1
+            size=8192,
+            page_size=1,
+            head_num=1,
+            head_dim=1,
+            dtype=torch.float16,
+            layer_num=1,
+            device="cuda:0",
         )
         self.arenas = [FakeArena(), FakeArena()]
         self.ctrl = adapter.Residency(pool, self.arenas, SLOT, "test")
@@ -130,6 +136,177 @@ class ResidencyTest(unittest.TestCase):
                 ):
                     with self.assertRaisesRegex(ValueError, "EKV_PRECOMMIT_CHUNKS"):
                         adapter.Residency(self.ctrl.pool, self.arenas, SLOT, "test")
+
+    def test_predictive_prewarm_requires_bounded_v5_configuration(self):
+        with (
+            patch.object(adapter, "MODE", "v1"),
+            patch.dict(os.environ, {"EKV_PREDICTIVE_PREWARM_MODE": "enforce"}),
+        ):
+            with self.assertRaisesRegex(ValueError, "requires EKV_MODE=v5"):
+                adapter.Residency(self.ctrl.pool, self.arenas, SLOT, "test")
+        for values in (
+            {"EKV_PREDICTIVE_PREWARM_MODE": "invalid"},
+            {
+                "EKV_PREDICTIVE_PREWARM_MODE": "off",
+                "EKV_PREDICTIVE_PREWARM_TTL_MS": "-1",
+            },
+            {
+                "EKV_PREDICTIVE_PREWARM_MODE": "dry_run",
+                "EKV_PREDICTIVE_PREWARM_TTL_MS": "0",
+            },
+            {
+                "EKV_PREDICTIVE_PREWARM_MODE": "enforce",
+                "EKV_PREDICTIVE_PREWARM_MAX_CHUNKS": "0",
+            },
+        ):
+            with self.subTest(values=values):
+                with (
+                    patch.object(adapter, "MODE", "v5"),
+                    patch.dict(os.environ, values),
+                ):
+                    with self.assertRaises(ValueError):
+                        adapter.Residency(self.ctrl.pool, self.arenas, SLOT, "test")
+
+    def test_predictive_prewarm_rejects_invalid_demand_and_time(self):
+        for demand in (-1, True, 1.5):
+            with self.subTest(demand=demand):
+                with self.assertRaisesRegex(ValueError, "demand"):
+                    self.ctrl.predictive_prewarm(demand)
+        with self.assertRaisesRegex(ValueError, "time"):
+            self.ctrl.predictive_prewarm(1, now_s=float("nan"))
+
+    def test_predictive_prewarm_dry_run_does_not_claim_or_map_slots(self):
+        with (
+            patch.object(adapter, "MODE", "v5"),
+            patch.dict(
+                os.environ,
+                {
+                    "EKV_PREDICTIVE_PREWARM_MODE": "dry_run",
+                    "EKV_PREDICTIVE_PREWARM_MAX_CHUNKS": "2",
+                },
+            ),
+        ):
+            self.ctrl = adapter.Residency(
+                self.ctrl.pool, self.arenas, SLOT, "test"
+            )
+        self.ctrl.free_slots = adapter.FreeSlots(self.ctrl.pool.size)
+        free_before = self.ctrl.free_slots.count
+
+        selected = self.ctrl.predictive_prewarm(
+            SLOT * 4, now_s=time.monotonic()
+        )
+
+        self.assertGreater(selected, 0)
+        self.assertEqual(self.ctrl.precommitted, set())
+        self.assertEqual(self.ctrl.free_slots.count, free_before)
+        self.assertEqual(self.ctrl.live_count, 0)
+        self.assert_mapping({0})
+        self.assertEqual(
+            self.ctrl.counters["predictive_prewarm_dry_run_chunks"], selected
+        )
+
+    def test_predictive_prewarm_is_consumed_by_native_slot_admission(self):
+        with (
+            patch.object(adapter, "MODE", "v5"),
+            patch.dict(
+                os.environ,
+                {
+                    "EKV_PREDICTIVE_PREWARM_MODE": "enforce",
+                    "EKV_PREDICTIVE_PREWARM_TTL_MS": "1000",
+                    "EKV_PREDICTIVE_PREWARM_MAX_CHUNKS": "2",
+                },
+            ),
+        ):
+            self.ctrl = adapter.Residency(
+                self.ctrl.pool, self.arenas, SLOT, "test"
+            )
+        self.ctrl.free_slots = adapter.FreeSlots(self.ctrl.pool.size)
+        free_before = self.ctrl.free_slots.count
+
+        selected = self.ctrl.predictive_prewarm(
+            SLOT * 4, now_s=time.monotonic()
+        )
+        self.assertGreater(selected, 0)
+        self.assertEqual(self.ctrl.free_slots.count, free_before)
+        self.assertEqual(len(self.ctrl.precommitted), selected)
+
+        ranges = self.ctrl.free_slots.peek(2)
+        self.ctrl.free_slots.claim(ranges)
+        self.ctrl.admit_ranges(ranges)
+
+        self.assertGreater(
+            self.ctrl.counters["predictive_prewarm_hit_chunks"], 0
+        )
+        self.assertEqual(self.ctrl._predictive_precommitted, set())
+        self.assertEqual(self.ctrl.free_slots.count, free_before - 2)
+        self.assertEqual(self.ctrl.live_count, 2)
+
+    def test_predictive_prewarm_expiry_reclaims_only_idle_lease(self):
+        with (
+            patch.object(adapter, "MODE", "v5"),
+            patch.dict(
+                os.environ,
+                {
+                    "EKV_PREDICTIVE_PREWARM_MODE": "enforce",
+                    "EKV_PREDICTIVE_PREWARM_TTL_MS": "10",
+                    "EKV_PREDICTIVE_PREWARM_MAX_CHUNKS": "2",
+                },
+            ),
+        ):
+            self.ctrl = adapter.Residency(
+                self.ctrl.pool, self.arenas, SLOT, "test"
+            )
+        self.ctrl.free_slots = adapter.FreeSlots(self.ctrl.pool.size)
+        now = time.monotonic()
+        selected = self.ctrl.predictive_prewarm(SLOT * 4, now_s=now)
+
+        expired = self.ctrl.expire_predictive_prewarm(now_s=now + 0.02)
+
+        self.assertEqual(expired, selected)
+        self.assertEqual(self.ctrl.precommitted, set())
+        self.assertEqual(self.ctrl._predictive_precommitted, set())
+        self.assert_mapping({0})
+        self.assertEqual(
+            self.ctrl.counters["predictive_prewarm_expired_chunks"], selected
+        )
+
+    def test_repeated_predictive_plan_does_not_extend_existing_lease(self):
+        with (
+            patch.object(adapter, "MODE", "v5"),
+            patch.dict(
+                os.environ,
+                {
+                    "EKV_PREDICTIVE_PREWARM_MODE": "enforce",
+                    "EKV_PREDICTIVE_PREWARM_TTL_MS": "100",
+                    "EKV_PREDICTIVE_PREWARM_MAX_CHUNKS": "4",
+                },
+            ),
+        ):
+            self.ctrl = adapter.Residency(
+                self.ctrl.pool, self.arenas, SLOT, "test"
+            )
+        self.ctrl.free_slots = adapter.FreeSlots(self.ctrl.pool.size)
+        now = time.monotonic()
+        self.ctrl.predictive_prewarm(SLOT * 8, now_s=now)
+        original = {
+            chunk: self.ctrl._predictive_prewarm_deadlines[chunk]
+            for chunk in self.ctrl._predictive_precommitted
+        }
+
+        self.ctrl.predictive_prewarm(SLOT * 8, now_s=now + 0.05)
+
+        for chunk, deadline in original.items():
+            self.assertEqual(
+                self.ctrl._predictive_prewarm_deadlines[chunk], deadline
+            )
+        self.assertEqual(len(self.ctrl._predictive_precommitted), 4)
+
+        # A repeated plan consumes no additional speculative budget once the
+        # outstanding lease set reaches its configured cap.
+        self.assertEqual(
+            self.ctrl.predictive_prewarm(SLOT * 8, now_s=now + 0.075), 0
+        )
+        self.assertEqual(len(self.ctrl._predictive_precommitted), 4)
 
     def test_crossing_slots_retain_shared_chunks(self):
         # Slot 1 touches chunks 0,1. Slot 2 touches chunks 1,2.

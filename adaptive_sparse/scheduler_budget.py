@@ -14,8 +14,11 @@ from pathlib import Path
 
 from .adaptive_runtime import MigrationFatal
 from .future_prefill import (
-    FuturePrefillConfig, effective_prefill_headroom, empty_plan,
-    plan_future_prefill, reconcile_tp_plan,
+    FuturePrefillConfig,
+    effective_prefill_headroom,
+    empty_plan,
+    plan_future_prefill,
+    reconcile_tp_plan,
 )
 from .migration import (
     abort_demote,
@@ -37,7 +40,6 @@ from .runtime_value import (
     runtime_values,
 )
 from .runtime_value import evidence as runtime_value_evidence
-
 
 SCHEDULER_SHA256S = frozenset({
     # Pinned MiniMax development image used by the request-level experiments.
@@ -1211,7 +1213,12 @@ def install_scheduler_budget():
     import torch
     from sglang.srt.managers import scheduler
     from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
-    from sglang.srt.runtime_context import get_disagg, get_schedule, get_server_args, get_spec
+    from sglang.srt.runtime_context import (
+        get_disagg,
+        get_schedule,
+        get_server_args,
+        get_spec,
+    )
 
     source_sha256 = hashlib.sha256(Path(scheduler.__file__).read_bytes()).hexdigest()
     if source_sha256 not in SCHEDULER_SHA256S:
@@ -1223,6 +1230,14 @@ def install_scheduler_budget():
     def run(self, batch, prefill):
         now = time.monotonic()
         coordinator = self.hisparse_coordinator
+        tracker = (
+            None
+            if coordinator is None
+            else getattr(coordinator.mem_pool_device, "adaptive_vmm", None)
+        )
+        expire_prewarm = getattr(tracker, "expire_predictive_prewarm", None)
+        if callable(expire_prewarm):
+            expire_prewarm()
         if not hasattr(self, "_ekv_adaptive_budget"):
             if (coordinator is None or not coordinator.is_m3_hisparse
                     or not hasattr(coordinator, "_ekv_resident")
@@ -1233,7 +1248,9 @@ def install_scheduler_budget():
                     or get_disagg().disaggregation_mode != "null"
                     or get_spec().speculative_algorithm not in (None, "NONE")):
                 raise RuntimeError("adaptive scheduler requires eager colocated MiniMax VMM residency")
-            from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
+            from sglang.srt.distributed.parallel_state import (
+                get_tensor_model_parallel_rank,
+            )
 
             stats_path = (Path(stats_dir) / f"rank{get_tensor_model_parallel_rank():02d}.json"
                           if stats_dir else None)
@@ -1273,6 +1290,9 @@ def install_scheduler_budget():
             if coordinator.tp_world_size > 1:
                 signatures = exchange(reservation.signature)
                 reservation, tp_fallback = reconcile_tp_plan(reservation, signatures)
+            prewarm = getattr(tracker, "predictive_prewarm", None)
+            if callable(prewarm) and not tp_fallback:
+                prewarm(reservation.kv_bytes)
         future_headroom = effective_prefill_headroom(
             reservation, headroom, future_mode
         )
