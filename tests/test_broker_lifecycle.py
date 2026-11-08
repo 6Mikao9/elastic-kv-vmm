@@ -5,15 +5,66 @@ from types import SimpleNamespace as B
 from unittest.mock import Mock
 
 import numpy as np
+import torch
 
-from adaptive_sparse.migration import commit_promote
+from adaptive_sparse.migration import commit_demote, commit_promote
 from adaptive_sparse.residency_broker import remaining_output_tokens
 
 
 class BrokerLifecycleTest(unittest.TestCase):
+    def test_demotion_removes_published_prefix_source(self):
+        request = B()
+        remove_source = Mock()
+        allocator = B(free_hisparse_indices=Mock())
+
+        class Mapping:
+            def __setitem__(self, key, value):
+                self.value = value
+
+        coordinator = B(
+            padded_buffer_size=2,
+            mem_pool_device=B(
+                page_size=1,
+                full_to_hisparse_device_index_mapping=Mapping(),
+            ),
+            req_to_device_buffer=torch.zeros((1, 2), dtype=torch.int32),
+            req_device_buffer_size=torch.zeros(1, dtype=torch.int32),
+            req_device_buffer_tokens=torch.zeros((1, 1, 2), dtype=torch.int32),
+            req_device_buffer_token_locs=torch.zeros((1, 1, 2), dtype=torch.int32),
+            lru_slots=torch.zeros((1, 1, 2), dtype=torch.int32),
+            _lru_init=torch.zeros(2, dtype=torch.int32),
+            spec_swap=B(reset=Mock()),
+            _skip_first_backup={},
+            token_to_kv_pool_allocator=allocator,
+            _ekv_remove_demoted_source=remove_source,
+        )
+        prepared = B(
+            status="prepared",
+            coordinator=coordinator,
+            request=request,
+            row=0,
+            logical=np.array([7, 8, 9], dtype=np.int64),
+            physical=torch.tensor([1, 2, 3, 4], dtype=torch.long),
+            committed_len=4,
+            retained_rows=(0, 1),
+            released_rows=(2, 3),
+        )
+        publish = Mock()
+
+        released = commit_demote(
+            prepared, publish, Mock(), Mock(return_value=0)
+        )
+
+        remove_source.assert_called_once_with(request)
+        publish.assert_called_once_with(0)
+        allocator.free_hisparse_indices.assert_called_once()
+        self.assertEqual(released, 0)
+        self.assertEqual(prepared.status, "committed")
+
     def test_promotion_cleanup_uses_nonterminal_hook(self):
         request = B()
         cleanup = Mock(return_value="cleaned")
+        register_source = Mock()
         tracker = B(backing=B(backed_bytes=5))
         tracker.trim_quiescent = Mock(return_value=0)
 
@@ -34,6 +85,7 @@ class BrokerLifecycleTest(unittest.TestCase):
                 adaptive_vmm=tracker,
             ),
             _ekv_cleanup_promotion_source=cleanup,
+            _ekv_register_promoted_source=register_source,
             request_finished=Mock(side_effect=AssertionError("terminal cleanup")),
         )
         prepared = B(
@@ -51,6 +103,7 @@ class BrokerLifecycleTest(unittest.TestCase):
         growth = commit_promote(prepared, publish, synchronize)
 
         cleanup.assert_called_once_with(request)
+        register_source.assert_called_once_with(request)
         coordinator.request_finished.assert_not_called()
         key = np.array([7, 8], dtype=np.int64)
         self.assertEqual(mapping[key].tolist(), [41, 42])

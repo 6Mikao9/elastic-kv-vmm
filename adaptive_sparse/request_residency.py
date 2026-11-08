@@ -14,6 +14,11 @@ from .residency_broker import (
     page_aligned_slots,
     remaining_output_tokens,
 )
+from .shared_prefix import (
+    SharedPrefixRegistry,
+    make_prefix_claim,
+    resolve_shared_block_locations,
+)
 
 
 _REQUEST_DECISION_LIMIT = 4096
@@ -77,6 +82,9 @@ def install_request_residency():
     if full_batch_swap not in ("0", "1") or (full_batch_swap == "1" and resolver != "triton"):
         raise ValueError("EKV_RESIDENT_FULL_BATCH_SWAP requires Triton resolver when enabled")
     full_batch_swap = full_batch_swap == "1"
+    shared_prefix_mode = os.environ.get("EKV_SHARED_PREFIX_REUSE", "off")
+    if shared_prefix_mode not in ("off", "direct"):
+        raise ValueError("EKV_SHARED_PREFIX_REUSE must be off or direct")
     if resolver == "triton":
         from .resident_lookup import resolve_resident
     reserve = int(os.environ.get("EKV_RESIDENT_FREE_RESERVE", "0"))
@@ -87,6 +95,10 @@ def install_request_residency():
         raise ValueError("EKV_RESIDENT_HINT_POLICY must be off or adaptive")
     if hint_policy == "adaptive" and os.environ.get("EKV_FUTURE_POLICY", "off") == "off":
         raise ValueError("adaptive resident hints require the future scheduler hook")
+    if shared_prefix_mode == "direct" and hint_policy == "off":
+        raise ValueError("direct shared-prefix reuse requires adaptive resident hints")
+    if shared_prefix_mode == "direct" and full_batch_swap:
+        raise ValueError("direct shared-prefix reuse does not support full-batch swap")
     minimum_hint_tokens = int(
         os.environ.get("EKV_RESIDENT_MIN_HINT_OUTPUT_TOKENS", "256")
     )
@@ -179,12 +191,19 @@ def install_request_residency():
         self._ekv_residency_stats = {"resident_admissions": 0, "native_admissions": 0,
                                      "resident_decode_rows": 0, "native_decode_rows": 0,
                                      "mixed_decode_batches": 0, "resident_layer_rows": 0,
+                                     "shared_prefix_direct_blocks": 0,
+                                     "shared_prefix_native_blocks": 0,
+                                     "shared_prefix_native_requests": 0,
+                                     "shared_prefix_partial_requests": 0,
                                      "future_hint_claim_attempts": 0, "future_hint_declines": 0,
                                      "future_hint_missing": 0, "future_hint_invalid": 0,
                                      "future_decision_reasons": {},
                                      "broker_dry_run_declines": 0,
                                      "resident_broker_mode": broker_mode,
                                      "requests": OrderedDict()}
+        self._ekv_shared_prefixes = (
+            SharedPrefixRegistry() if shared_prefix_mode == "direct" else None
+        )
 
     def publish_broker_stats(self):
         snapshot = self._ekv_residency_broker.snapshot()
@@ -239,6 +258,10 @@ def install_request_residency():
         key = req.kv.req_pool_idx
         self._ekv_residency_broker.reserve(key, predicted_growth_bytes=growth_bytes)
         self._ekv_residency_broker.set_last_length(key, current_tokens)
+        if self._ekv_shared_prefixes is not None:
+            claim = self._ekv_shared_prefixes.claim_for(key)
+            if claim is not None:
+                self._ekv_shared_prefixes.register_source(key, req, claim)
         publish_broker_stats(self)
 
     def broker_release_request(self, req):
@@ -261,6 +284,7 @@ def install_request_residency():
         hint_weight = hint_deadline = hint_kind = hint_prefix = None
         hint_shared_prefix_tokens = 0
         claim = True
+        shared_claim = None
         decline_reason = None
         claim_reason = None
         slots_available = len(self._ekv_resident) < limit
@@ -309,6 +333,21 @@ def install_request_residency():
                 hint_kind = hint.kind
                 hint_prefix = hint.prefix_group
                 hint_shared_prefix_tokens = hint.shared_prefix_tokens
+                if self._ekv_shared_prefixes is not None:
+                    try:
+                        shared_claim = make_prefix_claim(
+                            req,
+                            group=hint.prefix_group,
+                            shared_tokens=hint.shared_prefix_tokens,
+                        )
+                    except (AttributeError, TypeError, ValueError):
+                        stats["shared_prefix_invalid"] = (
+                            stats.get("shared_prefix_invalid", 0) + 1
+                        )
+                    if shared_claim is not None:
+                        self._ekv_shared_prefixes.register_claim(
+                            req.kv.req_pool_idx, shared_claim
+                        )
             decision = decide_resident_claim(
                 sequence_tokens=req.kv.kv_allocated_len,
                 native_buffer_tokens=self.device_buffer_size,
@@ -388,6 +427,10 @@ def install_request_residency():
         event = torch.cuda.Event()
         event.record()
         self._ekv_resident.add(req.kv.req_pool_idx)
+        if shared_claim is not None:
+            self._ekv_shared_prefixes.register_source(
+                req.kv.req_pool_idx, req, shared_claim
+            )
         stats["resident_admissions"] += 1
         record_decision(
             "resident",
@@ -429,12 +472,19 @@ def install_request_residency():
 
         resident = torch.tensor(resident_rows, device=rows.device, dtype=torch.long)
         sparse = torch.tensor(sparse_rows, device=rows.device, dtype=torch.long)
+        request_rows_cpu = rows_cpu.tolist()
         native_lengths = None
         if full_batch_swap and sparse_rows:
             # The pinned block swap kernel's zero-length path writes -1 to
             # this row without reading host/device cache entries or LRU.
             native_lengths = lengths.clone().index_fill_(0, resident, 0)
-        self._ekv_decode_rows = resident, sparse, native_lengths
+        self._ekv_decode_rows = (
+            resident,
+            sparse,
+            native_lengths,
+            request_rows_cpu,
+            sparse_rows,
+        )
         request_table = self.req_to_token_pool.req_to_token
         mapping = self.mem_pool_device.full_to_hisparse_device_index_mapping
         previous = mapping[request_table[rows[resident], lengths[resident] - 2]]
@@ -452,7 +502,7 @@ def install_request_residency():
         selection = ctrl._ekv_decode_rows
         if selection is None:
             return original_swap(self, forward_batch, topk_idx, layer_id)
-        resident, sparse, native_lengths = selection
+        resident, sparse, native_lengths, request_rows_cpu, sparse_rows = selection
         ctrl._ekv_residency_stats["resident_layer_rows"] += len(resident)
         rows, lengths = forward_batch.req_pool_indices, forward_batch.seq_lens
         if topk_idx.shape[:2] != (1, len(rows)) or len(rows) != len(resident) + len(sparse):
@@ -482,15 +532,92 @@ def install_request_residency():
             logical = self.req_to_token[rows[resident, None], positions.masked_fill(~valid, 0)]
             result[resident] = mapping[logical].masked_fill(~valid, -1).to(torch.int32)
         if sparse.numel():
-            result[sparse] = ctrl.swap_in_selected_blocks(
-                req_pool_indices=rows[sparse], seq_lens=lengths[sparse],
-                top_k_blocks=topk_idx[0, sparse], layer_id=layer_id,
-                sparse_block_size=block_size)
+            registry = ctrl._ekv_shared_prefixes
+            if registry is None:
+                result[sparse] = ctrl.swap_in_selected_blocks(
+                    req_pool_indices=rows[sparse], seq_lens=lengths[sparse],
+                    top_k_blocks=topk_idx[0, sparse], layer_id=layer_id,
+                    sparse_block_size=block_size)
+            else:
+                sparse_blocks = topk_idx[0, sparse]
+                sparse_row_ids = [request_rows_cpu[i] for i in sparse_rows]
+                native_local = []
+                partial = []
+                direct_blocks = 0
+                native_blocks = 0
+                for local, row_id in enumerate(sparse_row_ids):
+                    source = registry.resolve(int(row_id))
+                    if source is None:
+                        native_local.append(local)
+                        native_blocks += int(sparse_blocks[local].numel())
+                        continue
+                    valid, physical = resolve_shared_block_locations(
+                        sparse_blocks[local],
+                        source_row=source.row,
+                        seq_len=lengths[sparse[local]],
+                        shared_tokens=source.claim.tokens,
+                        block_size=block_size,
+                        request_table=self.req_to_token,
+                        device_mapping=mapping,
+                    )
+                    if not bool(valid.any()):
+                        native_local.append(local)
+                        native_blocks += int(sparse_blocks[local].numel())
+                        continue
+                    result[sparse[local]].view(-1, block_size)[valid] = physical[valid]
+                    direct_blocks += int(valid.sum().item())
+                    if bool((~valid).any()):
+                        partial.append((local, ~valid))
+                        native_blocks += int((~valid).sum().item())
+                if direct_blocks:
+                    ctrl._ekv_residency_stats["shared_prefix_direct_blocks"] = (
+                        ctrl._ekv_residency_stats.get("shared_prefix_direct_blocks", 0)
+                        + direct_blocks
+                    )
+                if native_blocks:
+                    ctrl._ekv_residency_stats["shared_prefix_native_blocks"] = (
+                        ctrl._ekv_residency_stats.get("shared_prefix_native_blocks", 0)
+                        + native_blocks
+                    )
+                if native_local:
+                    ctrl._ekv_residency_stats["shared_prefix_native_requests"] = (
+                        ctrl._ekv_residency_stats.get(
+                            "shared_prefix_native_requests", 0
+                        )
+                        + len(native_local)
+                    )
+                if partial:
+                    ctrl._ekv_residency_stats["shared_prefix_partial_requests"] = (
+                        ctrl._ekv_residency_stats.get(
+                            "shared_prefix_partial_requests", 0
+                        )
+                        + len(partial)
+                    )
+                if native_local:
+                    chosen = torch.tensor(native_local, device=rows.device, dtype=torch.long)
+                    result[sparse[chosen]] = ctrl.swap_in_selected_blocks(
+                        req_pool_indices=rows[sparse[chosen]], seq_lens=lengths[sparse[chosen]],
+                        top_k_blocks=sparse_blocks[chosen], layer_id=layer_id,
+                        sparse_block_size=block_size)
+                for local, missing in partial:
+                    native = ctrl.swap_in_selected_blocks(
+                        req_pool_indices=rows[sparse[local]].reshape(1),
+                        seq_lens=lengths[sparse[local]].reshape(1),
+                        top_k_blocks=sparse_blocks[local][missing].reshape(1, -1),
+                        layer_id=layer_id,
+                        sparse_block_size=block_size,
+                    )
+                    result[sparse[local]].view(-1, block_size)[missing] = (
+                        native.reshape(-1, block_size)
+                    )
+                ctrl._ekv_residency_stats["shared_prefix"] = registry.snapshot()
         return result.unsqueeze(0)
 
     def finish(self, req):
         broker_finish_request(self, req)
         self._ekv_resident.discard(req.kv.req_pool_idx)
+        if self._ekv_shared_prefixes is not None:
+            self._ekv_shared_prefixes.remove_request(req.kv.req_pool_idx)
         return original_finish(self, req)
 
     def cleanup_promotion_source(self, req):
@@ -499,11 +626,27 @@ def install_request_residency():
         # cycles; only final completion or abort may discard it.
         broker_release_request(self, req)
         self._ekv_resident.discard(req.kv.req_pool_idx)
+        if self._ekv_shared_prefixes is not None:
+            self._ekv_shared_prefixes.remove_source(req.kv.req_pool_idx)
         return original_finish(self, req)
+
+    def register_promoted_source(self, req):
+        if self._ekv_shared_prefixes is None:
+            return
+        row = req.kv.req_pool_idx
+        claim = self._ekv_shared_prefixes.claim_for(row)
+        if claim is not None:
+            self._ekv_shared_prefixes.register_source(row, req, claim)
+
+    def remove_demoted_source(self, req):
+        if self._ekv_shared_prefixes is not None:
+            self._ekv_shared_prefixes.remove_source(req.kv.req_pool_idx)
 
     def abort(self, req):
         broker_finish_request(self, req)
         self._ekv_resident.discard(req.kv.req_pool_idx)
+        if self._ekv_shared_prefixes is not None:
+            self._ekv_shared_prefixes.remove_request(req.kv.req_pool_idx)
         return original_abort(self, req)
 
     cls.__init__ = initialize
@@ -512,11 +655,15 @@ def install_request_residency():
     cls.map_last_loc_to_buffer = map_latest
     cls.request_finished = finish
     cls.abort_staging_request = abort
+    if broker_mode != "off" or shared_prefix_mode == "direct":
+        cls._ekv_cleanup_promotion_source = cleanup_promotion_source
     if broker_mode != "off":
         cls._ekv_broker_can_promote = broker_can_promote
         cls._ekv_broker_promotion_plan = broker_promotion_plan
         cls._ekv_broker_commit_promotion = broker_commit_promotion
         cls._ekv_broker_release_request = broker_release_request
-        cls._ekv_cleanup_promotion_source = cleanup_promotion_source
+    if shared_prefix_mode == "direct":
+        cls._ekv_register_promoted_source = register_promoted_source
+        cls._ekv_remove_demoted_source = remove_demoted_source
     attn._hisparse_swap_in_blocks = swap
     cls._ekv_static_residency = True

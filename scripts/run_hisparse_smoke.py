@@ -92,6 +92,23 @@ def validate_resident_broker_options(parser, *, mode, lookahead_tokens, resident
         parser.error("resident broker requires enabled request residency")
 
 
+def validate_shared_prefix_reuse_options(
+    parser, *, mode, hint_policy, future_policy, resident_limit, full_batch_swap
+):
+    if mode not in ("off", "direct"):
+        parser.error("shared-prefix reuse mode must be off or direct")
+    if mode != "direct":
+        return
+    if not resident_limit:
+        parser.error("direct shared-prefix reuse requires request residency")
+    if hint_policy != "adaptive":
+        parser.error("direct shared-prefix reuse requires adaptive resident hints")
+    if future_policy == "off":
+        parser.error("direct shared-prefix reuse requires future hints")
+    if full_batch_swap:
+        parser.error("direct shared-prefix reuse does not support full-batch swap")
+
+
 def resident_hint_environment(policy, minimum_tokens, resident_limit):
     if not resident_limit:
         return {}
@@ -106,6 +123,16 @@ def resident_hint_manifest(policy, minimum_tokens):
         "resident_hint_policy": policy,
         "resident_min_hint_output_tokens": minimum_tokens,
     }
+
+
+def shared_prefix_environment(mode, resident_limit):
+    if not resident_limit or mode == "off":
+        return {}
+    return {"EKV_SHARED_PREFIX_REUSE": mode}
+
+
+def shared_prefix_manifest(mode):
+    return {"shared_prefix_reuse": mode}
 
 
 def resident_broker_environment(mode, lookahead_tokens, resident_limit):
@@ -132,6 +159,7 @@ def resident_hint_sources(resident_limit):
         "adaptive_sparse/future_residency.py",
         "adaptive_sparse/residency_broker.py",
         "adaptive_sparse/resident_lookup.py",
+        "adaptive_sparse/shared_prefix.py",
     )
 
 
@@ -197,6 +225,7 @@ def main():
     parser.add_argument("--resident-full-batch-swap", action="store_true")
     parser.add_argument("--resident-hint-policy", choices=("off", "adaptive"), default="off")
     parser.add_argument("--resident-min-hint-output-tokens", type=int, default=128)
+    parser.add_argument("--shared-prefix-reuse", choices=("off", "direct"), default="off")
     parser.add_argument("--resident-broker", choices=("off", "dry_run", "enforce"), default="off")
     parser.add_argument("--resident-broker-lookahead-tokens", type=int, default=256)
     parser.add_argument("--adaptive-budget-mib", type=int, default=0)
@@ -316,6 +345,14 @@ def main():
         lookahead_tokens=args.resident_broker_lookahead_tokens,
         resident_limit=args.resident_limit,
     )
+    validate_shared_prefix_reuse_options(
+        parser,
+        mode=args.shared_prefix_reuse,
+        hint_policy=args.resident_hint_policy,
+        future_policy=args.future_policy,
+        resident_limit=args.resident_limit,
+        full_batch_swap=args.resident_full_batch_swap,
+    )
     if args.adaptive_plan_capture and not args.logical_shadow:
         parser.error("allocation plan capture is diagnostic and requires logical shadow")
     if (args.adaptive_force_demote_step or args.adaptive_force_promote_step) and not args.logical_shadow:
@@ -427,6 +464,7 @@ def main():
         environment.pop("EKV_ALLOCATOR_STATS_DIR", None)
     for name in ("EKV_VMM_STATS_DIR", "EKV_RESIDENT_LIMIT", "EKV_RESIDENT_FREE_RESERVE",
                  "EKV_RESIDENT_HINT_POLICY", "EKV_RESIDENT_MIN_HINT_OUTPUT_TOKENS",
+                 "EKV_SHARED_PREFIX_REUSE",
                  "EKV_RESIDENT_BROKER", "EKV_RESIDENT_BROKER_LOOKAHEAD_TOKENS",
                  "EKV_LAYER_TRACE_DIR", "EKV_DISABLE_FUSED_QKNORM", "EKV_RESIDENT_RESOLVER"):
         environment.pop(name, None)
@@ -476,6 +514,9 @@ def main():
         environment.update(resident_broker_environment(
             args.resident_broker, args.resident_broker_lookahead_tokens,
             args.resident_limit,
+        ))
+        environment.update(shared_prefix_environment(
+            args.shared_prefix_reuse, args.resident_limit
         ))
     command = [sys.executable, "-u", *launch, "--model-path",
                str(args.model_path.resolve()), *server_args]
@@ -554,6 +595,7 @@ def main():
         **resident_broker_manifest(
             args.resident_broker, args.resident_broker_lookahead_tokens
         ),
+        **shared_prefix_manifest(args.shared_prefix_reuse),
         "adaptive_settings": adaptive_settings if adaptive else None,
         "chunk_aware_retention": args.chunk_aware_retention,
         "future_policy": args.future_policy,
@@ -575,6 +617,7 @@ def main():
                **resident_broker_manifest(
                    args.resident_broker, args.resident_broker_lookahead_tokens
                ),
+               **shared_prefix_manifest(args.shared_prefix_reuse),
                "future_policy": args.future_policy,
                "future_planning_policy": effective_future_policy if future_plan_mode else None,
                "future_hints_emitted": future_plan_mode and not args.future_no_hints,

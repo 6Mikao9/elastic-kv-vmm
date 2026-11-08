@@ -12,6 +12,7 @@ import os
 @dataclass
 class PreparedDemotion:
     coordinator: object
+    request: object
     row: int
     logical: object
     physical: object
@@ -112,7 +113,7 @@ def prepare_demote(coordinator, req, synchronize):
         synchronize()
         _release_host(coordinator, row)
         raise
-    return PreparedDemotion(coordinator, row, logical, physical, length,
+    return PreparedDemotion(coordinator, req, row, logical, physical, length,
                              retained_rows, released_rows)
 
 
@@ -155,6 +156,11 @@ def commit_demote(prepared, publish_host_backed, synchronize, trim_quiescent=Non
     coordinator.lru_slots[:, row, :].copy_(coordinator._lru_init)
     coordinator.spec_swap.reset(row)
     coordinator._skip_first_backup[row] = True
+    remove_shared_source = getattr(
+        coordinator, "_ekv_remove_demoted_source", None
+    )
+    if remove_shared_source is not None:
+        remove_shared_source(prepared.request)
     mapping = coordinator.mem_pool_device.full_to_hisparse_device_index_mapping
     mapping[prepared.logical] = 0
     synchronize()
@@ -267,5 +273,10 @@ def commit_promote(prepared, publish_gpu_resident, synchronize):
     tracker = pool.adaptive_vmm
     tracker.trim_quiescent()
     publish_gpu_resident(prepared.row)
+    register_shared_source = getattr(
+        coordinator, "_ekv_register_promoted_source", None
+    )
+    if register_shared_source is not None:
+        register_shared_source(prepared.request)
     prepared.status = "committed"
     return max(0, tracker.backing.backed_bytes - prepared.backed_before)

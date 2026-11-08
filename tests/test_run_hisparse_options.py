@@ -13,8 +13,11 @@ from scripts.run_hisparse_smoke import (
     resident_hint_manifest,
     resident_hint_sources,
     load_future_submissions,
+    shared_prefix_environment,
+    shared_prefix_manifest,
     validate_resident_hint_options,
     validate_resident_broker_options,
+    validate_shared_prefix_reuse_options,
 )
 
 
@@ -75,6 +78,7 @@ class ResidentHintRunnerOptionsTest(unittest.TestCase):
         )
         self.assertIn("adaptive_sparse/future_residency.py", resident_hint_sources(2))
         self.assertIn("adaptive_sparse/residency_broker.py", resident_hint_sources(2))
+        self.assertIn("adaptive_sparse/shared_prefix.py", resident_hint_sources(2))
         self.assertEqual(resident_hint_environment("off", 128, 0), {})
         self.assertEqual(resident_hint_sources(0), ())
 
@@ -95,6 +99,49 @@ class ResidentHintRunnerOptionsTest(unittest.TestCase):
         )
         self.assertEqual(resident_broker_environment("enforce", 256, 0), {})
         self.assertEqual(resident_broker_environment("off", 256, 2), {})
+
+    def test_shared_prefix_environment_and_manifest_are_explicit(self):
+        self.assertEqual(
+            shared_prefix_environment("direct", 2),
+            {"EKV_SHARED_PREFIX_REUSE": "direct"},
+        )
+        self.assertEqual(
+            shared_prefix_manifest("direct"), {"shared_prefix_reuse": "direct"}
+        )
+        self.assertEqual(shared_prefix_environment("direct", 0), {})
+        self.assertEqual(shared_prefix_environment("off", 2), {})
+
+    def test_shared_prefix_requires_full_runtime_enablement(self):
+        parser = argparse.ArgumentParser()
+        invalid = (
+            ("invalid", "adaptive", "deadline", 2, False),
+            ("direct", "off", "deadline", 2, False),
+            ("direct", "adaptive", "off", 2, False),
+            ("direct", "adaptive", "deadline", 0, False),
+            ("direct", "adaptive", "deadline", 2, True),
+        )
+        for mode, hints, future, limit, full_batch in invalid:
+            with self.subTest(
+                mode=mode, hints=hints, future=future, limit=limit,
+                full_batch=full_batch,
+            ):
+                with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+                    validate_shared_prefix_reuse_options(
+                        parser,
+                        mode=mode,
+                        hint_policy=hints,
+                        future_policy=future,
+                        resident_limit=limit,
+                        full_batch_swap=full_batch,
+                    )
+        validate_shared_prefix_reuse_options(
+            parser,
+            mode="direct",
+            hint_policy="adaptive",
+            future_policy="deadline",
+            resident_limit=2,
+            full_batch_swap=False,
+        )
 
     def test_adaptive_requires_future_policy_and_residency(self):
         parser = argparse.ArgumentParser()

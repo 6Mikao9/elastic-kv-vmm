@@ -158,6 +158,14 @@ The MiniMax request-residency path can consume the same hint. With
 SGLang's native admission and physical-reserve checks. Its paired GPU experiment
 is specified in the [HiSparse reproduction guide](docs/HISPARSE_REPRODUCE.md).
 
+`--shared-prefix-reuse direct` additionally lets a host-backed HiSparse request
+resolve complete Top-K blocks inside a verified shared prefix from another live
+full-resident request, avoiding host staging for that subset. The source must
+remain resident and matching tokens, adapters and request identity are checked
+before reuse. This CPU-validated path still needs paired MiniMax GPU
+correctness, host-transfer and TPOT measurements; see [the direct shared-prefix
+runtime boundary](docs/SHARED_PREFIX_RUNTIME.md).
+
 The optional `--resident-broker dry_run|enforce` path adds a second admission
 check: predicted output-token growth, the fixed allocator reserve and every
 already promised resident growth share one physical-byte ledger. `dry_run`
