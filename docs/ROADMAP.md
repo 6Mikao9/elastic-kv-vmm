@@ -185,7 +185,10 @@ compares fixed slots, per-request chunk-rounded private slabs and exact-length
 packed request ranges. Private slabs remove cross-owner chunk coupling but pay
 per-request tail slack; packing admits more mixed/short-heavy requests but
 couples reclamation. At matched concurrency all three reach the same physical
-chunk union. A real trace, GPU mapping cost and serving comparison remain open.
+chunk union. A large-private/small-packed hybrid cuts the synthetic mixed
+peak from four shared chunks to one while retaining the private arm's
+active-request capacity. A real trace, GPU mapping cost and serving comparison
+remain open.
 
 Separately, explore reuse of identical prefix KV that another request still
 holds on the GPU. A HiSparse Top-K lookup could first resolve a compatible

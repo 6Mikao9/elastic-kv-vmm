@@ -116,6 +116,22 @@ class AffinePlacementTest(unittest.TestCase):
         self.assertEqual(chunks_for_prefix(first, 5, 8), {0})
         self.assertEqual(chunks_for_prefix(second, 3, 8), {1})
 
+    def test_chunk_rounded_reservation_skips_an_unaligned_free_prefix(self):
+        arena = AffineArena(32, chunk_bytes=8)
+        packed = arena.reserve("short", total_tokens=3, row_bytes=1)
+        assert packed is not None
+        private = arena.reserve(
+            "long",
+            total_tokens=8,
+            row_bytes=1,
+            round_to_chunks=True,
+        )
+        assert private is not None
+
+        self.assertEqual(packed.start_byte, 0)
+        self.assertEqual(private.start_byte, 8)
+        self.assertEqual(arena.free_ranges, ((3, 5), (16, 16)))
+
     def test_private_affine_reclaims_all_touched_chunks_independently(self):
         arena = AffineArena(32, chunk_bytes=8, round_to_chunks=True)
         first = arena.reserve("first", total_tokens=9, row_bytes=1)
@@ -132,6 +148,8 @@ class AffinePlacementTest(unittest.TestCase):
     def test_slot_and_chunk_rounding_are_mutually_exclusive(self):
         with self.assertRaisesRegex(ValueError, "mutually exclusive"):
             AffineArena(16, chunk_bytes=8, slot_bytes=8, round_to_chunks=True)
+        with self.assertRaisesRegex(TypeError, "boolean"):
+            AffineArena(16, chunk_bytes=8, round_to_chunks="yes")  # type: ignore[arg-type]
 
     def test_release_coalesces_ranges_and_keeps_fragmented_ranges_apart(self):
         arena = AffineArena(32, chunk_bytes=8)
@@ -158,11 +176,39 @@ class AffinePlacementTest(unittest.TestCase):
             AffineRequest("short-b", 2, 20, 40),
         ]
         config = AffineConfig(16_384, 2_048, 4, 3)
-        first = simulate_affine_placement(requests, config, "packed-affine")
-        second = simulate_affine_placement(requests, config, "packed-affine")
-        self.assertEqual(first, second)
-        self.assertEqual(first.admitted_requests, 3)
-        self.assertLessEqual(first.peak.mapped_bytes, config.arena_bytes)
+        for strategy in (
+            "fixed-affine",
+            "private-affine",
+            "packed-affine",
+            "hybrid-affine",
+        ):
+            with self.subTest(strategy=strategy):
+                first = simulate_affine_placement(requests, config, strategy)
+                second = simulate_affine_placement(requests, config, strategy)
+                self.assertEqual(first, second)
+                self.assertEqual(first.admitted_requests, 3)
+                self.assertLessEqual(first.peak.mapped_bytes, config.arena_bytes)
+
+    def test_hybrid_keeps_small_requests_packed_and_large_requests_private(self):
+        requests = [
+            AffineRequest("short-a", 0, 2, 2),
+            AffineRequest("short-b", 0, 2, 2),
+            AffineRequest("long", 0, 7, 1),
+        ]
+        config = AffineConfig(
+            arena_bytes=32,
+            chunk_bytes=8,
+            row_bytes=1,
+            max_active_requests=3,
+            prefill_tokens_per_ms=100,
+            decode_tokens_per_ms=100,
+        )
+        fixed = simulate_affine_placement(requests, config, "fixed-affine")
+        hybrid = simulate_affine_placement(requests, config, "hybrid-affine")
+
+        self.assertEqual(fixed.peak.mapped_bytes, 24)
+        self.assertEqual(hybrid.peak.mapped_bytes, 16)
+        self.assertEqual(hybrid.peak.shared_chunks, 1)
 
     def test_benchmark_payload_includes_private_reclaim_control(self):
         payload = run_scenario(
@@ -183,6 +229,7 @@ class AffinePlacementTest(unittest.TestCase):
                 "max_total_tokens",
                 "fixed_affine",
                 "private_affine",
+                "hybrid_affine",
                 "packed_affine",
                 "comparison",
             },

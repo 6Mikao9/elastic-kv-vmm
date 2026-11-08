@@ -1,7 +1,7 @@
 # Request-affine placement simulation
 
 This CPU experiment asks whether a stable per-request virtual base can reduce
-VMM tail waste without introducing a software KV block table. It compares three
+VMM tail waste without introducing a software KV block table. It compares four
 layouts while keeping the same direct token formula:
 
 ```text
@@ -13,6 +13,8 @@ byte_offset = request_base + token_position * row_bytes
 - `private-affine` gives each request a chunk-aligned base and reserves only
   that request's exact final extent rounded up to whole VMM chunks. Unique
   suffixes cannot share a chunk with another request.
+- `hybrid-affine` applies the private rule only to requests whose exact extent
+  reaches one VMM chunk; smaller requests remain best-fit packed.
 - `packed-affine` reserves each request's exact final byte extent in one global
   virtual arena. Best-fit allocation places neighboring requests at arbitrary
   chunk offsets, so their live prefixes may share a physical chunk.
@@ -49,57 +51,68 @@ each arm; `max active` is the maximum reached anywhere in the run.
 |---|---|---:|---:|---:|---:|---:|---:|
 | mixed | fixed-affine | 8 | 7 | 26 MiB | 19.60 MiB | 3,796.7 ms | 5,375.4 ms |
 | mixed | private-affine | 16 | 16 | 46 MiB | 25.91 MiB | 2,049.4 ms | 3,943.2 ms |
+| mixed | hybrid-affine | 16 | 16 | 44 MiB | 28.37 MiB | 1,993.0 ms | 3,892.8 ms |
 | mixed | packed-affine | 16 | 16 | 54 MiB | 30.82 MiB | 1,618.3 ms | 3,294.8 ms |
 | short-heavy | fixed-affine | 8 | 8 | 48 MiB | 39.12 MiB | 1,315.0 ms | 3,091.3 ms |
 | short-heavy | private-affine | 16 | 6 | 42 MiB | 34.69 MiB | 1,282.3 ms | 3,091.3 ms |
+| short-heavy | hybrid-affine | 16 | 7 | 48 MiB | 40.26 MiB | 1,247.0 ms | 3,056.0 ms |
 | short-heavy | packed-affine | 16 | 8 | 54 MiB | 44.90 MiB | 1,207.7 ms | 3,016.7 ms |
 | equal-length | fixed-affine | 16 | 16 | 32 MiB | 24.64 MiB | 2,037.4 ms | 2,726.2 ms |
 | equal-length | private-affine | 16 | 16 | 32 MiB | 24.64 MiB | 2,037.4 ms | 2,726.2 ms |
+| equal-length | hybrid-affine | 16 | 16 | 32 MiB | 24.64 MiB | 2,037.4 ms | 2,726.2 ms |
 | equal-length | packed-affine | 16 | 16 | 32 MiB | 24.64 MiB | 2,037.4 ms | 2,726.2 ms |
 
 Private affine also raised mixed-workload concurrency from 8 to 16. Relative to
 packed affine, it mapped 8 MiB less at the selected mixed peak but completed
 648.4 ms later. In the short-heavy scenario, chunk alignment prevented private
 slabs from reaching the same peak concurrency: only six were active at the peak
-versus eight for the other layouts. These are capacity and queueing effects,
-not isolated reductions in per-request mapping cost.
+versus eight for fixed and packed placement. These are capacity and queueing
+effects, not isolated reductions in per-request mapping cost.
+
+Hybrid placement recovered part of that capacity: in the mixed scenario it
+mapped 10 MiB less than packed placement and reduced shared chunks at the peak
+from four to one, while completing 598.0 ms later than packed and 50.4 ms
+earlier than private placement. In the short-heavy scenario it reached seven
+peak-active requests, one more than private placement, but stayed below packed
+placement's eight.
 
 To remove the active-request-count difference, the second run uses a 128 MiB
 arena. Mixed and equal workloads reach the configured 16-request limit;
 short-heavy reaches the same nine-request peak in all layouts. Every scenario
 has the same admission and completion times across the layouts.
 
-| scenario | fixed peak | private peak | packed peak | packed shared savings at peak | fixed virtual reservation | private virtual reservation | packed virtual reservation |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| mixed | 52 MiB | 52 MiB | 52 MiB | 12 MiB / 5 chunks | 128 MiB | 74 MiB | 52.72 MiB |
-| short-heavy | 60 MiB | 60 MiB | 60 MiB | 8 MiB / 4 chunks | 72 MiB | 72 MiB | 61.51 MiB |
-| equal-length | 32 MiB | 32 MiB | 32 MiB | 0 MiB | 32 MiB | 32 MiB | 32 MiB |
+| scenario | fixed peak | private peak | hybrid peak | packed peak | packed shared savings at peak | fixed virtual | private virtual | hybrid virtual | packed virtual |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| mixed | 52 MiB | 52 MiB | 52 MiB | 52 MiB | 12 MiB / 5 chunks | 128 MiB | 74 MiB | 71.42 MiB | 52.72 MiB |
+| short-heavy | 60 MiB | 60 MiB | 60 MiB | 60 MiB | 8 MiB / 4 chunks | 72 MiB | 72 MiB | 72 MiB | 61.51 MiB |
+| equal-length | 32 MiB | 32 MiB | 32 MiB | 32 MiB | 0 MiB | 32 MiB | 32 MiB | 32 MiB | 32 MiB |
 
-At matched concurrency, private and packed layouts touch the same union of
-physical chunks. Packing removes 8-12 MiB of independently counted chunk
+At matched concurrency, all layouts touch the same union of physical chunks.
+Packing removes 8-12 MiB of independently counted chunk
 backing by co-occupying chunks and uses substantially less virtual reservation
 than private slots. Exact-length equality is a useful negative control because
 a 4,096-token request already occupies exactly 2 MiB.
 
 ## Interpretation
 
-Private affine gives the allocator a middle option: ordinary suffixes have no
-cross-owner chunk, so one request's departure can release its own touched
-chunks. This removes the joint-reclaim coupling seen in packed placement, but
-chunk rounding wastes virtual capacity and can reduce concurrency on
-short-heavy traffic.
+Private affine protects ordinary suffixes from cross-owner chunks, so one large
+request's departure can release its own touched chunks. Hybrid placement keeps
+that protection for requests at least one chunk long while packing smaller
+requests. In these fixtures it is a compromise rather than a universal winner:
+it can reduce long-request reclaim coupling and virtual reservation without
+imposing a private chunk on every short request.
 
-Packed affine avoids per-request chunk rounding and therefore fits the largest
-number of active requests in the synthetic mixed and short-heavy cases. The
-cost is explicit: neighboring requests co-own tail chunks, so a single request
-cannot necessarily release a complete chunk.
+Packed affine avoids per-request chunk rounding and therefore reaches the
+largest peak concurrency in the synthetic short-heavy case. The cost is
+explicit: neighboring requests co-own tail chunks, so a single request cannot
+necessarily release a complete chunk.
 
 No layout makes tail chunks free. Whole-chunk VMM mapping still rounds the
 union of live prefixes. Private slabs convert sharing into internal slack;
-packed slabs convert internal slack into shared-chunk lifetime. Reservations
-must be exact and immutable for the request lifetime; growing into unplanned
-space would change the affine base unless a separate mapping indirection is
-added.
+packed slabs convert internal slack into shared-chunk lifetime; hybrid slabs
+divide requests by expected length. Reservations must be exact and immutable
+for the request lifetime; growing into unplanned space would change the affine
+base unless a separate mapping indirection is added.
 
 The next step should replay a real serving trace with known prompt and output
 lengths, then compare actual mapped bytes, admission delay, mapping calls and

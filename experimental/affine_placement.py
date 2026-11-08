@@ -102,6 +102,8 @@ class AffineArena:
                 raise ValueError("slot_bytes must be chunk aligned")
             if slot_bytes > arena_bytes:
                 raise ValueError("slot_bytes exceeds arena_bytes")
+        if not isinstance(round_to_chunks, bool):
+            raise TypeError("round_to_chunks must be a boolean")
         if round_to_chunks and slot_bytes is not None:
             raise ValueError("slot_bytes and round_to_chunks are mutually exclusive")
         self.arena_bytes = arena_bytes
@@ -124,6 +126,8 @@ class AffineArena:
         request_id: str,
         total_tokens: int,
         row_bytes: int,
+        *,
+        round_to_chunks: bool | None = None,
     ) -> Placement | None:
         """Place a full, fixed request interval using best fit.
 
@@ -139,22 +143,37 @@ class AffineArena:
         _positive_int(total_tokens, "total_tokens")
         _positive_int(row_bytes, "row_bytes")
         exact_bytes = total_tokens * row_bytes
+        if round_to_chunks is not None and not isinstance(round_to_chunks, bool):
+            raise TypeError("round_to_chunks must be a boolean or None")
+        use_chunk_rounding = (
+            self.round_to_chunks
+            if round_to_chunks is None
+            else round_to_chunks
+        )
+        if use_chunk_rounding and self.slot_bytes is not None:
+            raise ValueError("slot_bytes cannot be combined with chunk rounding")
         reserved = exact_bytes if self.slot_bytes is None else self.slot_bytes
-        if self.round_to_chunks:
+        if use_chunk_rounding:
             reserved = _ceil_div(exact_bytes, self.chunk_bytes) * self.chunk_bytes
         if exact_bytes > reserved:
             raise ValueError("request sequence exceeds the configured affine slot")
         if reserved > self.arena_bytes:
             return None
 
-        candidates = [
-            (size, index, start)
-            for index, (start, size) in enumerate(self._free)
-            if size >= reserved
-        ]
+        candidates: list[tuple[int, int, int, int]] = []
+        for index, (range_start, size) in enumerate(self._free):
+            start = (
+                _ceil_div(range_start, self.chunk_bytes) * self.chunk_bytes
+                if use_chunk_rounding
+                else range_start
+            )
+            if start + reserved <= range_start + size:
+                candidates.append(
+                    (size - reserved, start - range_start, start, index)
+                )
         if not candidates:
             return None
-        _size, index, start = min(candidates)
+        _leftover, _leading, start, index = min(candidates)
         old_start, old_size = self._free[index]
         replacement: list[tuple[int, int]] = []
         if start > old_start:
@@ -347,9 +366,15 @@ def simulate_affine_placement(
     ids = [item.request_id for item in workload]
     if len(ids) != len(set(ids)):
         raise ValueError("request IDs must be unique")
-    if strategy not in {"fixed-affine", "packed-affine", "private-affine"}:
+    if strategy not in {
+        "fixed-affine",
+        "packed-affine",
+        "private-affine",
+        "hybrid-affine",
+    }:
         raise ValueError(
-            "strategy must be fixed-affine, packed-affine or private-affine"
+            "strategy must be fixed-affine, packed-affine, private-affine "
+            "or hybrid-affine"
         )
 
     max_tokens = max(item.total_tokens for item in workload)
@@ -431,10 +456,16 @@ def simulate_affine_placement(
                 if len(active) >= config.max_active_requests:
                     return
                 request = by_id[request_id]
+                exact_bytes = request.total_tokens * config.row_bytes
+                request_private = round_to_chunks or (
+                    strategy == "hybrid-affine"
+                    and exact_bytes >= config.chunk_bytes
+                )
                 placement = arena.reserve(
                     request_id,
                     request.total_tokens,
                     config.row_bytes,
+                    round_to_chunks=request_private,
                 )
                 if placement is None:
                     continue

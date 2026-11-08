@@ -76,9 +76,11 @@ def run_scenario(
     workload = generate_workload(scenario, request_count, seed)
     fixed = simulate_affine_placement(workload, config, "fixed-affine")
     private = simulate_affine_placement(workload, config, "private-affine")
+    hybrid = simulate_affine_placement(workload, config, "hybrid-affine")
     packed = simulate_affine_placement(workload, config, "packed-affine")
     fixed_peak = fixed.peak.mapped_bytes
     private_peak = private.peak.mapped_bytes
+    hybrid_peak = hybrid.peak.mapped_bytes
     packed_peak = packed.peak.mapped_bytes
     return {
         "scenario": scenario,
@@ -89,10 +91,12 @@ def run_scenario(
         "max_total_tokens": max(item.total_tokens for item in workload),
         "fixed_affine": _compact(fixed),
         "private_affine": _compact(private),
+        "hybrid_affine": _compact(hybrid),
         "packed_affine": _compact(packed),
         "comparison": {
             "fixed_peak_backing_bytes": fixed_peak,
             "private_peak_backing_bytes": private_peak,
+            "hybrid_peak_backing_bytes": hybrid_peak,
             "packed_peak_backing_bytes": packed_peak,
             "private_peak_backing_delta_vs_fixed_bytes": private_peak - fixed_peak,
             "peak_backing_delta_bytes": packed_peak - fixed_peak,
@@ -102,8 +106,10 @@ def run_scenario(
             "packed_shared_savings_at_peak_bytes": packed.peak.shared_savings_bytes,
             "packed_shared_chunks_at_peak": packed.peak.shared_chunks,
             "private_shared_chunks_at_peak": private.peak.shared_chunks,
+            "hybrid_shared_chunks_at_peak": hybrid.peak.shared_chunks,
             "fixed_virtual_reservation_at_peak_bytes": fixed.peak.reserved_bytes,
             "private_virtual_reservation_at_peak_bytes": private.peak.reserved_bytes,
+            "hybrid_virtual_reservation_at_peak_bytes": hybrid.peak.reserved_bytes,
             "packed_virtual_reservation_at_peak_bytes": packed.peak.reserved_bytes,
             "packed_extra_active_requests_at_peak": (
                 packed.peak.active_requests - fixed.peak.active_requests
@@ -117,6 +123,12 @@ def run_scenario(
             ),
             "private_to_packed_makespan_delta_ms": (
                 private.makespan_ms - packed.makespan_ms
+            ),
+            "hybrid_to_packed_start_delay_delta_ms": (
+                hybrid.max_start_delay_ms - packed.max_start_delay_ms
+            ),
+            "hybrid_to_packed_makespan_delta_ms": (
+                hybrid.makespan_ms - packed.makespan_ms
             ),
         },
     }
@@ -153,6 +165,10 @@ def analyze(args: argparse.Namespace) -> dict[str, object]:
             "private-affine": (
                 "every request has a chunk-aligned base and reserves its own "
                 "exact final sequence rounded up to whole VMM chunks"
+            ),
+            "hybrid-affine": (
+                "requests whose exact extent reaches one VMM chunk use private "
+                "chunk-rounded slabs; smaller requests remain best-fit packed"
             ),
             "packed-affine": (
                 "exact final sequence extent, best-fit in one virtual arena; "
