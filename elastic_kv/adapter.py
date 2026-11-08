@@ -224,6 +224,27 @@ class Residency:
             free = after
 
         usable = max(0, free - prefill_headroom)
+        broker_available = [
+            value
+            for arena in self.arenas
+            if (
+                value := getattr(
+                    getattr(arena, "backing", None),
+                    "broker_available_bytes",
+                    None,
+                )
+            ) is not None
+        ]
+        if broker_available:
+            global_available = min(broker_available)
+            self.counters["physical_global_broker_available_bytes"] = (
+                global_available
+            )
+            if global_available < usable:
+                self.counters["physical_global_broker_limited_calls"] = (
+                    self.counters.get("physical_global_broker_limited_calls", 0) + 1
+                )
+            usable = min(usable, global_available)
         chunk_budget = usable // chunk_cost
         backed_chunks = set(self.precommitted)
         if self.arenas:

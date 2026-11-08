@@ -58,6 +58,33 @@ def _should_plan_future_waiting(mode, waiting_queue, *, prefill, steps, observe)
     )
 
 
+def _broker_snapshot(tracker):
+    """Return a validated aggregate VMM snapshot, or None when disabled."""
+
+    value = getattr(tracker.backing, "broker_snapshot", None)
+    if value is None:
+        return None
+    if callable(value):
+        value = value()
+    if value is None:
+        return None
+    try:
+        capacity = int(value["capacity_bytes"])
+        outstanding = int(value["outstanding_bytes"])
+        available = int(value["available_bytes"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("invalid global VMM broker snapshot") from exc
+    if capacity < 1 or not 0 <= outstanding <= capacity:
+        raise RuntimeError("invalid global VMM broker snapshot")
+    if available != capacity - outstanding:
+        raise RuntimeError("inconsistent global VMM broker snapshot")
+    return {
+        "capacity_bytes": capacity,
+        "outstanding_bytes": outstanding,
+        "available_bytes": available,
+    }
+
+
 def _releasable(tracker, pages):
     return _releasable_counts(tracker, _chunk_release_counts(tracker, set(pages)))
 
@@ -362,7 +389,8 @@ class SchedulerBudget:
                  group_search_limit=256, deadline_guard_ms=DEFAULT_DEADLINE_GUARD_MS,
                  migration_time_cap_ms=0,
                  initial_migration_bandwidth_bytes_per_s=1 << 30,
-                 migration_bandwidth_ewma_alpha=0.25):
+                 migration_bandwidth_ewma_alpha=0.25,
+                 broker_headroom_bytes=0, broker_low_bytes=0):
         if max_group not in (1, 2, 3, 4):
             raise ValueError("max_group must be between 1 and 4")
         if group_search_limit < 1:
@@ -371,6 +399,12 @@ class SchedulerBudget:
             raise ValueError("deadline_guard_ms must be nonnegative")
         if migration_time_cap_ms < 0:
             raise ValueError("migration_time_cap_ms must be nonnegative")
+        if broker_headroom_bytes < 0 or broker_low_bytes < 0:
+            raise ValueError("global broker watermarks must be nonnegative")
+        if bool(broker_headroom_bytes) != bool(broker_low_bytes):
+            raise ValueError("global broker headroom and low watermark must be paired")
+        if broker_headroom_bytes and broker_low_bytes <= broker_headroom_bytes:
+            raise ValueError("global broker low watermark must exceed headroom")
         self.budget = budget
         self.headroom = headroom
         self.dwell = dwell
@@ -387,6 +421,8 @@ class SchedulerBudget:
         self.group_search_limit = group_search_limit
         self.deadline_guard_ms = deadline_guard_ms
         self.migration_time_cap_ms = migration_time_cap_ms
+        self.broker_headroom_bytes = broker_headroom_bytes
+        self.broker_low_bytes = broker_low_bytes
         self.migration_bandwidth = MigrationBandwidthEstimator(
             initial_migration_bandwidth_bytes_per_s,
             migration_bandwidth_ewma_alpha,
@@ -442,12 +478,18 @@ class SchedulerBudget:
                       "time_cap_rejections": 0,
                       "time_cap_rejections_demotion": 0,
                       "time_cap_rejections_promotion": 0,
+                      "global_broker_observations": 0,
+                      "global_broker_pressure_observations": 0,
+                      "global_broker_min_available_bytes": None,
+                      "global_broker_max_outstanding_bytes": 0,
+                      "global_broker_min_capacity_bytes": None,
                       "last_demotion_runtime_values": {},
                       "min_live_bytes": None, "max_live_bytes": 0,
                       "min_reclaimable_bytes": None, "max_reclaimable_bytes": 0}
         self.steps = 0
         self.forced = False
         self.last_change = float("-inf")
+        self.broker_low_since = None
 
     def publish(self):
         if self.stats_path is not None:
@@ -525,6 +567,34 @@ class SchedulerBudget:
             self.stats[high] = max(self.stats[high], value)
         return reclaimable
 
+    def observe_broker(self, states):
+        """Record the tightest aggregate VMM state across tensor-parallel ranks."""
+
+        if not self.broker_headroom_bytes:
+            return None
+        capacities = [int(item[5]) for item in states]
+        available = [int(item[4]) for item in states]
+        if any(capacity < 1 for capacity in capacities):
+            raise RuntimeError("invalid global VMM broker capacity")
+        minimum_available = min(available)
+        maximum_capacity = max(capacities)
+        self.stats["global_broker_observations"] += 1
+        previous = self.stats["global_broker_min_available_bytes"]
+        self.stats["global_broker_min_available_bytes"] = (
+            minimum_available if previous is None else min(previous, minimum_available)
+        )
+        previous_capacity = self.stats["global_broker_min_capacity_bytes"]
+        self.stats["global_broker_min_capacity_bytes"] = (
+            maximum_capacity
+            if previous_capacity is None
+            else min(previous_capacity, maximum_capacity)
+        )
+        self.stats["global_broker_max_outstanding_bytes"] = max(
+            self.stats["global_broker_max_outstanding_bytes"],
+            max(capacity - value for capacity, value in zip(capacities, available)),
+        )
+        return minimum_available
+
     def observe_future_prefill(self, plan, effective_headroom=0, *, tp_fallback=False,
                                boundary="prefill"):
         """Publish the latest bounded waiting-queue reservation snapshot."""
@@ -592,19 +662,41 @@ class SchedulerBudget:
         backed = tracker.backing.backed_bytes
         self.stats["max_observed_backed_bytes"] = max(self.stats["max_observed_backed_bytes"], backed)
         if not prefill and not force and not force_promote and not future_headroom and (
-                not self.budget or self.steps % self.observe):
+                not (self.budget or self.broker_headroom_bytes)
+                or self.steps % self.observe):
             return
-        local = (backed, force, now - self.last_change >= self.dwell, force_promote)
+        snapshot = _broker_snapshot(tracker)
+        if self.broker_headroom_bytes and snapshot is None:
+            raise RuntimeError("global broker pressure requires a broker-enabled VMM backing")
+        local = (
+            backed, force, now - self.last_change >= self.dwell, force_promote,
+            None if snapshot is None else snapshot["available_bytes"],
+            None if snapshot is None else snapshot["capacity_bytes"],
+        )
         states = exchange(local)
+        if self.broker_headroom_bytes and any(
+                item[4] is None or item[5] is None for item in states):
+            raise RuntimeError("global broker pressure must be configured on every TP rank")
+        broker_available = self.observe_broker(states)
         headroom = future_headroom
         if prefill:
             headroom = max(self.headroom, headroom)
-        pressure = self.budget > 0 and max(item[0] for item in states) + headroom > self.budget
+        local_pressure = (
+            self.budget > 0
+            and max(item[0] for item in states) + headroom > self.budget
+        )
+        broker_pressure = (
+            self.broker_headroom_bytes > 0
+            and broker_available < self.broker_headroom_bytes
+        )
+        pressure = local_pressure or broker_pressure
         force = all(item[1] for item in states)
         reclaimable = self.observe_backing(tracker)
         peak = max(item[0] for item in states) + headroom
         if pressure:
             self.stats["pressure_observations"] += 1
+            if broker_pressure:
+                self.stats["global_broker_pressure_observations"] += 1
             if future_headroom > 0:
                 key = (
                     "future_prefill_pressure_observations"
@@ -613,8 +705,21 @@ class SchedulerBudget:
                 self.stats[key] += 1
             self.low_since = None
             self.trim_slack(coordinator, tracker, exchange, synchronize, reclaimable)
-            peak = max(exchange(tracker.backing.backed_bytes)) + headroom
-            pressure = peak > self.budget
+            post_snapshot = _broker_snapshot(tracker)
+            post_local = (
+                tracker.backing.backed_bytes, local[1], local[2], local[3],
+                None if post_snapshot is None else post_snapshot["available_bytes"],
+                None if post_snapshot is None else post_snapshot["capacity_bytes"],
+            )
+            states = exchange(post_local)
+            broker_available = self.observe_broker(states)
+            peak = max(item[0] for item in states) + headroom
+            local_pressure = self.budget > 0 and peak > self.budget
+            broker_pressure = (
+                self.broker_headroom_bytes > 0
+                and broker_available < self.broker_headroom_bytes
+            )
+            pressure = local_pressure or broker_pressure
         if self.trim_low_water and self.low and not pressure and not force and peak >= self.low:
             live = len(tracker.refs) * tracker.chunk_bytes
             host_long = any(
@@ -635,9 +740,27 @@ class SchedulerBudget:
         elif self.low_since is None:
             self.low_since = now
         stable = self.low_since is not None and now - self.low_since >= self.stable
+        if self.broker_headroom_bytes:
+            broker_relaxed = broker_available >= self.broker_low_bytes
+            if broker_relaxed:
+                if self.broker_low_since is None:
+                    self.broker_low_since = now
+            else:
+                self.broker_low_since = None
+            broker_stable = (
+                self.broker_low_since is not None
+                and now - self.broker_low_since >= self.stable
+            )
+            recovery_stable = broker_stable
+        else:
+            recovery_stable = True
         forced_up = all(item[3] for item in states)
-        if not pressure and not force and (self.low or self.promote_step):
-            can_promote = all(exchange(stable and local[2]))
+        if not pressure and not force and (
+                self.low or self.promote_step or self.broker_headroom_bytes):
+            can_promote = all(exchange(
+                recovery_stable and local[2]
+                and (stable if self.low or self.promote_step else True)
+            ))
             if forced_up or can_promote:
                 self.promote(batch, coordinator, exchange, synchronize, forced_up, now)
             return
@@ -1001,6 +1124,12 @@ def install_scheduler_budget():
     time_cap_ms = int(os.environ.get(
         "EKV_ADAPTIVE_MIGRATION_TIME_CAP_MS", "0"
     ))
+    broker_headroom = int(os.environ.get(
+        "EKV_ADAPTIVE_GLOBAL_BROKER_HEADROOM_BYTES", "0"
+    ))
+    broker_low = int(os.environ.get(
+        "EKV_ADAPTIVE_GLOBAL_BROKER_LOW_BYTES", "0"
+    ))
     initial_bandwidth_mib_s = float(os.environ.get(
         "EKV_ADAPTIVE_INITIAL_BANDWIDTH_MIB_S", "1024"
     ))
@@ -1037,16 +1166,18 @@ def install_scheduler_budget():
             "EKV_FUTURE_PREFILL_AUTO_RESIDENT_TOKENS", "128"
         )),
     )
-    if (not budget and not force and not promote and not time_cap_ms
+    if (not budget and not broker_headroom and not force and not promote and not time_cap_ms
             and future_mode == "off"):
         return
-    if (min(budget, headroom, force, dwell, low, stable, promote) < 0
+    if (min(budget, broker_headroom, broker_low, headroom, force, dwell, low, stable, promote) < 0
             or observe < 1 or cap < 1 or group_search_limit < 1
             or deadline_guard_ms < 0
             or time_cap_ms < 0 or not math.isfinite(initial_bandwidth_mib_s)
             or initial_bandwidth_mib_s <= 0
             or not 0 < bandwidth_ewma_alpha <= 1
             or max_group not in (1, 2, 3, 4)
+            or bool(broker_headroom) != bool(broker_low)
+            or (broker_headroom and broker_low <= broker_headroom)
             or (low and low >= budget) or (promote and (not force or promote <= force))):
         raise ValueError("adaptive scheduler settings must be nonnegative")
     if future_mode == "enforce" and budget <= 0:
@@ -1084,7 +1215,7 @@ def install_scheduler_budget():
                 budget, headroom, dwell, force, low, stable, observe, promote, stats_path, cap, max_group, capture_plans,
                 trim_low_water, group_search_limit, deadline_guard_ms,
                 time_cap_ms, int(initial_bandwidth_mib_s * (1 << 20)),
-                bandwidth_ewma_alpha)
+                bandwidth_ewma_alpha, broker_headroom, broker_low)
 
         def exchange(value):
             if coordinator.tp_world_size == 1:
@@ -1144,7 +1275,7 @@ def install_scheduler_budget():
 
     @wraps(prefill)
     def before_prefill(self, running_batch):
-        if (future_mode != "off" or budget) and (
+        if (future_mode != "off" or budget or broker_headroom) and (
                 self.waiting_queue or self.chunked_req is not None):
             run(self, running_batch, True)
         return prefill(self, running_batch)

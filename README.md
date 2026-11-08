@@ -106,9 +106,35 @@ with V5 to bound SGLang's allocator `available_size()` by current device free
 memory, the configured prefill headroom and the exact cost of committing a new
 VMM chunk. Already mapped holes and precommitted chunks remain usable, so the
 scheduler reduces an extend or decode batch only when its low-ID free prefix
-actually needs unmapped backing. The gate remains inside one process; it is not
-yet a cross-instance reservation or a guarantee against concurrent allocator
-races.
+actually needs unmapped backing.
+
+For two or more processes on one physical GPU, point them at the same SQLite
+broker file and give it one aggregate VMM capacity:
+
+```bash
+--elastic-global-broker-path /run/ekv/gpu0.sqlite \
+--elastic-global-broker-mib 6144
+```
+
+Each `Backing` reserves chunk leases before `cuMemMap` and returns them only
+after a successful unmap or close; a partial mapping failure or failed teardown
+keeps the leases reserved. The generic dense path also subtracts the broker's
+current free bytes from native physical admission. For TP or other multi-GPU
+launches, pass a directory or a `{gpu}` path template so every physical GPU gets
+its own state file, for example `/run/ekv/gpu-{gpu}.sqlite`. Resource metadata
+rejects accidental reuse of one file across GPUs.
+
+The MiniMax scheduler can consume the same broker state. Set
+`EKV_ADAPTIVE_GLOBAL_BROKER_HEADROOM_BYTES` to the local VMM bytes it should
+keep available and `EKV_ADAPTIVE_GLOBAL_BROKER_LOW_BYTES` to the higher recovery
+watermark. Aggregate exhaustion then triggers the existing safe demotion path,
+and promotion waits for stable recovery. Both values are required together and
+the low watermark must be higher. This is cooperative pressure, not a command
+to forcibly unmap another process: every participating instance must run a
+scheduler boundary. The mechanism covers VMM-backed KV only, uses first-come
+leases, does not include weights, PyTorch workspace or activation allocations,
+does not enforce per-model fairness, and cannot preempt live KV in a process
+that does not participate.
 
 `EKV_PREFILL_HEADROOM_SCOPED=1` (or `--elastic-prefill-headroom-scoped`) makes
 the static fallback apply only while native prefill admission is active.
@@ -218,8 +244,8 @@ See the [integration map](docs/INTEGRATION.md) for changed components, Graph lif
 - VMM admission completes before the allocator publishes IDs to the forward pass. Reclamation waits for device work to finish. Slot zero remains backed.
 - `v0` and `v1` reclaim empty chunks on logical frees. The later arms defer reclamation until the instance is idle; they therefore do not promise prompt return of all slack under a permanently busy workload.
 - A fixed virtual address is not sufficient to make arbitrary unmapping safe. SGLang Graph padding uses a permanently backed sink row and maps real slots before replay. Overlap scheduling, speculative decoding, HiCache/PD transfers, prefix-cache retention and hybrid recurrent states remain unsupported. vLLM Graph execution remains unsupported.
-- CUDA allocation failures are fail-stop. A successfully mapped earlier plane may remain allocated until worker teardown if a later plane fails. There is no tested transactional OOM recovery, multi-tenant fairness or process-failure broker.
-- Two instances can independently release unused backing to the driver. The shared-GPU experiment does not implement a global admission broker, transfer live KV, force physical OOM or demonstrate safe preemption of another model.
+- CUDA allocation failures are fail-stop. A successfully mapped earlier plane may remain allocated until worker teardown if a later plane fails. There is no transactional OOM recovery or multi-tenant fair share; the optional broker recovers a dead owner's leases only after proving the process or boot generation is gone.
+- A shared SQLite VMM broker can prevent independently mapped K/V chunks from exceeding one configured aggregate capacity, and both instances still release idle backing to the driver. It has no per-model fair share, live-KV transfer, forced physical OOM or safe preemption of another model. Model weights and activation allocators remain outside its budget.
 - Optional V5 activation policies measure prefill demand, trim unused retained KV chunks before prefill under pressure, and return actually releasable PyTorch cache before new VMM commitment. They never evict live KV or release Graph pools. Headroom is empirical; unresolved pressure is recorded, not converted into scheduler backpressure. This is not a guaranteed activation-budget lender or OOM recovery system.
 
 ## Related work

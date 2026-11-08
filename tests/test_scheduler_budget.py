@@ -100,6 +100,91 @@ class SchedulerBudgetTest(unittest.TestCase):
         self.assertEqual(policy.stats["future_decode_pressure_observations"], 1)
         self.assertEqual(policy.stats["future_prefill_pressure_observations"], 0)
 
+    def test_global_broker_headroom_can_trigger_prefill_pressure(self):
+        policy = SchedulerBudget(
+            0, 0, 0, 0, broker_headroom_bytes=10, broker_low_bytes=20
+        )
+        backing = B(
+            backed_bytes=40,
+            broker_snapshot={
+                "capacity_bytes": 100,
+                "outstanding_bytes": 91,
+                "available_bytes": 9,
+            },
+        )
+        tracker = B(
+            backing=backing, refs={}, chunk_bytes=40,
+            trim_quiescent=lambda: 0,
+        )
+        ctrl = B(
+            _ekv_resident=set(),
+            wait_for_pending_backup=lambda: None,
+            padded_buffer_size=0,
+            mem_pool_device=B(adaptive_vmm=tracker, page_size=1),
+        )
+        policy.boundary(
+            B(reqs=[]), ctrl, lambda value: (value, value), lambda: None,
+            prefill=True, now=0,
+        )
+        self.assertEqual(policy.stats["pressure_observations"], 1)
+        self.assertEqual(policy.stats["global_broker_pressure_observations"], 1)
+        self.assertEqual(policy.stats["global_broker_min_available_bytes"], 9)
+        self.assertEqual(policy.stats["global_broker_max_outstanding_bytes"], 91)
+
+    def test_global_broker_recovery_requires_low_watermark_stability(self):
+        policy = SchedulerBudget(
+            0, 0, 0, 0, stable=2,
+            broker_headroom_bytes=10, broker_low_bytes=20,
+        )
+        policy.promote = Mock()
+        backing = B(backed_bytes=40)
+        tracker = B(backing=backing, refs={}, chunk_bytes=40)
+        ctrl = B(
+            _ekv_resident=set(),
+            mem_pool_device=B(adaptive_vmm=tracker),
+        )
+        for now, available in ((0, 20), (1, 19), (2, 20), (3, 25), (4, 25)):
+            backing.broker_snapshot = {
+                "capacity_bytes": 100,
+                "outstanding_bytes": 100 - available,
+                "available_bytes": available,
+            }
+            policy.boundary(
+                B(reqs=[]), ctrl, lambda value: (value, value), lambda: None,
+                prefill=True, now=now,
+            )
+            self.assertEqual(policy.promote.call_count, int(now == 4))
+
+    def test_global_broker_pressure_requires_snapshot_on_every_rank(self):
+        policy = SchedulerBudget(
+            0, 0, 0, 0, broker_headroom_bytes=10, broker_low_bytes=20
+        )
+        tracker = B(
+            backing=B(
+                backed_bytes=40,
+                broker_snapshot={
+                    "capacity_bytes": 100,
+                    "outstanding_bytes": 80,
+                    "available_bytes": 20,
+                },
+            ),
+            refs={},
+            chunk_bytes=40,
+        )
+        ctrl = B(
+            _ekv_resident=set(),
+            mem_pool_device=B(adaptive_vmm=tracker),
+        )
+
+        def asymmetric_exchange(value):
+            return value, (*value[:4], None, None)
+
+        with self.assertRaisesRegex(RuntimeError, "every TP rank"):
+            policy.boundary(
+                B(reqs=[]), ctrl, asymmetric_exchange, lambda: None,
+                prefill=True, now=0,
+            )
+
     def test_base_prefill_headroom_does_not_inflate_decode_pressure(self):
         policy = SchedulerBudget(100, 10, 0, 0, observe=1)
         backing = B(backed_bytes=95)

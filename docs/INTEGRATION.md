@@ -29,7 +29,8 @@ uses its own audited adapter and does not pass through this generic MHA guard.
 | Pool construction | [adapter.py](../elastic_kv/adapter.py) | On 0.5.2, hook `ModelRunner.init_memory_pool`; on the newer API, replace the MHA class and allocator at their `mem_cache` import sites and wrap `KVCacheConfigurator.configure()`. Both routes replace `MHATokenToKVPool._create_buffers` to provide demand-backed K/V planes. |
 | Slot allocation | [adapter.py](../elastic_kv/adapter.py) | V5 tracks free ID ranges on the host, favors low IDs and admits ranges before writes. Contiguous allocations use slices of a persistent GPU ID tensor. Fragmented allocations return the selected IDs through the existing allocator interface. Physical admission mode bounds `available_size()` before SGLang builds a batch by charging prefill headroom only when the low-ID free prefix first touches an unmapped VMM chunk. |
 | Residency | [adapter.py](../elastic_kv/adapter.py) | V5 defers ordinary reclaim until the pool drains, synchronizes before unmapping and can retain a configurable low-ID chunk reserve with `EKV_RETAIN_CHUNKS`. `EKV_PRECOMMIT_CHUNKS` optionally precommits the next logical chunk and moves its zeroing to a private nonblocking CUDA stream; the first real `ensure` remains the readiness barrier. A global `EKV_PRECOMMIT_MAX_CHUNKS` cap bounds speculative physical backing. Logical capacity remains fixed. |
-| Startup | [launch.py](../elastic_kv/launch.py), [adapter.py](../elastic_kv/adapter.py) | Install hooks in the server process tree and reject unsupported configurations. |
+| Startup | [launch.py](../elastic_kv/launch.py), [adapter.py](../elastic_kv/adapter.py) | Install hooks in the server process tree, validate the optional aggregate VMM broker and reject unsupported configurations. |
+| Cross-process backing | [global_broker.py](../elastic_kv/global_broker.py), [backing.py](../elastic_kv/backing.py), [scheduler_budget.py](../adaptive_sparse/scheduler_budget.py) | Co-located SGLang processes share a per-GPU SQLite lease table. A chunk lease is acquired before `cuMemMap` and retained through partial failures until successful teardown. Dense V5 admission subtracts broker-wide free bytes; the MiniMax scheduler can use the same state as a high/low-water pressure signal for cooperative request demotion and delayed promotion. |
 
 ## Decode CUDA Graph
 
@@ -68,8 +69,25 @@ budget through the native `available_size()` query, allowing `PrefillAdder` to
 reduce a batch before VMM commit. Already mapped free ranges and precommitted
 chunks remain available under pressure instead of being lost to a coarse
 chunks-to-tokens calculation. The prefill headroom remains an estimate, and
-transactional allocation failure, exact activation ownership and cross-process
-memory grants remain separate work.
+transactional allocation failure and exact activation ownership remain separate
+work. An optional [cross-process broker](../elastic_kv/global_broker.py) now
+leases aggregate VMM chunks before mapping and exposes its remaining bytes to
+dense V5 admission. Its capacity covers only mapped VMM backing, uses a
+first-come policy and does not preempt another process's live KV. A caller that
+never reaches the broker, such as another runtime's original CUDA allocator,
+remains outside the guarantee. Dead owners are reclaimed only after the stale
+interval when their PID is gone or the boot ID changed; a live hung owner keeps
+its lease because invalidating it could overcommit still-mapped memory.
+
+Use a directory or a `{gpu}` path template for a multi-GPU launch. The broker
+uses CUDA visibility metadata (or the device index as a fallback) to validate
+that one state file is not accidentally shared by different physical GPUs.
+MiniMax pressure is opt-in through
+`EKV_ADAPTIVE_GLOBAL_BROKER_HEADROOM_BYTES` and
+`EKV_ADAPTIVE_GLOBAL_BROKER_LOW_BYTES`; the former triggers demand reduction and
+the latter provides stability hysteresis before a promotion. This path depends
+on every participating instance reaching its scheduler hook, so it is
+cooperative admission rather than forced cross-process eviction.
 
 `EKV_PREFILL_HEADROOM_SCOPED=1` makes the fallback headroom prefill-only;
 decode admission no longer pays for scratch that is not live. A positive
@@ -99,6 +117,7 @@ backing while keeping the sink resident. vLLM retains its software block
 table and logical paging. See [vLLM adapter](../vllm_integration/adapter.py)
 and [launcher](../vllm_integration/launch.py).
 
-Mixed Full/SWA/Mamba pools, live KV eviction and a global memory broker
-remain separate integration targets. Removing attention's software page
-lookup requires changes to the kernel and indexing path in addition to VMM.
+Mixed Full/SWA/Mamba pools, live KV eviction, per-model fair shares and
+cross-process KV preemption remain separate integration targets. Removing
+attention's software page lookup requires changes to the kernel and indexing
+path in addition to VMM.

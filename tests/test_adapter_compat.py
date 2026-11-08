@@ -434,6 +434,32 @@ class AdapterCompatibilityTest(unittest.TestCase):
         self.assertEqual(ctrl.counters["physical_headroom_bytes"], 500)
         self.assertEqual(ctrl.counters["physical_limited_calls"], 1)
 
+    def test_physical_admission_is_capped_by_global_broker_remaining_bytes(self):
+        ctrl = object.__new__(adapter.Residency)
+        ctrl.admission_policy = "physical"
+        ctrl.pool = SimpleNamespace(device="cuda:0")
+        ctrl.arenas = [SimpleNamespace(
+            planes=1,
+            mapped_chunks={0},
+            backing=SimpleNamespace(broker_available_bytes=1_000),
+        )]
+        ctrl.chunk_bytes = 1_000
+        ctrl.slot_bytes = 100
+        ctrl.prefill_headroom_bytes = 0
+        ctrl.counters = {}
+        ctrl.precommitted = set()
+
+        with patch.object(
+            adapter.torch.cuda, "mem_get_info", return_value=(10_000, 10_000)
+        ):
+            admitted = ctrl.physical_available_tokens(30, [(1, 31)])
+
+        self.assertEqual(admitted, 19)
+        self.assertEqual(
+            ctrl.counters["physical_global_broker_available_bytes"], 1_000
+        )
+        self.assertEqual(ctrl.counters["physical_global_broker_limited_calls"], 1)
+
     def test_logical_admission_does_not_query_cuda(self):
         ctrl = object.__new__(adapter.Residency)
         ctrl.admission_policy = "logical"

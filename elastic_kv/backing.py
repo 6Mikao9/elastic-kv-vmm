@@ -10,6 +10,8 @@ from pathlib import Path
 
 import torch
 
+from .global_broker import GlobalAdmissionBroker
+
 
 DEFAULT_CHUNK_BYTES = 2 << 20
 _INVALID = (1 << 64) - 1
@@ -33,6 +35,65 @@ def _load_library(path):
     lib.ev_error.argtypes = []
     lib.ev_error.restype = ct.c_char_p
     return lib
+
+
+def _gpu_resource_id(device):
+    """Return a stable physical-device hint for broker state validation."""
+
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible not in (None, "", "-1", "NoDevices"):
+        entries = [entry.strip() for entry in visible.split(",")]
+        if 0 <= device < len(entries) and entries[device]:
+            return f"cuda-visible:{entries[device]}"
+    try:
+        if torch.cuda.is_available():
+            properties = torch.cuda.get_device_properties(device)
+            uuid = getattr(properties, "uuid", None)
+            if uuid is not None:
+                return f"cuda-uuid:{uuid}"
+    except (AssertionError, RuntimeError):
+        pass
+    return f"cuda-index:{device}"
+
+
+def _resolve_broker_path(configured, resource_id):
+    safe_id = "".join(
+        character if character.isalnum() or character in "-._" else "_"
+        for character in resource_id
+    )
+    expanded = Path(configured.replace("{gpu}", safe_id)).expanduser()
+    if (
+        expanded.is_dir()
+        or configured.endswith("/")
+        or configured.endswith("\\")
+    ):
+        expanded.mkdir(parents=True, exist_ok=True)
+        return str(expanded / f"elastic-kv-{safe_id}.sqlite")
+    return str(expanded)
+
+
+class _BackingLifecycle:
+    """Own native and broker teardown without retaining the Backing object."""
+
+    def __init__(self, library, handle):
+        self.library = library
+        self.handle = handle
+        self.broker = None
+
+    def close(self):
+        if self.handle:
+            if self.library.ev_close(self.handle):
+                error = self.library.ev_error().decode("utf-8", errors="replace")
+                return "native", error or "native VMM close failed"
+            self.handle = None
+        if self.broker is not None:
+            broker = self.broker
+            try:
+                broker.close()
+            except Exception as exc:
+                return "broker", str(exc) or type(exc).__name__
+            self.broker = None
+        return "closed", None
 
 
 class Backing:
@@ -63,7 +124,8 @@ class Backing:
         self._handle = self._lib.ev_create(self.device, self.capacity_bytes, self.chunk_bytes)
         if not self._handle:
             raise RuntimeError(self._error())
-        self._finalizer = weakref.finalize(self, self._lib.ev_close, self._handle)
+        self._lifecycle = _BackingLifecycle(self._lib, self._handle)
+        self._finalizer = weakref.finalize(self, self._lifecycle.close)
         self._finalizer.atexit = False
         self.base = self._number("ev_base")
         self.reserved_bytes = self._number("ev_reserved")
@@ -72,6 +134,39 @@ class Backing:
         self._precommitted = set()
         self._raw_ref = None
         self._poisoned = False
+        self._broker = None
+        self._broker_leases = set()
+        try:
+            broker_path = os.environ.get("EKV_GLOBAL_BROKER_PATH")
+            broker_mib = int(os.environ.get("EKV_GLOBAL_BROKER_MIB", "0"))
+            if bool(broker_path) != (broker_mib > 0):
+                raise ValueError(
+                    "global VMM broker requires both EKV_GLOBAL_BROKER_PATH and "
+                    "a positive EKV_GLOBAL_BROKER_MIB"
+                )
+            if broker_path:
+                stale = float(
+                    os.environ.get("EKV_GLOBAL_BROKER_STALE_SECONDS", "120")
+                )
+                if stale <= 0:
+                    raise ValueError(
+                        "EKV_GLOBAL_BROKER_STALE_SECONDS must be positive"
+                    )
+                resource_id = _gpu_resource_id(self.device)
+                self._broker = GlobalAdmissionBroker(
+                    _resolve_broker_path(broker_path, resource_id),
+                    broker_mib << 20,
+                    stale_after_seconds=stale,
+                    heartbeat_seconds=max(0.1, min(30.0, stale / 3)),
+                    resource_id=resource_id,
+                )
+                self._lifecycle.broker = self._broker
+        except Exception:
+            try:
+                self.close()
+            except Exception:
+                pass
+            raise
         self._metrics = {
             "ensure_calls": 0,
             "ensure_chunks": 0,
@@ -84,6 +179,9 @@ class Backing:
             "reclaim_ns": 0,
             "reclaim_sync_ns": 0,
             "peak_backed_bytes": 0,
+            "global_broker_reservations": 0,
+            "global_broker_denials": 0,
+            "global_broker_released_chunks": 0,
         }
 
     def _error(self):
@@ -123,11 +221,57 @@ class Backing:
 
     @property
     def metrics(self):
-        return {
+        result = {
             **self._metrics,
             "backed_bytes": self.backed_bytes,
             "reserved_bytes": self.reserved_bytes,
         }
+        if self._broker is not None:
+            result["global_broker"] = self._broker.snapshot()
+        return result
+
+    @property
+    def broker_available_bytes(self):
+        snapshot = self.broker_snapshot
+        return None if snapshot is None else snapshot["available_bytes"]
+
+    @property
+    def broker_snapshot(self):
+        return None if self._broker is None else self._broker.snapshot()
+
+    def _broker_key(self, index):
+        return f"{self._broker.owner_id}/device-{self.device}/chunk-{index}"
+
+    def _reserve_broker(self, indices):
+        if self._broker is None or not indices:
+            return ()
+        decision = self._broker.reserve(
+            {self._broker_key(index): self.chunk_bytes for index in indices}
+        )
+        if not decision.admit:
+            self._metrics["global_broker_denials"] += 1
+            raise RuntimeError(
+                "global VMM capacity exhausted: "
+                f"required={decision.required_bytes} "
+                f"available={decision.available_bytes}"
+            )
+        self._broker_leases.update(decision.acquired_keys)
+        self._metrics["global_broker_reservations"] += len(decision.acquired_keys)
+        return decision.acquired_keys
+
+    def _release_broker(self, indices):
+        if self._broker is None or not indices:
+            return
+        keys = tuple(
+            self._broker_key(index)
+            for index in indices
+            if self._broker_key(index) in self._broker_leases
+        )
+        if not keys:
+            return
+        self._broker.release(keys)
+        self._broker_leases.difference_update(keys)
+        self._metrics["global_broker_released_chunks"] += len(keys)
 
     @property
     def raw(self):
@@ -164,6 +308,9 @@ class Backing:
         if not needs_initialization:
             return 0
         start = time.perf_counter_ns()
+        self._reserve_broker(pending)
+        # A failed batch may have mapped a prefix. Keep every lease until a
+        # successful close proves that no native mapping remains.
         self._batch("ev_ensure", pending)
         self._mapped.update(pending)
         self._precommitted.clear()
@@ -187,6 +334,8 @@ class Backing:
         if not pending:
             return 0
         start = time.perf_counter_ns()
+        self._reserve_broker(pending)
+        # As with ensure(), an error can follow a partial native mapping.
         self._batch("ev_precommit", pending)
         self._mapped.update(pending)
         self._precommitted.update(pending)
@@ -215,6 +364,7 @@ class Backing:
         self._batch("ev_drop", pending)
         self._mapped.difference_update(pending)
         self._precommitted.difference_update(pending)
+        self._release_broker(pending)
         self._metrics["reclaim_ns"] += time.perf_counter_ns() - start
         self._metrics["reclaim_calls"] += 1
         self._metrics["reclaim_chunks"] += len(pending)
@@ -222,11 +372,14 @@ class Backing:
 
     def close(self):
         """Close once no tensor view, kernel, or transfer can access backing."""
-        if not self._handle:
-            return
+        stage, message = self._lifecycle.close()
         self._handle = None
-        status = self._finalizer()
-        self._mapped.clear()
-        self._precommitted.clear()
-        if status:
-            raise RuntimeError(self._error())
+        if stage != "closed":
+            self._poisoned = True
+            raise RuntimeError(f"{stage} VMM teardown failed: {message}")
+        self._finalizer.detach()
+        self._broker = None
+        self._broker_leases.clear()
+        if self._lifecycle.handle is None:
+            self._mapped.clear()
+            self._precommitted.clear()

@@ -22,6 +22,8 @@ python -m elastic_kv \
   --elastic-prefill-headroom-scoped \
   --elastic-prefill-workspace-bytes-per-token 1536 \
   --elastic-prefill-workspace-max-mib 1024 \
+  --elastic-global-broker-path /run/ekv/gpu0.sqlite \
+  --elastic-global-broker-mib 6144 \
   --model-path /models/Qwen3-0.6B-Base \
   --attention-backend triton \
   --page-size 1 \
@@ -55,6 +57,9 @@ SGLang or touch CUDA.
 | `--elastic-future-ordering-horizon-ms` | `0` | nonnegative; zero keeps native horizon behavior |
 | `--elastic-stats-path` | unset | atomic JSON telemetry destination |
 | `--elastic-future-stats-path` | unset | separate future-hook telemetry destination |
+| `--elastic-global-broker-path` | unset | shared SQLite state for one physical GPU |
+| `--elastic-global-broker-mib` | `0` | aggregate VMM backing capacity; must be positive with a path |
+| `--elastic-global-broker-stale-seconds` | `120` | minimum age before a demonstrably dead owner's leases are recovered |
 
 The CLI currently launches the guarded dense-MHA scope documented in
 [integration](INTEGRATION.md). Unsupported SGLang configurations fail at
@@ -68,8 +73,20 @@ Already mapped free slots and precommitted chunks consume no new backing and
 remain schedulable even when free device memory is tight. Use
 `--elastic-activation-policy both` to trim unreferenced VMM chunks and reclaim
 PyTorch cache under the same pressure gate. This reduces admission before VMM
-commit; it is not yet a cross-process reservation or a guarantee against a
-concurrent CUDA allocator race.
+commit. When a global broker is configured, the same gate also observes
+broker-wide remaining bytes.
+
+For multiple SGLang processes on one GPU, launch every broker-aware process with
+the same `--elastic-global-broker-path` and the same aggregate
+`--elastic-global-broker-mib`. For multi-GPU launches, use a directory path or
+a `{gpu}` template such as `/run/ekv/gpu-{gpu}.sqlite`. The SQLite transaction is
+the cross-process admission point, and a lease is kept until the corresponding
+chunk is unambiguously unmapped. This coordinates VMM backing only. Weights,
+PyTorch caches and activations are outside the capacity, admission is first-come
+rather than fair, and another process's live KV is not forcibly preempted.
+Stale leases are removed only when the owner process is provably gone or the
+machine boot ID changed; failed mapping or teardown therefore fails safe by
+retaining capacity until a later successful close or crash recovery.
 
 The dynamic path is opt-in. At `Scheduler.get_new_batch_prefill`, the adapter
 sums remaining prompt tokens in the waiting queue and the chunked request,
@@ -108,6 +125,17 @@ guard tier, demotion candidate efficiency is adjusted by hint weight,
 remaining decode work and shared-prefix reuse potential. Missing hints remain
 neutral. The option changes only candidate ordering after the existing
 adaptive budget and migration safety checks have already triggered.
+
+To make MiniMax request residency react to shared-GPU VMM pressure, set both
+`EKV_ADAPTIVE_GLOBAL_BROKER_HEADROOM_BYTES` and
+`EKV_ADAPTIVE_GLOBAL_BROKER_LOW_BYTES`. The first is the aggregate free-byte
+headroom that triggers the normal demotion path; the second is the higher
+free-byte threshold that must remain stable before promotion is allowed. The
+low watermark must exceed the trigger. Every TP rank must use a broker-enabled
+backing, and all participants must reach the scheduler hook. This is a
+cooperative multi-instance policy over VMM KV leases; it does not budget model
+weights or activation allocators and does not force eviction inside an
+uncooperative process.
 
 Set `--elastic-future-ordering-horizon-ms` (or `EKV_FUTURE_ORDERING_HORIZON_MS`)
 to make deadline reordering fall back to

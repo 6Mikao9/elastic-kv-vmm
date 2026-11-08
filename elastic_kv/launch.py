@@ -73,6 +73,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--elastic-future-ordering-horizon-ms", type=int)
     parser.add_argument("--elastic-stats-path")
     parser.add_argument("--elastic-future-stats-path")
+    parser.add_argument("--elastic-global-broker-path")
+    parser.add_argument("--elastic-global-broker-mib", type=int)
+    parser.add_argument("--elastic-global-broker-stale-seconds", type=int)
     parser.add_argument(
         "--elastic-dry-run",
         action="store_true",
@@ -102,6 +105,9 @@ def resolve_config(argv: Sequence[str]) -> tuple[ElasticConfig, list[str], bool]
             args.elastic_prefill_workspace_bytes_per_token
         ),
         prefill_workspace_max_mib=args.elastic_prefill_workspace_max_mib,
+        global_broker_path=args.elastic_global_broker_path,
+        global_broker_mib=args.elastic_global_broker_mib,
+        global_broker_stale_seconds=args.elastic_global_broker_stale_seconds,
     )
     return config, sglang_argv, args.elastic_dry_run
 

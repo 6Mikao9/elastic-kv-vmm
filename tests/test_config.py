@@ -32,6 +32,9 @@ class ElasticConfigTest(unittest.TestCase):
                 "EKV_FUTURE_POLICY": "deadline",
                 "EKV_FUTURE_ORDERING_HORIZON_MS": "2000",
                 "EKV_FUTURE_STATS_PATH": "/tmp/future.json",
+                "EKV_GLOBAL_BROKER_PATH": "/tmp/gpu0-broker.sqlite",
+                "EKV_GLOBAL_BROKER_MIB": "6144",
+                "EKV_GLOBAL_BROKER_STALE_SECONDS": "90",
             }
         )
         self.assertEqual(config.chunk_mib, 4)
@@ -47,6 +50,9 @@ class ElasticConfigTest(unittest.TestCase):
         self.assertEqual(config.future_policy, "deadline")
         self.assertEqual(config.future_ordering_horizon_ms, 2000)
         self.assertEqual(config.future_stats_path, "/tmp/future.json")
+        self.assertEqual(config.global_broker_path, "/tmp/gpu0-broker.sqlite")
+        self.assertEqual(config.global_broker_mib, 6144)
+        self.assertEqual(config.global_broker_stale_seconds, 90)
 
     def test_activation_policy_requires_v5(self):
         with self.assertRaisesRegex(ValueError, "require elastic mode v5"):
@@ -80,6 +86,12 @@ class ElasticConfigTest(unittest.TestCase):
                 prefill_workspace_bytes_per_token=1,
             )
 
+    def test_global_broker_requires_path_and_positive_capacity_together(self):
+        with self.assertRaisesRegex(ValueError, "requires both a path"):
+            ElasticConfig(global_broker_path="/tmp/gpu0.sqlite")
+        with self.assertRaisesRegex(ValueError, "requires both a path"):
+            ElasticConfig(global_broker_mib=1024)
+
     def test_cli_overrides_leave_sglang_arguments_untouched(self):
         config, upstream, dry_run = resolve_config(
             [
@@ -104,6 +116,12 @@ class ElasticConfigTest(unittest.TestCase):
                 "1500",
                 "--elastic-future-stats-path",
                 "/tmp/future.json",
+                "--elastic-global-broker-path",
+                "/tmp/gpu0.sqlite",
+                "--elastic-global-broker-mib",
+                "6144",
+                "--elastic-global-broker-stale-seconds",
+                "90",
                 "--model-path",
                 "/models/qwen",
                 "--port",
@@ -123,6 +141,9 @@ class ElasticConfigTest(unittest.TestCase):
                 config.prefill_headroom_scoped,
                 config.prefill_workspace_bytes_per_token,
                 config.prefill_workspace_max_mib,
+                config.global_broker_path,
+                config.global_broker_mib,
+                config.global_broker_stale_seconds,
             ),
             (
                 "v5",
@@ -136,6 +157,9 @@ class ElasticConfigTest(unittest.TestCase):
                 True,
                 1536,
                 768,
+                "/tmp/gpu0.sqlite",
+                6144,
+                90,
             ),
         )
         self.assertEqual(upstream, ["--model-path", "/models/qwen", "--port", "30000"])
