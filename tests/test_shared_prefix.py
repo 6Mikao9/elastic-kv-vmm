@@ -181,6 +181,50 @@ class SharedPrefixTest(unittest.TestCase):
         self.assertIsNone(registry.resolve(1))
         self.assertEqual(registry.snapshot()["active_claims"], 2)
 
+    def test_only_exact_live_host_backed_consumers_count_for_donor(self):
+        registry = SharedPrefixRegistry()
+        source_request = request([1, 2, 3, 4])
+        source = make_prefix_claim(
+            source_request, group="system", shared_tokens=3
+        )
+        consumer = make_prefix_claim(
+            request([1, 2, 3, 8]), group="system", shared_tokens=3
+        )
+        peer = make_prefix_claim(
+            request([1, 2, 3, 9]), group="system", shared_tokens=3
+        )
+        mismatch = make_prefix_claim(
+            request([1, 2, 8, 9]), group="system", shared_tokens=3
+        )
+        shorter = make_prefix_claim(
+            request([1, 2, 3]), group="system", shared_tokens=2
+        )
+        peer_request = request([1, 2, 3, 9])
+        registry.register_source(2, peer_request, peer)
+        registry.register_source(0, source_request, source)
+        registry.register_claim(1, consumer)
+        registry.register_claim(3, mismatch)
+        registry.register_claim(4, shorter)
+
+        self.assertEqual(registry.active_donor_consumers(0), 1)
+        self.assertEqual(registry.active_donor_consumers(2), 0)
+        self.assertEqual(registry.resolve(1).row, 0)
+        self.assertEqual(registry.active_donor_consumers(3), 0)
+        self.assertEqual(registry.snapshot()["donor_consumers"], 1)
+        self.assertTrue(
+            registry.prefers_geometry_donor(0, group="system", tokens=3)
+        )
+        self.assertFalse(
+            registry.prefers_geometry_donor(2, group="system", tokens=3)
+        )
+
+        source_request.hisparse_staging = True
+        self.assertEqual(registry.active_donor_consumers(0), 0)
+        self.assertEqual(registry.active_donor_consumers(2), 1)
+        self.assertTrue(
+            registry.prefers_geometry_donor(2, group="system", tokens=3)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

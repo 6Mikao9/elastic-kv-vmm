@@ -226,6 +226,9 @@ class SharedPrefixRegistry:
             "missing_sources": 0,
             "staging_sources": 0,
             "inconsistent_group": 0,
+            "donor_lookups": 0,
+            "donor_consumers": 0,
+            "geometry_donor_lookups": 0,
         }
 
     def register_claim(self, row: int, claim: PrefixClaim) -> None:
@@ -262,6 +265,7 @@ class SharedPrefixRegistry:
             return None
         self.stats["lookups"] += 1
         inconsistent = False
+        matches = []
         for source in self._sources.values():
             if source.row == row or source.claim.group != claim.group:
                 continue
@@ -274,13 +278,67 @@ class SharedPrefixRegistry:
             if getattr(source.request, "hisparse_staging", False):
                 self.stats["staging_sources"] += 1
                 continue
+            matches.append(source)
+        if matches:
             self.stats["shared_hits"] += 1
-            return source
+            return min(matches, key=lambda candidate: candidate.row)
         if inconsistent:
             self.stats["inconsistent_group"] += 1
         else:
             self.stats["missing_sources"] += 1
         return None
+
+    def active_donor_consumers(self, row: int) -> int:
+        """Count live host-backed claims that resolve exactly to ``row``.
+
+        Sources are resident requests. Claims that are themselves sources are
+        excluded so two resident peers do not inflate each other's retention
+        value. A staging source cannot provide direct reuse and therefore
+        contributes no demand.
+        """
+
+        self._validate_row(row)
+        self.stats["donor_lookups"] += 1
+        source = self._sources.get(row)
+        if source is None or getattr(source.request, "hisparse_staging", False):
+            return 0
+        consumers = 0
+        for consumer_row, claim in self._claims.items():
+            if consumer_row == row or consumer_row in self._sources:
+                continue
+            selected = min((
+                candidate for candidate in self._sources.values()
+                if candidate.claim.group == claim.group
+                and candidate.claim.tokens == claim.tokens
+                and candidate.claim.fingerprint == claim.fingerprint
+                and not getattr(candidate.request, "hisparse_staging", False)
+            ), key=lambda candidate: candidate.row, default=None)
+            if selected is not None and selected.row == row:
+                consumers += 1
+        self.stats["donor_consumers"] += consumers
+        return consumers
+
+    def prefers_geometry_donor(self, row: int, *, group: str, tokens: int) -> bool:
+        """Return whether ``row`` is the canonical donor for a future forecast.
+
+        Waiting requests do not yet have a prefill fingerprint. Unique donor
+        selection therefore uses live-source insertion order plus group and
+        length. This only controls retention ranking; it never permits reuse.
+        """
+
+        self._validate_row(row)
+        if not isinstance(group, str) or not group:
+            raise ValueError("prefix group must be a non-empty string")
+        if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 1:
+            raise ValueError("shared prefix tokens must be positive")
+        self.stats["geometry_donor_lookups"] += 1
+        selected = min((
+            source for source in self._sources.values()
+            if source.claim.group == group
+            and source.claim.tokens == tokens
+            and not getattr(source.request, "hisparse_staging", False)
+        ), key=lambda source: source.row, default=None)
+        return selected is not None and selected.row == row
 
     def snapshot(self) -> dict[str, int]:
         result = dict(self.stats)

@@ -176,7 +176,11 @@ is specified in the [HiSparse reproduction guide](docs/HISPARSE_REPRODUCE.md).
 resolve complete Top-K blocks inside a verified shared prefix from another live
 full-resident request, avoiding host staging for that subset. The source must
 remain resident and matching tokens, adapters and request identity are checked
-before reuse. This CPU-validated path still needs paired MiniMax GPU
+before reuse. Under adaptive pressure, donor retention counts only exact active
+consumers or same-group/same-length consumers already visible in the waiting
+queue. The latter is a forecast: it does not bypass fingerprint checks or
+reduce a planning budget, and a prefix hint with no consumer remains neutral.
+This CPU-validated path still needs paired MiniMax GPU
 correctness, host-transfer and TPOT measurements; see [the direct shared-prefix
 runtime boundary](docs/SHARED_PREFIX_RUNTIME.md).
 

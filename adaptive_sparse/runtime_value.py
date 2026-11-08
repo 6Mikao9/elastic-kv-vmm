@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Hashable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fractions import Fraction
 from typing import Any
 
@@ -36,6 +36,8 @@ class RuntimeRequestValue:
     kind: str = "generic"
     prefix_group: str | None = None
     shared_prefix_tokens: int = 0
+    active_reuse_consumers: int = 0
+    future_reuse_consumers: int = 0
     hinted: bool = False
 
     def deadline_guarded(self, guard_ms: int = DEFAULT_DEADLINE_GUARD_MS) -> bool:
@@ -66,8 +68,76 @@ class RuntimeRequestValue:
             deadline_factor = 1.0 + min(
                 guard_ms / max(1.0, float(remaining_deadline)), 8.0
             )
-        shared_factor = 1.0 + min(max(0, self.shared_prefix_tokens) / 2048.0, 4.0)
+        # A prefix length alone is not a benefit. Keeping the donor resident
+        # only matters when another live or imminent host-backed request can
+        # reuse it. The forecast only orders demotions; the runtime still checks
+        # the complete token/adapter fingerprint before direct reuse.
+        active_reuse = self.shared_prefix_tokens * self.active_reuse_consumers
+        future_reuse = self.shared_prefix_tokens * self.future_reuse_consumers
+        reusable_tokens = max(0, active_reuse, future_reuse)
+        shared_factor = 1.0 + min(reusable_tokens / 2048.0, 4.0)
         return weight_factor * work_factor * deadline_factor * shared_factor
+
+
+@dataclass(frozen=True, slots=True)
+class PrefixReuseDemand:
+    """Evidence that a resident request can avoid another request's fetch."""
+
+    tokens: int
+    active_consumers: int = 0
+    future_consumers: int = 0
+
+    def __post_init__(self) -> None:
+        for name in ("tokens", "active_consumers", "future_consumers"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a nonnegative integer")
+
+    @property
+    def total_consumers(self) -> int:
+        return self.active_consumers + self.future_consumers
+
+
+def attach_prefix_reuse(
+    value: RuntimeRequestValue, demand: PrefixReuseDemand
+) -> RuntimeRequestValue:
+    """Return ``value`` annotated with live and forecast consumer evidence."""
+
+    tokens = min(value.shared_prefix_tokens, demand.tokens)
+    return replace(
+        value,
+        active_reuse_consumers=demand.active_consumers if tokens else 0,
+        future_reuse_consumers=demand.future_consumers if tokens else 0,
+    )
+
+
+def forecast_prefix_reuse(
+    requests: Iterable[Any],
+) -> dict[tuple[str, int], int]:
+    """Count potentially host-backed waiting consumers by identity geometry.
+
+    Token/adapter identity is intentionally not hashed on every scheduler tick.
+    This forecast only orders demotions, while the shared-prefix registry still
+    requires an exact fingerprint before a direct Top-K reuse. Explicit resident
+    requests are excluded; ``auto`` and ``host_backed`` hints remain candidates
+    because pressure may force ``auto`` onto the native HiSparse path.
+    """
+
+    from .sglang_future_hook import _extract_hint
+
+    demand: dict[tuple[str, int], int] = {}
+    for request in requests:
+        try:
+            hint = _extract_hint(request)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if hint is None or hint.residence == "resident":
+            continue
+        if hint.prefix_group is None or hint.shared_prefix_tokens < 1:
+            continue
+        key = (hint.prefix_group, hint.shared_prefix_tokens)
+        demand[key] = demand.get(key, 0) + 1
+    return demand
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,6 +306,8 @@ def evidence(value: RuntimeRequestValue | None, *, guard_ms: int) -> dict[str, o
         "kind": value.kind,
         "prefix_group": value.prefix_group,
         "shared_prefix_tokens": value.shared_prefix_tokens,
+        "active_reuse_consumers": value.active_reuse_consumers,
+        "future_reuse_consumers": value.future_reuse_consumers,
         "deadline_guarded": value.deadline_guarded(guard_ms),
         "retention_score": value.retention_score(guard_ms),
         "hinted": value.hinted,

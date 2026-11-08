@@ -2,7 +2,10 @@ import unittest
 from types import SimpleNamespace as NS
 
 from adaptive_sparse.runtime_value import (
+    PrefixReuseDemand,
     RuntimeRequestValue,
+    attach_prefix_reuse,
+    forecast_prefix_reuse,
     merge_demotion_values,
     rank_demotions,
     runtime_values,
@@ -90,13 +93,54 @@ class RuntimeValueTest(unittest.TestCase):
         ordinary = RuntimeRequestValue("ordinary")
         weighted = RuntimeRequestValue(
             "weighted", weight=16, remaining_output_tokens=512,
-            shared_prefix_tokens=4096,
+            shared_prefix_tokens=4096, active_reuse_consumers=1,
         )
         deadline = RuntimeRequestValue("deadline", deadline_remaining_ms=25)
         self.assertEqual(ordinary.retention_score(), 1.0)
         self.assertGreater(weighted.retention_score(), ordinary.retention_score())
         self.assertGreater(deadline.retention_score(), ordinary.retention_score())
         self.assertLess(weighted.retention_score(), 1_000_000)
+
+    def test_prefix_without_a_consumer_is_not_retained_by_default(self):
+        unused = RuntimeRequestValue("unused", shared_prefix_tokens=4096)
+        self.assertEqual(unused.retention_score(), 1.0)
+
+    def test_verified_or_forecast_consumers_increase_donor_value(self):
+        value = RuntimeRequestValue("donor", shared_prefix_tokens=4096)
+        active = attach_prefix_reuse(
+            value, PrefixReuseDemand(4096, active_consumers=1)
+        )
+        future = attach_prefix_reuse(
+            value, PrefixReuseDemand(4096, future_consumers=3)
+        )
+        self.assertGreater(active.retention_score(), value.retention_score())
+        self.assertGreater(future.retention_score(), active.retention_score())
+        self.assertEqual(active.active_reuse_consumers, 1)
+        self.assertEqual(future.future_reuse_consumers, 3)
+
+    def test_forecast_matches_group_and_length_but_excludes_resident_hint(self):
+        requests = [
+            hinted_request("host", payload={
+                "prefix_group": "system", "shared_prefix_tokens": 64,
+                "residence": "host_backed",
+            }),
+            hinted_request("auto", payload={
+                "prefix_group": "system", "shared_prefix_tokens": 64,
+                "residence": "auto",
+            }),
+            hinted_request("resident", payload={
+                "prefix_group": "system", "shared_prefix_tokens": 64,
+                "residence": "resident",
+            }),
+            hinted_request("other-length", payload={
+                "prefix_group": "system", "shared_prefix_tokens": 32,
+                "residence": "host_backed",
+            }),
+        ]
+        self.assertEqual(
+            forecast_prefix_reuse(requests),
+            {("system", 64): 2, ("system", 32): 1},
+        )
 
 
 if __name__ == "__main__":

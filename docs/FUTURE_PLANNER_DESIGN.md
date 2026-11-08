@@ -227,6 +227,16 @@ resident aggregate
 避免把不同内容误算成共享。已知未来准入会同时抵扣多个 imminent resident 请求
 之间的共享前缀，防止预留空间被重复计算。
 
+运行时 demotion 排序进一步区分“带前缀元数据”和“确有消费者”。只有
+`EKV_SHARED_PREFIX_REUSE=direct` 时，控制器才把以下证据计入 donor 的驻留价值：
+其他活跃 host-backed 请求通过完整 fingerprint 精确解析到该 donor；或 waiting
+queue 中存在同一 `prefix_group` 和相同 `shared_prefix_tokens` 的潜在 host-backed /
+auto 请求。后者只利用轻量几何匹配作为排序预测，不声称 Top-K 一定命中，也不抵扣
+规划预算；真正复用仍必须通过 token、adapter 与前缀 fingerprint 校验。因此一个请求
+单独携带 `shared_prefix_tokens` 不再自动获得高驻留分，没有消费者时保持中性。
+预测只覆盖已进入 SGLang waiting queue 的请求；尚未提交到服务端的远期计划仍需后续
+控制面通道，不能从当前队列状态推断。
+
 `elastic.future` payload 已能无损携带 `prefix_group` 和
 `shared_prefix_tokens`，但当前 SGLang 实跑范围仍关闭 radix cache，也没有把
 第二个请求直接绑定到第一个请求的完整驻留 KV。因此这一步已经完成的是确定性容量

@@ -27,6 +27,9 @@ from .migration import (
 )
 from .runtime_value import (
     DEFAULT_DEADLINE_GUARD_MS,
+    PrefixReuseDemand,
+    attach_prefix_reuse,
+    forecast_prefix_reuse,
     merge_demotion_values,
     rank_demotions,
     runtime_values,
@@ -404,6 +407,9 @@ class SchedulerBudget:
                       "runtime_value_hints": 0,
                       "runtime_value_invalid": 0,
                       "runtime_value_guarded": 0,
+                      "prefix_reuse_donors": 0,
+                      "prefix_reuse_active_consumers": 0,
+                      "prefix_reuse_future_consumers": 0,
                       "deadline_last_resort_actions": 0,
                       "last_demotion_runtime_values": {},
                       "min_live_bytes": None, "max_live_bytes": 0,
@@ -510,7 +516,7 @@ class SchedulerBudget:
             self.publish()
 
     def boundary(self, batch, coordinator, exchange, synchronize, *, prefill, now,
-                 future_headroom=0):
+                 future_headroom=0, future_prefix_demand=None):
         if (
             isinstance(future_headroom, bool)
             or not isinstance(future_headroom, int)
@@ -614,6 +620,47 @@ class SchedulerBudget:
                                           "predicted_chunks": sorted(chunks)}
 
         request_values, value_stats = runtime_values(batch.reqs, now_s=now)
+        future_prefix_demand = future_prefix_demand or {}
+        registry = getattr(coordinator, "_ekv_shared_prefixes", None)
+        for request in batch.reqs:
+            rid = getattr(request, "rid", None)
+            value = request_values.get(rid)
+            row = getattr(getattr(request, "kv", None), "req_pool_idx", None)
+            if value is None or not isinstance(row, int) or isinstance(row, bool):
+                continue
+            active_consumers = (
+                registry.active_donor_consumers(row) if registry is not None else 0
+            )
+            future_consumers = 0
+            if (
+                registry is not None
+                and value.prefix_group is not None
+                and value.shared_prefix_tokens > 0
+            ):
+                future_consumers = future_prefix_demand.get(
+                    (value.prefix_group, value.shared_prefix_tokens), 0
+                )
+                if future_consumers and not (
+                    registry.prefers_geometry_donor(
+                        row,
+                        group=value.prefix_group,
+                        tokens=value.shared_prefix_tokens,
+                    )
+                ):
+                    future_consumers = 0
+            if not active_consumers and not future_consumers:
+                continue
+            request_values[rid] = attach_prefix_reuse(
+                value,
+                PrefixReuseDemand(
+                    tokens=value.shared_prefix_tokens,
+                    active_consumers=active_consumers,
+                    future_consumers=future_consumers,
+                ),
+            )
+            self.stats["prefix_reuse_donors"] += 1
+            self.stats["prefix_reuse_active_consumers"] += active_consumers
+            self.stats["prefix_reuse_future_consumers"] += future_consumers
         self.stats["runtime_value_hints"] += value_stats["hinted"]
         self.stats["runtime_value_invalid"] += value_stats["invalid"]
         self.stats["runtime_value_guarded"] += sum(
@@ -890,6 +937,7 @@ def install_scheduler_budget():
     ))
     capture_plans = os.environ.get("EKV_ADAPTIVE_PLAN_CAPTURE") == "1"
     trim_low_water = os.environ.get("EKV_ADAPTIVE_TRIM_LOW_WATER") == "1"
+    shared_prefix_direct = os.environ.get("EKV_SHARED_PREFIX_REUSE") == "direct"
     future_mode = os.environ.get("EKV_FUTURE_PREFILL_MODE", "off")
     kind_activation_raw = json.loads(os.environ.get(
         "EKV_FUTURE_PREFILL_KIND_ACTIVATION_JSON", "{}"
@@ -991,10 +1039,19 @@ def install_scheduler_budget():
                 reservation, future_headroom, tp_fallback=tp_fallback,
                 boundary="prefill" if prefill else "decode",
             )
+        future_prefix_demand = (
+            forecast_prefix_reuse((
+                *self.waiting_queue,
+                *((self.chunked_req,) if self.chunked_req is not None else ()),
+            ))
+            if shared_prefix_direct and (self.waiting_queue or self.chunked_req is not None)
+            else {}
+        )
         controller.boundary(
             batch, coordinator, exchange,
             lambda: torch.cuda.synchronize(coordinator.mem_pool_device.device),
             prefill=prefill, now=now, future_headroom=future_headroom,
+            future_prefix_demand=future_prefix_demand,
         )
 
     prefill = cls.get_new_batch_prefill
