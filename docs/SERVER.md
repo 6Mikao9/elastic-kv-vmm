@@ -75,7 +75,10 @@ The MiniMax eager scheduler can additionally aggregate known-future waiting
 requests into a bounded prefill reservation.  Set
 `EKV_FUTURE_PREFILL_MODE=dry_run` to export demand without changing admission,
 or `enforce` with a positive `EKV_ADAPTIVE_BUDGET_BYTES` to trigger the existing
-prefill-pressure migration path. `EKV_FUTURE_PREFILL_HORIZON_MS`,
+pressure migration path. Prefill refreshes the plan on every boundary; decode
+refreshes it every `EKV_ADAPTIVE_OBSERVE_STEPS` so an imminent prefill can
+reclaim backing before the physical high-water mark is crossed. Fixed prefill
+scratch is applied only to prefill pressure. `EKV_FUTURE_PREFILL_HORIZON_MS`,
 `EKV_FUTURE_PREFILL_MAX_BYTES`,
 `EKV_FUTURE_PREFILL_ACTIVATION_BYTES_PER_TOKEN`,
 `EKV_FUTURE_PREFILL_KIND_ACTIVATION_JSON`, and

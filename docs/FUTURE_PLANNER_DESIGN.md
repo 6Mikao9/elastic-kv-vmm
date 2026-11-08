@@ -450,9 +450,11 @@ GPU 跳过；在线迁移开销、预测误差和端到端
 
 `adaptive_sparse/future_prefill.py` 把 waiting queue 中的 hint 聚合为一次有界
 预留。它只计算字节和建议，不分配 GPU 内存，也不会替代 `PrefillAdder`。每个
-prefill boundary 都从当前 queue 重新计算；没有跨 tick 的陈旧 reservation。因此
-请求离开队列或越过 `horizon` 后，旧建议自然失效。现有
-`EKV_ADAPTIVE_DWELL_SECONDS` 继续负责迁移防抖。
+prefill boundary 都从当前 queue 重新计算；decode 则在每
+`EKV_ADAPTIVE_OBSERVE_STEPS` 个真实运行步刷新一次，使即将到来的 prefill 不用
+等到主 KV 已经越线才触发降级。每次刷新都替换上一份建议；请求离开队列或越过
+`horizon` 后，旧建议自然失效。现有 `EKV_ADAPTIVE_DWELL_SECONDS` 继续负责迁移
+防抖。
 
 SGLang 0.5.17 源码审计确认 `get_new_batch_prefill()` 在进入
 `_get_new_batch_prefill_raw()` 后依次执行原生 priority、构造 `PrefillAdder`、
@@ -490,8 +492,9 @@ reservation = kv + prompt * activation_rate
 | `EKV_FUTURE_PREFILL_KIND_ACTIVATION_JSON` | `{}` | 按请求 `kind` 覆盖 activation bytes/token，例如 `{"tool":1536,"chat":1024}` |
 | `EKV_FUTURE_PREFILL_AUTO_RESIDENT_TOKENS` | `128` | `auto` 选择完整驻留的输出阈值 |
 
-`dry_run` 只写 telemetry；`enforce` 把 reservation 作为预填充边界的有效
-headroom，且要求 `EKV_ADAPTIVE_BUDGET_BYTES > 0`。有效 headroom 为
+`dry_run` 只写 telemetry；`enforce` 把 reservation 作为 prefill 与周期性
+decode 边界的有效 headroom，且要求 `EKV_ADAPTIVE_BUDGET_BYTES > 0`。prefill
+边界的有效 headroom 为
 
 ```text
 预测 KV bytes
@@ -503,12 +506,15 @@ headroom，且要求 `EKV_ADAPTIVE_BUDGET_BYTES > 0`。有效 headroom 为
 即将发生的原生分配腾出空间，并没有在 hint 到来时直接 `cuMemCreate` 整个预测
 块。activation 默认为零，必须在目标模型和 chunk 大小上标定后才能用于容量结论。
 
-每 rank telemetry 新增 `future_prefill_ticks`、`future_prefill_reserve_bytes`、
-`future_prefill_selected`、`future_prefill_effective_headroom_bytes`，以及
-deferred/missing/invalid/unestimated/capped/TP-fallback 和 reservation-pressure
-计数。当前只有 CPU 单元测试与 SGLang 源码接入证据；真实 GPU 上仍须比较 native、
-`dry_run`、`enforce` 三组，并同时观察 TTFT、TPOT、吞吐、OOM/retraction、迁移
-字节和整卡 NVML。
+decode 只使用 reservation 产生的 KV 与 activation 余量；固定 prefill scratch
+headroom 不会被永久加到 decode 高水位。每 rank telemetry 记录
+`future_plan_ticks`、`last_future_plan_boundary`、`future_prefill_ticks`、
+`future_prefill_reserve_bytes`、`future_prefill_selected`、
+`future_prefill_effective_headroom_bytes`，以及 decode/prefill pressure、
+deferred/missing/invalid/unestimated/capped/TP-fallback 计数。当前只有 CPU
+单元测试与 SGLang 源码接入证据；真实 GPU 上仍须比较 native、`dry_run`、
+`enforce` 三组，并同时观察 TTFT、TPOT、吞吐、OOM/retraction、迁移字节和整卡
+NVML。
 
 ### 5.4 请求准入的最短期未来预留
 

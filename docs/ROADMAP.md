@@ -61,10 +61,14 @@ requests inside a configurable horizon.  Request-level full or hot-set KV and
 an optional measured activation term are checked against one byte cap; TP
 ranks atomically fall back to zero reservation when their plans disagree.
 `dry_run` exports the demand, while `enforce` feeds it into the existing
-prefill-pressure migration path.  The planner never allocates for future
-requests and SGLang's `PrefillAdder` remains authoritative.  The activation
-coefficient defaults to zero until calibrated because no source-level estimate
-has yet been validated on the target MiniMax workload.
+prefill-pressure migration path. During decode, the waiting queue is refreshed
+every configured observation interval so a known imminent prefill can cause
+reclaim before backing already crosses the high-water mark. Fixed prefill
+scratch is included only at prefill boundaries; decode pressure uses predicted
+future demand without permanently inflating its watermark. The planner never
+allocates for future requests and SGLang's `PrefillAdder` remains authoritative.
+The activation coefficient defaults to zero until calibrated because no
+source-level estimate has yet been validated on the target MiniMax workload.
 
 Controlled-rollout planning now emits an executable submission schedule from
 the offline policy.  Each request carries its planned arrival, type, expected

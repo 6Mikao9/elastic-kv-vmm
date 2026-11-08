@@ -10,6 +10,7 @@ from adaptive_sparse.scheduler_budget import (
     _chunk_release_counts, _demand_index_demotion_groups,
     _indexed_demotion_groups, _rank_demotions,
     _releasable, _releasable_counts, _releasable_group, _releasable_pair,
+    _should_plan_future_waiting,
 )
 from adaptive_sparse.future_prefill import empty_plan
 from adaptive_sparse.runtime_value import RuntimeRequestValue, merge_demotion_values
@@ -20,7 +21,35 @@ class SchedulerBudgetTest(unittest.TestCase):
         policy = SchedulerBudget(100, 0, 0, 0)
         policy.observe_future_prefill(empty_plan("dry_run"), 0)
         self.assertEqual(policy.stats["future_prefill_ticks"], 1)
+        self.assertEqual(policy.stats["future_plan_ticks"], 1)
+        self.assertEqual(policy.stats["last_future_plan_boundary"], "prefill")
         self.assertEqual(policy.stats["future_prefill_selected"], 0)
+
+    def test_decode_future_plan_telemetry_is_distinct_from_prefill(self):
+        policy = SchedulerBudget(100, 0, 0, 0)
+        policy.observe_future_prefill(
+            empty_plan("dry_run"), 0, boundary="decode"
+        )
+        self.assertEqual(policy.stats["future_plan_ticks"], 1)
+        self.assertEqual(policy.stats["future_prefill_ticks"], 0)
+        self.assertEqual(policy.stats["last_future_plan_boundary"], "decode")
+
+    def test_future_waiting_cadence_is_immediate_for_prefill_and_periodic_for_decode(self):
+        self.assertTrue(_should_plan_future_waiting(
+            "enforce", [object()], prefill=True, steps=3, observe=16
+        ))
+        self.assertFalse(_should_plan_future_waiting(
+            "enforce", [object()], prefill=False, steps=14, observe=16
+        ))
+        self.assertTrue(_should_plan_future_waiting(
+            "enforce", [object()], prefill=False, steps=15, observe=16
+        ))
+        self.assertFalse(_should_plan_future_waiting(
+            "enforce", [], prefill=False, steps=15, observe=16
+        ))
+        self.assertFalse(_should_plan_future_waiting(
+            "off", [object()], prefill=True, steps=15, observe=16
+        ))
 
     def test_future_headroom_can_trigger_prefill_pressure(self):
         policy = SchedulerBudget(100, 10, 0, 0)
@@ -44,6 +73,46 @@ class SchedulerBudgetTest(unittest.TestCase):
         policy.boundary(
             B(reqs=[]), ctrl, lambda value: (value, value), lambda: None,
             prefill=True, now=0, future_headroom=11,
+        )
+        self.assertEqual(policy.stats["pressure_observations"], 0)
+
+    def test_future_headroom_can_trigger_pressure_during_decode(self):
+        policy = SchedulerBudget(100, 10, 0, 0, observe=16)
+        backing = B(backed_bytes=85)
+        tracker = B(
+            backing=backing,
+            refs={},
+            chunk_bytes=85,
+            trim_quiescent=lambda: 0,
+        )
+        ctrl = B(
+            _ekv_resident=set(),
+            wait_for_pending_backup=lambda: None,
+            padded_buffer_size=4,
+            mem_pool_device=B(adaptive_vmm=tracker, page_size=1),
+        )
+        batch = B(reqs=[], is_empty=lambda: False)
+        policy.boundary(
+            batch, ctrl, lambda value: (value, value), lambda: None,
+            prefill=False, now=0, future_headroom=20,
+        )
+        self.assertEqual(policy.stats["pressure_observations"], 1)
+        self.assertEqual(policy.stats["future_decode_pressure_observations"], 1)
+        self.assertEqual(policy.stats["future_prefill_pressure_observations"], 0)
+
+    def test_base_prefill_headroom_does_not_inflate_decode_pressure(self):
+        policy = SchedulerBudget(100, 10, 0, 0, observe=1)
+        backing = B(backed_bytes=95)
+        tracker = B(backing=backing, refs={}, chunk_bytes=95, trim_quiescent=lambda: 0)
+        ctrl = B(
+            _ekv_resident=set(),
+            wait_for_pending_backup=lambda: None,
+            mem_pool_device=B(adaptive_vmm=tracker, page_size=1),
+        )
+        policy.boundary(
+            B(reqs=[], is_empty=lambda: False), ctrl,
+            lambda value: (value, value), lambda: None,
+            prefill=False, now=0,
         )
         self.assertEqual(policy.stats["pressure_observations"], 0)
 

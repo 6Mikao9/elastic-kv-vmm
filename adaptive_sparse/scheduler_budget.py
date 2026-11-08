@@ -43,6 +43,16 @@ SCHEDULER_SHA256S = frozenset({
 LOG = logging.getLogger(__name__)
 
 
+def _should_plan_future_waiting(mode, waiting_queue, *, prefill, steps, observe):
+    """Return whether this scheduler boundary should refresh future demand."""
+
+    if observe < 1:
+        raise ValueError("observe must be positive")
+    return mode != "off" and bool(waiting_queue) and (
+        prefill or (steps + 1) % observe == 0
+    )
+
+
 def _releasable(tracker, pages):
     return _releasable_counts(tracker, _chunk_release_counts(tracker, set(pages)))
 
@@ -378,6 +388,7 @@ class SchedulerBudget:
                       "slack_reclaim_actions": 0, "slack_reclaim_bytes": 0,
                       "low_water_slack_actions": 0, "low_water_slack_bytes": 0,
                       "broker_rejected_promotions": 0,
+                      "future_plan_ticks": 0,
                       "future_prefill_ticks": 0, "future_prefill_selected": 0,
                       "future_prefill_reserve_bytes": 0,
                       "future_prefill_effective_headroom_bytes": 0,
@@ -388,6 +399,8 @@ class SchedulerBudget:
                       "future_prefill_capped": 0,
                       "future_prefill_tp_fallbacks": 0,
                       "future_prefill_pressure_observations": 0,
+                      "future_decode_pressure_observations": 0,
+                      "last_future_plan_boundary": None,
                       "runtime_value_hints": 0,
                       "runtime_value_invalid": 0,
                       "runtime_value_guarded": 0,
@@ -448,11 +461,17 @@ class SchedulerBudget:
             self.stats[high] = max(self.stats[high], value)
         return reclaimable
 
-    def observe_future_prefill(self, plan, effective_headroom=0, *, tp_fallback=False):
+    def observe_future_prefill(self, plan, effective_headroom=0, *, tp_fallback=False,
+                               boundary="prefill"):
         """Publish the latest bounded waiting-queue reservation snapshot."""
 
+        if boundary not in ("prefill", "decode"):
+            raise ValueError("future plan boundary must be prefill or decode")
         stats = self.stats
-        stats["future_prefill_ticks"] += 1
+        stats["future_plan_ticks"] += 1
+        stats["last_future_plan_boundary"] = boundary
+        if boundary == "prefill":
+            stats["future_prefill_ticks"] += 1
         stats["future_prefill_selected"] = plan.selected_count
         stats["future_prefill_reserve_bytes"] = plan.reserve_bytes
         stats["future_prefill_effective_headroom_bytes"] = int(effective_headroom)
@@ -492,6 +511,12 @@ class SchedulerBudget:
 
     def boundary(self, batch, coordinator, exchange, synchronize, *, prefill, now,
                  future_headroom=0):
+        if (
+            isinstance(future_headroom, bool)
+            or not isinstance(future_headroom, int)
+            or future_headroom < 0
+        ):
+            raise ValueError("future_headroom must be a nonnegative integer")
         tracker = coordinator.mem_pool_device.adaptive_vmm
         self.observe_residency(batch, coordinator._ekv_resident, now)
         if not prefill and not batch.is_empty():
@@ -502,12 +527,14 @@ class SchedulerBudget:
                          self.promote_step > 0 and self.steps >= self.promote_step)
         backed = tracker.backing.backed_bytes
         self.stats["max_observed_backed_bytes"] = max(self.stats["max_observed_backed_bytes"], backed)
-        if not prefill and not force and not force_promote and (
+        if not prefill and not force and not force_promote and not future_headroom and (
                 not self.budget or self.steps % self.observe):
             return
         local = (backed, force, now - self.last_change >= self.dwell, force_promote)
         states = exchange(local)
-        headroom = max(self.headroom, int(future_headroom)) if prefill else 0
+        headroom = future_headroom
+        if prefill:
+            headroom = max(self.headroom, headroom)
         pressure = self.budget > 0 and max(item[0] for item in states) + headroom > self.budget
         force = all(item[1] for item in states)
         reclaimable = self.observe_backing(tracker)
@@ -515,7 +542,11 @@ class SchedulerBudget:
         if pressure:
             self.stats["pressure_observations"] += 1
             if future_headroom > 0:
-                self.stats["future_prefill_pressure_observations"] += 1
+                key = (
+                    "future_prefill_pressure_observations"
+                    if prefill else "future_decode_pressure_observations"
+                )
+                self.stats[key] += 1
             self.low_since = None
             self.trim_slack(coordinator, tracker, exchange, synchronize, reclaimable)
             peak = max(exchange(tracker.backing.backed_bytes)) + headroom
@@ -931,7 +962,12 @@ def install_scheduler_budget():
 
         reservation = empty_plan(future_mode)
         tp_fallback = False
-        if prefill and future_mode != "off":
+        controller = self._ekv_adaptive_budget
+        should_plan_future = _should_plan_future_waiting(
+            future_mode, self.waiting_queue, prefill=prefill,
+            steps=controller.steps, observe=observe,
+        )
+        if should_plan_future:
             pool = coordinator.mem_pool_device
             local_config = replace(
                 future_config, sparse_hot_tokens=coordinator.device_buffer_size
@@ -950,11 +986,12 @@ def install_scheduler_budget():
         future_headroom = effective_prefill_headroom(
             reservation, headroom, future_mode
         )
-        if prefill and future_mode != "off":
-            self._ekv_adaptive_budget.observe_future_prefill(
-                reservation, future_headroom, tp_fallback=tp_fallback
+        if should_plan_future:
+            controller.observe_future_prefill(
+                reservation, future_headroom, tp_fallback=tp_fallback,
+                boundary="prefill" if prefill else "decode",
             )
-        self._ekv_adaptive_budget.boundary(
+        controller.boundary(
             batch, coordinator, exchange,
             lambda: torch.cuda.synchronize(coordinator.mem_pool_device.device),
             prefill=prefill, now=now, future_headroom=future_headroom,
