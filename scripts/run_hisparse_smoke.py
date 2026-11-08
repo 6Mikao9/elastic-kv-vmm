@@ -14,18 +14,32 @@ import urllib.error
 import urllib.request
 import zipfile
 
-from scripts.run_case import HOST, PORT, ROOT, URL, leader_exit, on_sigterm, stop_server
+from scripts.run_case import HOST, PORT, ROOT, leader_exit, on_sigterm, stop_server
 from benchmarks.client import digest_ids, prompt_ids, write_json
 
 
-def wait_healthy(server, opener):
+def server_base_url(host, port):
+    """Return a probe URL while keeping wildcard binds reachable locally."""
+    probe_host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(host, host)
+    authority = f"[{probe_host}]" if ":" in probe_host else probe_host
+    return f"http://{authority}:{port}"
+
+
+def validate_server_endpoint(parser, *, host, port):
+    if not host or host != host.strip() or any(character.isspace() for character in host):
+        parser.error("server host must be a nonempty value without whitespace")
+    if not 1 <= port <= 65535:
+        parser.error("server port must be between 1 and 65535")
+
+
+def wait_healthy(server, opener, base_url):
     deadline = time.monotonic() + 1800
     while time.monotonic() < deadline:
         status = leader_exit(server)
         if status is not None:
             raise RuntimeError(f"server exited during startup with status {status.si_status}")
         try:
-            with opener.open(URL + "/health", timeout=2) as response:
+            with opener.open(base_url + "/health", timeout=2) as response:
                 if response.status == 200:
                     return
         except (urllib.error.URLError, TimeoutError):
@@ -34,7 +48,7 @@ def wait_healthy(server, opener):
     raise TimeoutError("server health timeout")
 
 
-def probe(opener, length):
+def probe(opener, length, base_url):
     prompt = prompt_ids(f"hisparse-smoke/{length}", length)
     body = {
         "input_ids": prompt, "stream": False,
@@ -42,7 +56,7 @@ def probe(opener, length):
         "top_logprobs_num": 0, "return_text_in_logprobs": False,
         "sampling_params": {"temperature": 0, "max_new_tokens": 16, "ignore_eos": True},
     }
-    request = urllib.request.Request(URL + "/generate", json.dumps(body).encode(),
+    request = urllib.request.Request(base_url + "/generate", json.dumps(body).encode(),
                                      {"Content-Type": "application/json"})
     started = time.perf_counter()
     with opener.open(request, timeout=600) as response:
@@ -64,8 +78,8 @@ def probe(opener, length):
     }
 
 
-def check_capacity(opener, requested, ratio):
-    with opener.open(URL + "/server_info", timeout=30) as response:
+def check_capacity(opener, requested, ratio, base_url):
+    with opener.open(base_url + "/server_info", timeout=30) as response:
         info = json.load(response)
     actual = info.get("max_total_num_tokens")
     if type(actual) is not int or actual != requested:
@@ -75,6 +89,14 @@ def check_capacity(opener, requested, ratio):
             "derived_logical_capacity": actual * ratio,
             "host_to_device_ratio": ratio,
             "derivation": "Audited MiniMax pool and allocator code; logical/index capacity is physical pool size times ratio."}
+
+
+def diagnostic_capture_arguments(base_url, output, captures):
+    return [
+        "--url", base_url + "/generate",
+        "--output", str(output),
+        "--captures", str(captures),
+    ]
 
 
 def validate_resident_hint_options(parser, *, policy, minimum_tokens, resident_limit, future_policy):
@@ -269,6 +291,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--host", default=HOST,
+                        help="Bind host for the launched service (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=PORT,
+                        help="Bind port for the launched service (default: 31080)")
     parser.add_argument("--tp-size", type=int, default=4)
     parser.add_argument("--attention-backend", default="triton")
     parser.add_argument("--mode", choices=("native", "resident"), required=True)
@@ -358,6 +384,8 @@ def main():
     parser.add_argument("--future-forbid-deadline-overcommit", action="store_true")
     parser.add_argument("--future-poll-interval-ms", type=float, default=10.0)
     args = parser.parse_args()
+    validate_server_endpoint(parser, host=args.host, port=args.port)
+    base_url = server_base_url(args.host, args.port)
     if not (args.model_path / "config.json").is_file() or args.tp_size < 4:
         parser.error("require a local MiniMax snapshot and TP >= 4")
     if args.future_plan is not None and args.future_workload is not None:
@@ -537,7 +565,7 @@ def main():
     capacity = (args.logical_capacity // args.host_ratio
                 if args.mode == "native" else args.logical_capacity)
     server_args = [
-        "--host", HOST, "--port", str(PORT), "--tp-size", str(args.tp_size),
+        "--host", args.host, "--port", str(args.port), "--tp-size", str(args.tp_size),
         "--attention-backend", args.attention_backend, "--mm-attention-backend", "triton_attn",
         "--dtype", "bfloat16", "--kv-cache-dtype", "bfloat16",
         "--moe-runner-backend", "marlin", "--watchdog-timeout", "1800",
@@ -686,6 +714,8 @@ def main():
                 archive.write(ROOT / name, name)
     write_json(output / "source_manifest.json", {
         "mode": args.mode, "server_args": server_args,
+        "server_host": args.host, "server_port": args.port,
+        "server_base_url": base_url,
         "sm80_bf16_projections": args.sm80_bf16_projections,
         "benchmark_repeats": args.benchmark_repeats, "workloads": args.workloads,
         "forced_replay": args.forced_replay,
@@ -741,6 +771,8 @@ def main():
     })
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     results = {"mode": args.mode, "tp_size": args.tp_size,
+               "server_host": args.host, "server_port": args.port,
+               "server_base_url": base_url,
                "sm80_bf16_projections": args.sm80_bf16_projections,
                "vmm_backing": args.vmm_backing, "resident_limit": args.resident_limit,
                **resident_hint_manifest(
@@ -774,14 +806,15 @@ def main():
         with (output / "server.log").open("xb") as log:
             server = subprocess.Popen(command, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
                                       start_new_session=True, env=environment)
-        wait_healthy(server, opener)
+        wait_healthy(server, opener, base_url)
         step = "capacity_validation"
         results["capacity"] = check_capacity(
-            opener, capacity, args.host_ratio if args.mode == "native" else 1)
+            opener, capacity, args.host_ratio if args.mode == "native" else 1,
+            base_url)
         write_json(output / "results.json", results)
         for length in (128, 8192):
             step = f"probe_{length}"
-            results["probes"].append(probe(opener, length))
+            results["probes"].append(probe(opener, length, base_url))
             write_json(output / "results.json", results)
         if future_plan_mode:
             from adaptive_sparse.rollout_executor import execute_rollout
@@ -803,7 +836,7 @@ def main():
             try:
                 with MemorySampler() as sampler:
                     planned_result = execute_rollout(
-                        URL + "/generate",
+                        base_url + "/generate",
                         planned_submissions,
                         timeout_s=args.future_request_timeout_s,
                         emit_hints=not args.future_no_hints,
@@ -849,12 +882,13 @@ def main():
         if args.diagnostic_captures:
             from benchmarks.hisparse_correctness import main as diagnose
             step = "determinism_diagnostic"
-            diagnose(["--output", str(output / "determinism.json"),
-                      "--captures", str(args.diagnostic_captures)])
+            diagnose(diagnostic_capture_arguments(
+                base_url, output / "determinism.json", args.diagnostic_captures
+            ))
         if args.benchmark_repeats:
             from benchmarks.hisparse_client import run_benchmark
             step = "benchmark"
-            run_benchmark(URL, output / "performance.json", gpu_uuids,
+            run_benchmark(base_url, output / "performance.json", gpu_uuids,
                           repeats=args.benchmark_repeats, workloads=args.workloads,
                           forced_replay=args.forced_replay, warmup_once=args.warmup_once,
                           emit_future_hints=args.future_policy != "off")
@@ -871,7 +905,9 @@ def main():
                         for index, length in enumerate((128, args.validation_long_tokens,
                                                         args.validation_long_tokens, 128))
                     ]
-                    records, _, _ = run_requests(URL + "/generate", specifications, 4, 600, stream=True)
+                    records, _, _ = run_requests(
+                        base_url + "/generate", specifications, 4, 600, stream=True
+                    )
                     if any(item["output_tokens"] != item["requested_output_tokens"] for item in records):
                         raise RuntimeError("incomplete concurrent shadow validation outputs")
                     for item in records:
@@ -954,9 +990,9 @@ def main():
         if args.semantic_probes:
             from benchmarks.hisparse_semantic import smoke as semantic_smoke
             step = "semantic_smoke"
-            with opener.open(URL + "/v1/models", timeout=30) as response:
+            with opener.open(base_url + "/v1/models", timeout=30) as response:
                 served_model = json.load(response)["data"][0]["id"]
-            semantic = semantic_smoke(URL, served_model, 180)
+            semantic = semantic_smoke(base_url, served_model, 180)
             write_json(output / "semantic_smoke.json", semantic)
             results["semantic_smoke_passed"] = semantic["passed"]
         if args.future_policy != "off":

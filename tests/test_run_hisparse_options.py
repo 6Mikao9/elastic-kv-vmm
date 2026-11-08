@@ -7,6 +7,7 @@ import tempfile
 import unittest
 
 from scripts.run_hisparse_smoke import (
+    diagnostic_capture_arguments,
     global_broker_environment,
     global_broker_manifest,
     resident_broker_environment,
@@ -15,16 +16,44 @@ from scripts.run_hisparse_smoke import (
     resident_hint_manifest,
     resident_hint_sources,
     load_future_submissions,
+    server_base_url,
     shared_prefix_environment,
     shared_prefix_manifest,
     validate_resident_hint_options,
     validate_resident_broker_options,
     validate_shared_prefix_reuse_options,
     validate_global_broker_options,
+    validate_server_endpoint,
 )
 
 
 class ResidentHintRunnerOptionsTest(unittest.TestCase):
+    def test_server_base_url_supports_explicit_ports_and_wildcards(self):
+        self.assertEqual(server_base_url("127.0.0.1", 31081), "http://127.0.0.1:31081")
+        self.assertEqual(server_base_url("0.0.0.0", 31082), "http://127.0.0.1:31082")
+        self.assertEqual(server_base_url("::", 31083), "http://[::1]:31083")
+
+    def test_server_endpoint_rejects_invalid_host_and_port(self):
+        parser = argparse.ArgumentParser()
+        for host, port in (("", 31080), (" localhost", 31080), ("127.0.0.1", 0),
+                           ("127.0.0.1", 65536)):
+            with self.subTest(host=host, port=port):
+                with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+                    validate_server_endpoint(parser, host=host, port=port)
+        validate_server_endpoint(parser, host="127.0.0.1", port=31081)
+
+    def test_diagnostic_capture_uses_the_launched_endpoint(self):
+        self.assertEqual(
+            diagnostic_capture_arguments(
+                "http://127.0.0.1:31082", Path("run/determinism.json"), 3
+            ),
+            [
+                "--url", "http://127.0.0.1:31082/generate",
+                "--output", str(Path("run/determinism.json")),
+                "--captures", "3",
+            ],
+        )
+
     def test_future_workload_and_emitted_plan_are_executable(self):
         workload = {
             "config": {
