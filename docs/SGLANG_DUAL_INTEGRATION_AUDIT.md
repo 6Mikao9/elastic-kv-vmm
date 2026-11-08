@@ -157,6 +157,16 @@ at the share boundary while preserving atomic mapping failure semantics.
 - Server teardown is attempted for every process in reverse launch order; any
   cleanup exception is appended to `violations` and changes the final status to
   `failed` before the result is rewritten.
+- `SIGTERM`, `KeyboardInterrupt` and other non-ordinary termination paths now
+  record a failed result before teardown, while final process return codes are
+  retained in `server_exit_codes`.
+- The final SQLite snapshot is taken only after both server process groups have
+  exited. `sqlite_final` records WAL/sidecar provenance, while
+  `configuration.broker.snapshot_final` queries owners, leases and outstanding
+  bytes. A completed broker run fails if the database is not queryable or if
+  any owner or lease remains after teardown. A direct `main(argv)` mock test
+  exercises the launch-failure, reverse cleanup and post-teardown snapshot
+  order without CUDA.
 - Still open before a GPU acceptance claim: multi-stage transition schedules, a
   real-broker runner integration test, and the paired
   isolated/shared/observe/enforce GPU matrix itself.

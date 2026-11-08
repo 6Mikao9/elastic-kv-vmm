@@ -1,4 +1,5 @@
 import argparse
+import json
 import sqlite3
 import tempfile
 import time
@@ -13,12 +14,16 @@ from scripts.run_dual import (
     broker_environment,
     build_phase_jobs,
     estimate_phase_kv_bytes,
+    finalize_broker_results,
+    main,
     model_kv_geometry,
     phase_stem,
     read_broker_snapshot,
+    record_run_failure,
     run_correctness_probes,
     run_synchronized,
     scenario_order,
+    server_exit_records,
     server_launch_spec,
     source_hashes,
     source_manifest,
@@ -32,6 +37,138 @@ from scripts.run_dual import (
 
 
 class DualBrokerRunnerTest(unittest.TestCase):
+    def test_final_broker_snapshot_rejects_live_owners_or_leases(self):
+        results = {
+            "status": "complete",
+            "configuration": {"broker": {}},
+            "violations": [],
+        }
+        snapshot = {
+            "status": "ready",
+            "owners": {"worker": {"pid": 11}},
+            "outstanding_bytes": 4096,
+        }
+        with patch("scripts.run_dual.read_broker_snapshot", return_value=snapshot):
+            finalize_broker_results(results, Path("broker.sqlite"))
+        self.assertEqual(results["status"], "failed")
+        self.assertEqual(results["violations"][0]["kind"], "broker_state_not_clean")
+        self.assertEqual(
+            results["violations"][0]["outstanding_bytes"], 4096
+        )
+        self.assertIs(
+            results["configuration"]["broker"]["snapshot_final"], snapshot
+        )
+
+    def test_complete_run_requires_queryable_final_broker_snapshot(self):
+        results = {
+            "status": "complete",
+            "configuration": {"broker": {}},
+            "violations": [],
+        }
+        with patch("scripts.run_dual.read_broker_snapshot",
+                   return_value={"status": "uninitialized"}):
+            finalize_broker_results(results, Path("broker.sqlite"))
+        self.assertEqual(results["status"], "failed")
+        self.assertEqual(
+            results["violations"][0]["kind"],
+            "broker_snapshot_unavailable",
+        )
+
+    def test_main_cleans_every_started_server_after_startup_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model_a = root / "model-a"
+            model_b = root / "model-b"
+            model_a.mkdir()
+            model_b.mkdir()
+            output = root / "results"
+            broker = root / "broker.sqlite"
+            stopped = []
+            servers = [
+                type("Server", (), {"pid": 11, "returncode": None})(),
+                type("Server", (), {"pid": 12, "returncode": None})(),
+            ]
+
+            def fake_start(_launch, _log_path):
+                return servers.pop(0)
+
+            def fake_wait(server, _port):
+                if server.pid == 12:
+                    raise RuntimeError("second server failed during startup")
+
+            def fake_stop(server):
+                stopped.append(server.pid)
+                server.returncode = -15
+
+            def fake_signal(_signal_number, _handler):
+                return None
+
+            manifest = {
+                "available": True,
+                "commit": "a" * 40,
+                "tree_sha256": "b" * 64,
+            }
+            runtime = {
+                "models": {
+                    "a": {"kv_geometry": {"bytes_per_token": 4}},
+                    "b": {"kv_geometry": {"bytes_per_token": 8}},
+                }
+            }
+            clean_snapshot = {
+                "status": "ready",
+                "owners": {},
+                "outstanding_bytes": 0,
+            }
+            argv = [
+                "--model-a", str(model_a),
+                "--model-b", str(model_b),
+                "--mode", "v2",
+                "--output-dir", str(output),
+                "--broker-path", str(broker),
+                "--broker-mib", "1024",
+            ]
+            with (
+                patch("scripts.run_dual.source_manifest", return_value=manifest),
+                patch("scripts.run_dual.runtime_provenance", return_value=runtime),
+                patch("scripts.run_dual.start_server", side_effect=fake_start),
+                patch("scripts.run_dual.wait_healthy", side_effect=fake_wait),
+                patch("scripts.run_dual.run_case.stop_server", side_effect=fake_stop),
+                patch("scripts.run_dual.read_broker_snapshot",
+                      return_value=clean_snapshot),
+                patch("scripts.run_dual.signal.signal", side_effect=fake_signal),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "second server failed"):
+                    main(argv)
+
+            payload = json.loads((output / "results.json").read_text(encoding="utf-8"))
+        self.assertEqual(payload["status"], "failed")
+        self.assertEqual(stopped, [12, 11])
+        self.assertEqual(payload["server_exit_codes"]["a"]["returncode"], -15)
+        self.assertEqual(payload["server_exit_codes"]["b"]["returncode"], -15)
+        self.assertEqual(
+            payload["configuration"]["broker"]["snapshot_final"],
+            clean_snapshot,
+        )
+
+    def test_runtime_failure_records_non_exception_termination(self):
+        results = {"status": "running", "violations": []}
+        record_run_failure(results, SystemExit(143))
+        self.assertEqual(results["status"], "failed")
+        self.assertEqual(results["violations"][0]["error_type"], "SystemExit")
+
+    def test_server_exit_records_keep_wait_status(self):
+        servers = [
+            type("Server", (), {"pid": 11, "returncode": -15})(),
+            type("Server", (), {"pid": 12, "returncode": 0})(),
+        ]
+        self.assertEqual(
+            server_exit_records(servers),
+            {
+                "a": {"pid": 11, "returncode": -15},
+                "b": {"pid": 12, "returncode": 0},
+            },
+        )
+
     def test_broker_environment_is_explicit_per_tenant(self):
         self.assertEqual(
             broker_environment(

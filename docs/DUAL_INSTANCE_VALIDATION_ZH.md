@@ -102,6 +102,11 @@ bash scripts/container_dual.sh 0 /path/to/huggingface/hub v2 \
 逐项一致。
 服务关闭按逆序逐个执行；任一 teardown 异常都会写入 `violations` 并把最终
 `status` 改为 `failed`，避免留下虚假的 complete 结果。
+两个服务退出后才采集最终 broker 状态。`sqlite_final` 记录数据库与 WAL
+文件信息，`configuration.broker.snapshot_final` 实际查询 owner、lease 和
+outstanding bytes；成功实验若仍有 owner/lease，或 broker 状态不可查询，
+会自动改判失败。直接驱动 `main(argv)` 的 CPU mock 回归还覆盖了启动失败、
+逆序清理和退出后快照的写入顺序。
 
 ## 3. Arm 矩阵
 

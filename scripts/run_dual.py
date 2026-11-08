@@ -648,13 +648,64 @@ def stop_servers(servers):
     for server in reversed(servers):
         try:
             run_case.stop_server(server)
-        except Exception as exc:
+        except BaseException as exc:
             errors.append({
                 "pid": getattr(server, "pid", None),
                 "error_type": type(exc).__name__,
                 "message": safe_error_message(exc),
             })
     return errors
+
+
+def record_run_failure(results, exc):
+    """Record failures that are not ordinary Exception instances."""
+    results["status"] = "failed"
+    results["violations"].append({
+        "kind": "phase_or_runtime_failure",
+        "error_type": type(exc).__name__,
+        "message": safe_error_message(exc),
+    })
+
+
+def server_exit_records(servers):
+    """Describe the fate of every launched leader after teardown."""
+    return {
+        instance: {
+            "pid": server.pid,
+            "returncode": server.returncode,
+        }
+        for instance, server in zip(PORTS, servers, strict=False)
+    }
+
+
+def finalize_broker_results(results, broker_path):
+    """Persist and validate the broker state after every server has exited."""
+
+    snapshot = read_broker_snapshot(broker_path)
+    broker_results = results["configuration"]["broker"]
+    broker_results["snapshot_final"] = snapshot
+    if broker_path is None:
+        return snapshot
+
+    if snapshot is not None and snapshot.get("status") == "ready":
+        owners = snapshot.get("owners", {})
+        outstanding = snapshot.get("outstanding_bytes", 0)
+        if owners or outstanding:
+            results["status"] = "failed"
+            results["violations"].append({
+                "kind": "broker_state_not_clean",
+                "owner_count": len(owners) if isinstance(owners, dict) else None,
+                "outstanding_bytes": outstanding,
+            })
+    elif results.get("status") == "complete":
+        results["status"] = "failed"
+        results["violations"].append({
+            "kind": "broker_snapshot_unavailable",
+            "snapshot_status": (
+                None if snapshot is None else snapshot.get("status")
+            ),
+        })
+    return snapshot
 
 
 def scenario_order(repeat):
@@ -956,7 +1007,7 @@ def run_correctness_probes(output):
     }
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-a", required=True, type=Path, help="local 0.6B snapshot")
     parser.add_argument("--model-b", required=True, type=Path, help="local 4B snapshot")
@@ -983,7 +1034,7 @@ def main():
         action="store_true",
         help="skip the fixed non-streaming output-ID matrix (debug runs only)",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     validate_broker_options(
         parser,
         mode=args.mode,
@@ -1176,31 +1227,30 @@ def main():
             broker_path
         )
         write_json(result_path, results)
-    except Exception as exc:
-        results["status"] = "failed"
-        results["violations"].append({
-            "kind": "phase_or_runtime_failure",
-            "error_type": type(exc).__name__,
-            "message": safe_error_message(exc),
-        })
-        results["configuration"]["broker"]["sqlite_final"] = sqlite_state(
-            broker_path
-        )
+    except BaseException as exc:
+        # SystemExit and KeyboardInterrupt still need an auditable failure
+        # record before teardown begins.
+        record_run_failure(results, exc)
         write_json(result_path, results)
         raise
     finally:
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         try:
             cleanup_errors = stop_servers(servers)
+            results["server_exit_codes"] = server_exit_records(servers)
             if cleanup_errors:
                 results["status"] = "failed"
                 results["violations"].extend({
                     "kind": "server_cleanup_failure", **error
                 } for error in cleanup_errors)
-                results["configuration"]["broker"]["sqlite_final"] = sqlite_state(
-                    broker_path
-                )
-                write_json(result_path, results)
+            # These snapshots must describe the state after both process
+            # groups have exited. The queryable broker snapshot verifies owner
+            # and lease cleanup; sqlite_state retains WAL/sidecar provenance.
+            results["configuration"]["broker"]["sqlite_final"] = sqlite_state(
+                broker_path
+            )
+            finalize_broker_results(results, broker_path)
+            write_json(result_path, results)
         finally:
             signal.signal(signal.SIGTERM, previous_handler)
 
