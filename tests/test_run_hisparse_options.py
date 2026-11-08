@@ -7,6 +7,8 @@ import tempfile
 import unittest
 
 from scripts.run_hisparse_smoke import (
+    global_broker_environment,
+    global_broker_manifest,
     resident_broker_environment,
     resident_broker_manifest,
     resident_hint_environment,
@@ -18,6 +20,7 @@ from scripts.run_hisparse_smoke import (
     validate_resident_hint_options,
     validate_resident_broker_options,
     validate_shared_prefix_reuse_options,
+    validate_global_broker_options,
 )
 
 
@@ -110,6 +113,96 @@ class ResidentHintRunnerOptionsTest(unittest.TestCase):
         )
         self.assertEqual(shared_prefix_environment("direct", 0), {})
         self.assertEqual(shared_prefix_environment("off", 2), {})
+
+    def test_global_broker_environment_and_manifest_are_explicit(self):
+        self.assertEqual(
+            global_broker_environment(
+                "/run/ekv/gpu-{gpu}.sqlite",
+                6144,
+                120,
+                "enforce",
+                "model-a",
+                3.0,
+                10.0,
+                0,
+            ),
+            {
+                "EKV_GLOBAL_BROKER_PATH": "/run/ekv/gpu-{gpu}.sqlite",
+                "EKV_GLOBAL_BROKER_MIB": "6144",
+                "EKV_GLOBAL_BROKER_STALE_SECONDS": "120",
+                "EKV_GLOBAL_BROKER_FAIR_MODE": "enforce",
+                "EKV_GLOBAL_BROKER_TENANT": "model-a",
+                "EKV_GLOBAL_BROKER_TENANT_WEIGHT": "3.0",
+                "EKV_GLOBAL_BROKER_DEMAND_TTL_SECONDS": "10.0",
+                "EKV_GLOBAL_BROKER_WAIT_MS": "0",
+            },
+        )
+        manifest = global_broker_manifest(
+            "/run/ekv/gpu-{gpu}.sqlite",
+            6144,
+            120,
+            "observe",
+            "model-a",
+            3.0,
+            10.0,
+            25,
+        )
+        self.assertEqual(manifest["global_broker_fair_mode"], "observe")
+        self.assertEqual(manifest["global_broker_wait_ms"], 25)
+        self.assertEqual(
+            global_broker_environment(None, 0, 120, "off", None, 1, 10, 0),
+            {},
+        )
+
+    def test_global_broker_options_require_a_consistent_vmm_configuration(self):
+        parser = argparse.ArgumentParser()
+        base = {
+            "path": None,
+            "mib": 0,
+            "stale_seconds": 120,
+            "fair_mode": "off",
+            "tenant": None,
+            "tenant_weight": 1.0,
+            "demand_ttl_seconds": 10.0,
+            "wait_ms": 0,
+            "vmm_backing": True,
+        }
+        invalid = (
+            {"path": "/tmp/broker.sqlite"},
+            {"mib": 1024},
+            {
+                "path": "/tmp/broker.sqlite",
+                "mib": 1024,
+                "fair_mode": "enforce",
+            },
+            {
+                "path": "/tmp/broker.sqlite",
+                "mib": 1024,
+                "vmm_backing": False,
+            },
+            {
+                "path": "/tmp/broker.sqlite",
+                "mib": 1024,
+                "fair_mode": "observe",
+                "tenant": "a",
+                "wait_ms": 5001,
+            },
+        )
+        for override in invalid:
+            with self.subTest(override=override):
+                case = {**base, **override}
+                with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+                    validate_global_broker_options(parser, **case)
+        validate_global_broker_options(
+            parser,
+            **{
+                **base,
+                "path": "/tmp/broker.sqlite",
+                "mib": 1024,
+                "fair_mode": "observe",
+                "tenant": "a",
+            },
+        )
 
     def test_shared_prefix_requires_full_runtime_enablement(self):
         parser = argparse.ArgumentParser()

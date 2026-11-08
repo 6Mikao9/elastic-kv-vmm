@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -109,6 +110,37 @@ def validate_shared_prefix_reuse_options(
         parser.error("direct shared-prefix reuse does not support full-batch swap")
 
 
+def validate_global_broker_options(
+    parser,
+    *,
+    path,
+    mib,
+    stale_seconds,
+    fair_mode,
+    tenant,
+    tenant_weight,
+    demand_ttl_seconds,
+    wait_ms,
+    vmm_backing,
+):
+    if fair_mode not in ("off", "observe", "enforce"):
+        parser.error("global broker fair mode must be off, observe or enforce")
+    if bool(path) != (mib > 0):
+        parser.error("global broker requires both a path and positive capacity")
+    if (path or fair_mode != "off") and not vmm_backing:
+        parser.error("global broker requires VMM backing")
+    if fair_mode != "off" and not tenant:
+        parser.error("global broker fairness requires a tenant")
+    if stale_seconds < 1:
+        parser.error("global broker stale interval must be positive")
+    if not math.isfinite(tenant_weight) or not 0 < tenant_weight <= 1_000_000:
+        parser.error("global broker tenant weight must be in (0, 1000000]")
+    if not math.isfinite(demand_ttl_seconds) or demand_ttl_seconds <= 0:
+        parser.error("global broker demand TTL must be positive")
+    if not 0 <= wait_ms <= 5_000:
+        parser.error("global broker wait must be between 0 and 5000 ms")
+
+
 def resident_hint_environment(policy, minimum_tokens, resident_limit):
     if not resident_limit:
         return {}
@@ -148,6 +180,54 @@ def resident_broker_manifest(mode, lookahead_tokens):
     return {
         "resident_broker_mode": mode,
         "resident_broker_lookahead_tokens": lookahead_tokens,
+    }
+
+
+def global_broker_environment(
+    path,
+    mib,
+    stale_seconds,
+    fair_mode,
+    tenant,
+    tenant_weight,
+    demand_ttl_seconds,
+    wait_ms,
+):
+    if not path:
+        return {}
+    result = {
+        "EKV_GLOBAL_BROKER_PATH": str(path),
+        "EKV_GLOBAL_BROKER_MIB": str(mib),
+        "EKV_GLOBAL_BROKER_STALE_SECONDS": str(stale_seconds),
+        "EKV_GLOBAL_BROKER_FAIR_MODE": fair_mode,
+        "EKV_GLOBAL_BROKER_TENANT_WEIGHT": str(tenant_weight),
+        "EKV_GLOBAL_BROKER_DEMAND_TTL_SECONDS": str(demand_ttl_seconds),
+        "EKV_GLOBAL_BROKER_WAIT_MS": str(wait_ms),
+    }
+    if tenant:
+        result["EKV_GLOBAL_BROKER_TENANT"] = tenant
+    return result
+
+
+def global_broker_manifest(
+    path,
+    mib,
+    stale_seconds,
+    fair_mode,
+    tenant,
+    tenant_weight,
+    demand_ttl_seconds,
+    wait_ms,
+):
+    return {
+        "global_broker_path": None if path is None else str(path),
+        "global_broker_capacity_mib": mib,
+        "global_broker_stale_seconds": stale_seconds,
+        "global_broker_fair_mode": fair_mode,
+        "global_broker_tenant": tenant,
+        "global_broker_tenant_weight": tenant_weight,
+        "global_broker_demand_ttl_seconds": demand_ttl_seconds,
+        "global_broker_wait_ms": wait_ms,
     }
 
 
@@ -206,6 +286,20 @@ def main():
     parser.add_argument("--vmm-backing", action="store_true")
     parser.add_argument("--vmm-fast-decode", action="store_true")
     parser.add_argument("--vmm-idle-grace-ms", type=int, default=0)
+    parser.add_argument("--global-broker-path")
+    parser.add_argument("--global-broker-mib", type=int, default=0)
+    parser.add_argument("--global-broker-stale-seconds", type=int, default=120)
+    parser.add_argument(
+        "--global-broker-fair-mode",
+        choices=("off", "observe", "enforce"),
+        default="off",
+    )
+    parser.add_argument("--global-broker-tenant")
+    parser.add_argument("--global-broker-tenant-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--global-broker-demand-ttl-seconds", type=float, default=10.0
+    )
+    parser.add_argument("--global-broker-wait-ms", type=int, default=0)
     parser.add_argument("--resident-limit", type=int, default=0)
     parser.add_argument("--resident-free-reserve", type=int, default=16384)
     parser.add_argument("--diagnostic-captures", type=int, default=0)
@@ -353,6 +447,18 @@ def main():
         resident_limit=args.resident_limit,
         full_batch_swap=args.resident_full_batch_swap,
     )
+    validate_global_broker_options(
+        parser,
+        path=args.global_broker_path,
+        mib=args.global_broker_mib,
+        stale_seconds=args.global_broker_stale_seconds,
+        fair_mode=args.global_broker_fair_mode,
+        tenant=args.global_broker_tenant,
+        tenant_weight=args.global_broker_tenant_weight,
+        demand_ttl_seconds=args.global_broker_demand_ttl_seconds,
+        wait_ms=args.global_broker_wait_ms,
+        vmm_backing=args.vmm_backing,
+    )
     if args.adaptive_plan_capture and not args.logical_shadow:
         parser.error("allocation plan capture is diagnostic and requires logical shadow")
     if (args.adaptive_force_demote_step or args.adaptive_force_promote_step) and not args.logical_shadow:
@@ -466,6 +572,10 @@ def main():
                  "EKV_RESIDENT_HINT_POLICY", "EKV_RESIDENT_MIN_HINT_OUTPUT_TOKENS",
                  "EKV_SHARED_PREFIX_REUSE",
                  "EKV_RESIDENT_BROKER", "EKV_RESIDENT_BROKER_LOOKAHEAD_TOKENS",
+                 "EKV_GLOBAL_BROKER_PATH", "EKV_GLOBAL_BROKER_MIB",
+                 "EKV_GLOBAL_BROKER_STALE_SECONDS", "EKV_GLOBAL_BROKER_FAIR_MODE",
+                 "EKV_GLOBAL_BROKER_TENANT", "EKV_GLOBAL_BROKER_TENANT_WEIGHT",
+                 "EKV_GLOBAL_BROKER_DEMAND_TTL_SECONDS", "EKV_GLOBAL_BROKER_WAIT_MS",
                  "EKV_LAYER_TRACE_DIR", "EKV_DISABLE_FUSED_QKNORM", "EKV_RESIDENT_RESOLVER"):
         environment.pop(name, None)
     environment.pop("EKV_FUTURE_POLICY", None)
@@ -500,6 +610,16 @@ def main():
     if args.vmm_backing:
         environment["EKV_VMM_STATS_DIR"] = str(output / "vmm_stats")
         environment["ELASTIC_VMM_LIBRARY"] = str(library)
+        environment.update(global_broker_environment(
+            args.global_broker_path,
+            args.global_broker_mib,
+            args.global_broker_stale_seconds,
+            args.global_broker_fair_mode,
+            args.global_broker_tenant,
+            args.global_broker_tenant_weight,
+            args.global_broker_demand_ttl_seconds,
+            args.global_broker_wait_ms,
+        ))
     if args.future_policy != "off":
         environment["EKV_FUTURE_POLICY"] = args.future_policy
         environment["EKV_FUTURE_STATS_PATH"] = str(output / "future_stats.json")
@@ -534,6 +654,8 @@ def main():
     if args.vmm_backing:
         sources += ("adaptive_sparse/minimax_vmm.py", "adaptive_sparse/vmm_runtime.py",
                     "elastic_kv/backing.py", "native/elastic_vmm.cpp", "native/libelastic_vmm.so")
+    if args.global_broker_path:
+        sources += ("elastic_kv/global_broker.py",)
     if args.future_policy != "off":
         sources += ("adaptive_sparse/sglang_future_hook.py", "adaptive_sparse/kv_hints_compat.py")
     if future_plan_mode:
@@ -596,6 +718,16 @@ def main():
             args.resident_broker, args.resident_broker_lookahead_tokens
         ),
         **shared_prefix_manifest(args.shared_prefix_reuse),
+        **global_broker_manifest(
+            args.global_broker_path,
+            args.global_broker_mib,
+            args.global_broker_stale_seconds,
+            args.global_broker_fair_mode,
+            args.global_broker_tenant,
+            args.global_broker_tenant_weight,
+            args.global_broker_demand_ttl_seconds,
+            args.global_broker_wait_ms,
+        ),
         "adaptive_settings": adaptive_settings if adaptive else None,
         "chunk_aware_retention": args.chunk_aware_retention,
         "future_policy": args.future_policy,
@@ -618,6 +750,16 @@ def main():
                    args.resident_broker, args.resident_broker_lookahead_tokens
                ),
                **shared_prefix_manifest(args.shared_prefix_reuse),
+               **global_broker_manifest(
+                   args.global_broker_path,
+                   args.global_broker_mib,
+                   args.global_broker_stale_seconds,
+                   args.global_broker_fair_mode,
+                   args.global_broker_tenant,
+                   args.global_broker_tenant_weight,
+                   args.global_broker_demand_ttl_seconds,
+                   args.global_broker_wait_ms,
+               ),
                "future_policy": args.future_policy,
                "future_planning_policy": effective_future_policy if future_plan_mode else None,
                "future_hints_emitted": future_plan_mode and not args.future_no_hints,

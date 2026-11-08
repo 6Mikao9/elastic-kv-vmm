@@ -26,13 +26,16 @@ changing the attention addressing model:
 
 The tenant fairness slice is opt-in and defaults off. Denied growth writes a
 bounded demand record; Dense V5 stops admitting a starved tenant's competitor,
-and MiniMax uses the same signal for cooperative demotion. Ownership remains
+and MiniMax uses the same signal both at new request-residency admission and
+for cooperative demotion. A request that would claim a complete-GPU history
+under live fairness pressure falls back to native HiSparse before allocating
+that history; all TP ranks use the conservative common result. Ownership remains
 with the original process: a lease is transferred only after successful
 `cuMemUnmap` and release. The next evidence needed is a paired two-instance GPU
 run comparing `off`, `observe`, `enforce`, an unfair long-lived burst and a
 load-reversal arm. Until that run, the implemented weighted targets,
-anti-starvation and bounded retry are CPU and multi-process SQLite evidence,
-not an end-to-end throughput or latency result.
+anti-starvation, request-admission fallback and bounded retry are CPU and
+multi-process SQLite evidence, not an end-to-end throughput or latency result.
 
 ## Request-level HiSparse phase
 

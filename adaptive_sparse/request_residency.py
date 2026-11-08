@@ -1,5 +1,6 @@
 """Static mixed residency for the pinned MiniMax eager HiSparse runtime."""
 from collections import OrderedDict
+from collections.abc import Mapping
 import hashlib
 import os
 from pathlib import Path
@@ -22,6 +23,43 @@ from .shared_prefix import (
 
 
 _REQUEST_DECISION_LIMIT = 4096
+
+
+def resident_admission_fairness(
+    snapshot: object,
+    mode: str,
+) -> tuple[bool, bool]:
+    """Return ``(would_yield, block_resident_claim)`` for an admission.
+
+    ``would_yield`` is useful in observe mode.  Only enforce mode turns the
+    broker's live fairness pressure into a conservative native-HiSparse claim.
+    The state-file mode must match the process configuration so a stale or
+    accidentally shared broker cannot silently change admission semantics.
+    """
+
+    if mode not in ("off", "observe", "enforce"):
+        raise ValueError("global fair mode must be off, observe or enforce")
+    if mode == "off":
+        return False, False
+    if not isinstance(snapshot, Mapping):
+        raise RuntimeError("fair resident admission requires a broker snapshot")
+    if snapshot.get("fair_mode") != mode:
+        raise RuntimeError("broker fair mode does not match resident admission")
+    would_yield = snapshot.get("fair_share_would_yield", False)
+    pressure = snapshot.get("fairness_pressure", False)
+    if not isinstance(would_yield, bool) or not isinstance(pressure, bool):
+        raise RuntimeError("invalid broker fairness signal for resident admission")
+    return would_yield, mode == "enforce" and pressure
+
+
+def coordinator_broker_snapshot(coordinator: object) -> object | None:
+    """Read the aggregate broker snapshot attached to a coordinator's VMM."""
+
+    tracker = getattr(coordinator, "mem_pool_device", None)
+    tracker = getattr(tracker, "adaptive_vmm", None)
+    backing = getattr(tracker, "backing", None)
+    snapshot = getattr(backing, "broker_snapshot", None)
+    return snapshot() if callable(snapshot) else snapshot
 
 
 def remember_request_decision(
@@ -99,6 +137,13 @@ def install_request_residency():
         raise ValueError("direct shared-prefix reuse requires adaptive resident hints")
     if shared_prefix_mode == "direct" and full_batch_swap:
         raise ValueError("direct shared-prefix reuse does not support full-batch swap")
+    global_fair_mode = os.environ.get(
+        "EKV_GLOBAL_BROKER_FAIR_MODE", "off"
+    ).strip().lower()
+    if global_fair_mode not in ("off", "observe", "enforce"):
+        raise ValueError(
+            "EKV_GLOBAL_BROKER_FAIR_MODE must be off, observe or enforce"
+        )
     minimum_hint_tokens = int(
         os.environ.get("EKV_RESIDENT_MIN_HINT_OUTPUT_TOKENS", "256")
     )
@@ -195,6 +240,10 @@ def install_request_residency():
                                      "shared_prefix_native_blocks": 0,
                                      "shared_prefix_native_requests": 0,
                                      "shared_prefix_partial_requests": 0,
+                                     "global_fair_claim_checks": 0,
+                                     "global_fair_claim_would_yield": 0,
+                                     "global_fair_claim_declines": 0,
+                                     "global_fair_mode": global_fair_mode,
                                      "future_hint_claim_attempts": 0, "future_hint_declines": 0,
                                      "future_hint_missing": 0, "future_hint_invalid": 0,
                                      "future_decision_reasons": {},
@@ -362,6 +411,18 @@ def install_request_residency():
                 decline_reason = decision.reason
         elif not slots_available or req.kv.kv_allocated_len <= self.device_buffer_size:
             claim = False
+
+        if claim and global_fair_mode != "off":
+            would_yield, fair_block = resident_admission_fairness(
+                coordinator_broker_snapshot(self), global_fair_mode
+            )
+            stats["global_fair_claim_checks"] += 1
+            if would_yield:
+                stats["global_fair_claim_would_yield"] += 1
+            if fair_block:
+                stats["global_fair_claim_declines"] += 1
+                claim = False
+                decline_reason = "global-fair-share-pressure"
 
         # Every TP worker must take the collective path before any rank can
         # switch to the native staging queue. A local disagreement therefore

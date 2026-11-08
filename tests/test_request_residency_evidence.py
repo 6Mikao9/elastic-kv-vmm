@@ -1,7 +1,12 @@
 import unittest
 from collections import OrderedDict
+from types import SimpleNamespace
 
-from adaptive_sparse.request_residency import remember_request_decision
+from adaptive_sparse.request_residency import (
+    coordinator_broker_snapshot,
+    remember_request_decision,
+    resident_admission_fairness,
+)
 
 
 class RequestResidencyEvidenceTest(unittest.TestCase):
@@ -49,6 +54,56 @@ class RequestResidencyEvidenceTest(unittest.TestCase):
             tp_world_size=1,
         )
         self.assertEqual(stats["requests"], OrderedDict())
+
+    def test_fair_resident_admission_observes_then_enforces_pressure(self):
+        self.assertEqual(resident_admission_fairness(None, "off"), (False, False))
+        observed = {
+            "fair_mode": "observe",
+            "fair_share_would_yield": True,
+            "fairness_pressure": False,
+        }
+        self.assertEqual(
+            resident_admission_fairness(observed, "observe"), (True, False)
+        )
+        enforced = {
+            "fair_mode": "enforce",
+            "fair_share_would_yield": True,
+            "fairness_pressure": True,
+        }
+        self.assertEqual(
+            resident_admission_fairness(enforced, "enforce"), (True, True)
+        )
+
+    def test_fair_resident_admission_rejects_stale_or_malformed_state(self):
+        with self.assertRaisesRegex(RuntimeError, "does not match"):
+            resident_admission_fairness(
+                {"fair_mode": "observe", "fairness_pressure": False},
+                "enforce",
+            )
+        with self.assertRaisesRegex(RuntimeError, "invalid"):
+            resident_admission_fairness(
+                {
+                    "fair_mode": "enforce",
+                    "fair_share_would_yield": 1,
+                    "fairness_pressure": True,
+                },
+                "enforce",
+            )
+        with self.assertRaisesRegex(RuntimeError, "requires"):
+            resident_admission_fairness(None, "enforce")
+
+    def test_coordinator_snapshot_reads_callable_backing_property(self):
+        calls = []
+        backing = SimpleNamespace(
+            broker_snapshot=lambda: calls.append(True) or {"fair_mode": "off"}
+        )
+        coordinator = SimpleNamespace(
+            mem_pool_device=SimpleNamespace(
+                adaptive_vmm=SimpleNamespace(backing=backing)
+            )
+        )
+        self.assertEqual(coordinator_broker_snapshot(coordinator), {"fair_mode": "off"})
+        self.assertEqual(calls, [True])
 
 
 if __name__ == "__main__":

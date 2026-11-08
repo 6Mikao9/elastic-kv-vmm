@@ -109,8 +109,15 @@ demand；申请成功后立即清除。另一个超额 tenant 若继续增长，
 `fairness_pressure` 会沿现有 TP collective 取任一 rank 的最紧张值。MiniMax 在
 全局可用字节尚未低于普通高水位时，也会因公平欠额触发同一套安全 demotion；
 只有公平压力消失且全局低水位保持稳定后才恢复 promotion。Dense V5 的
-`available_size()` 同时取设备余量、broker 总余量和当前 tenant 的目标余额，避免
-先向 SGLang 分配一个最终无法映射的 batch。
+`available_size()` 同时考虑设备余量、broker 总余量和当前 tenant 的公平压力；
+受压时新增长预算归零，避免先向 SGLang 分配一个最终无法映射的 batch。
+
+请求级驻留准入也会读取当前 rank 的 broker 快照。`observe` 只累计
+`global_fair_claim_would_yield`，不改变请求放置；`enforce` 下若当前 tenant 已
+超过目标且其他 tenant 有未满足 demand，新请求直接进入 native HiSparse，而不是
+先占完整 GPU KV、再在后续 decode 边界尝试降级。各 TP rank 分别检查本地 GPU 的
+broker，再对“是否允许驻留”做 MIN collective；任一 rank 受压时整组保守回退。
+这要求 MiniMax 使用 VMM backing；缺少 broker 快照时 fail closed。
 
 `EKV_GLOBAL_BROKER_WAIT_MS` 可以选择让一次租约申请在有限时间内轮询重试，默认
 为 0。最大值为 5 秒；它只适合能容忍 scheduler 线程短暂停顿的部署。Dense V5
@@ -172,7 +179,8 @@ PyTorch allocator cache、Graph private pool 和 activation workspace 仍然由�
 - 压力协调依赖实例运行 scheduler hook；它不能控制未接入 broker 的 allocator。
 - 没有跨进程 live-KV 传输，也没有可由 broker 单方面触发的 safe preemption。
 - MiniMax 的 indexer、权重、activation 和 Graph pool 不在当前 VMM 预算内。
-- 跨模型共享前缀和“其他实例已驻留的 Top-K chunk”尚未接入。
+- 同进程、同一完整 prefix 的 resident donor 已能直接服务 HiSparse Top-K；跨实例
+  共享前缀、部分 block 共享和 donor 完成后的 pinning 尚未接入。
 - 还没有使用真实双实例、多 TP 规模完成端到端时延和 OOM 对照。
 - 公平预算仍只覆盖 VMM-backed KV；prefill 激活、权重、PyTorch cache 和 Graph
   private pool 仍是外部预算。
@@ -194,6 +202,11 @@ PyTorch allocator cache、Graph private pool 和 activation workspace 仍然由�
 整卡 NVML、TTFT/TPOT、完成率和 OOM/fail-stop。若 `shared-adaptive` 只是减少
 OOM 但显著拖慢正常请求，应保留结果并把 fair-share 单独列为下一步，而不能把
 “能跑不 OOM”写成吞吐收益。
+
+MiniMax 额外记录 `global_fair_claim_checks`、`global_fair_claim_would_yield`、
+`global_fair_claim_declines` 和每个请求的 `future_decision_reasons`。验收时要确认
+受压 rank 的同一请求全部回退到 host-backed，不能用“另外三个 rank 已驻留”解释
+一组不一致的 TP 状态。
 
 CPU 上可以用 `python -m benchmarks.global_broker_latency` 单独测 SQLite 准入
 开销。该基准不包含 `cuMemMap`、模型计算或真实双服务竞争，只能用于检查公平查询

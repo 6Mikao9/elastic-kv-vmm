@@ -138,10 +138,17 @@ participant reaches the scheduler hook:
 ```
 
 An over-share owner is denied *new* leases while another tenant has an unmet
-demand. Dense V5 caps `available_size()` by the tenant's remaining share and
-MiniMax treats the same signal as pressure before aggregate exhaustion. The
+demand. Dense V5 returns no new-growth budget under the same fairness pressure,
+and MiniMax treats the signal as pressure before aggregate exhaustion. The
 broker never unmaps another process's live KV. Wait-based retry is optional and
 limited to 5 seconds because it can delay the calling scheduler.
+
+MiniMax also samples the same tenant signal when a new request would claim a
+complete-GPU KV history. `observe` records `global_fair_claim_would_yield`
+without changing placement; `enforce` turns live fairness pressure into a
+native-HiSparse admission on every TP rank. This prevents a resident request
+from taking memory that the scheduler would immediately try to reclaim. The
+request stays on the native hot-set path until a later safe promotion boundary.
 
 The MiniMax scheduler can consume the same broker state. Set
 `EKV_ADAPTIVE_GLOBAL_BROKER_HEADROOM_BYTES` to the local VMM bytes it should
@@ -222,9 +229,11 @@ into a performance result.
 The MiniMax request-residency path can consume the same hint. With
 `--resident-hint-policy adaptive`, `host_backed` yields a complete-GPU KV slot,
 `resident` requests one when capacity and the per-rank reserve permit it, and
-`auto` uses the predicted output length. The policy is opt-in and remains below
-SGLang's native admission and physical-reserve checks. Its paired GPU experiment
-is specified in the [HiSparse reproduction guide](docs/HISPARSE_REPRODUCE.md).
+`auto` uses the predicted output length. With global broker fairness enabled,
+resident claims also obey the per-rank admission snapshot described above. The
+policy is opt-in and remains below SGLang's native admission and physical-reserve
+checks. Its paired GPU experiment is specified in the
+[HiSparse reproduction guide](docs/HISPARSE_REPRODUCE.md).
 
 `--shared-prefix-reuse direct` additionally lets a host-backed HiSparse request
 resolve complete Top-K blocks inside a verified shared prefix from another live

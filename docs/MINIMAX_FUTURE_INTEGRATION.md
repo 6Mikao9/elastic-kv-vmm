@@ -61,6 +61,13 @@ deadline r2 的 future telemetry 为 84 个 scheduler tick、1 次队列重排�
 
 当前 `mixed12k_unequal` 的验收设计是阈值 128：一个 12K 输入、64 输出 token 的长请求退到原生热池；另一个 12K 输入、128 输出 token 的长请求可申请驻留。该切片目前只有纯策略、排序和源码接入验证；尚未在独占 A100 上完成 paired run，因此不能把“少占槽”或“命中预期请求”写成性能收益。后续需要同时检查每 rank 的 `future_decision_reasons`、真实驻留层行数、TTFT/TPOT、VMM backing 和整卡 NVML。
 
+使用 `EKV_GLOBAL_BROKER_FAIR_MODE=observe|enforce` 时，请求级驻留决策还会在
+staging 前读取本 rank 的 tenant broker 快照。`observe` 只记录本来会回退多少次；
+`enforce` 遇到公平压力时，让同一请求在所有 TP rank 一致走 native HiSparse。
+这把“全局高负载 -> 请求退化为稀疏路径”前移到请求准入点，避免完整 KV 已经占用后
+才进入迁移路径。相关计数为 `global_fair_claim_checks`、
+`global_fair_claim_would_yield` 和 `global_fair_claim_declines`。
+
 ## 正确性与可复现门禁
 
 - 两组自适应轮次的语义烟测通过，请求 token 数完整。
