@@ -9,10 +9,15 @@ gpu=$1; model=$2; output=$3
 shift 3
 root=$(cd "$(dirname "$0")/.." && pwd)
 image=${FUTURE_SMOKE_IMAGE:-lmsysorg/sglang:dev-minimax-m31-flash}
+idle_mib=${FUTURE_SMOKE_IDLE_MIB:-32}
+if [[ ! $idle_mib =~ ^[0-9]+$ ]]; then
+    echo "FUTURE_SMOKE_IDLE_MIB must be a non-negative integer." >&2
+    exit 2
+fi
 test -r "$model/config.json"
 IFS=, read -r gpu_uuid gpu_memory gpu_util < <(nvidia-smi -i "$gpu" --query-gpu=uuid,memory.used,utilization.gpu --format=csv,noheader,nounits)
 apps=$(nvidia-smi --query-compute-apps=gpu_uuid --format=csv,noheader)
-if [[ ${gpu_memory// /} != 0 || ${gpu_util// /} != 0 ]] || grep -Fxq "${gpu_uuid// /}" <<< "$apps"; then
+if (( gpu_memory > idle_mib || gpu_util != 0 )) || grep -Fxq "${gpu_uuid// /}" <<< "$apps"; then
     echo "Selected GPU is busy; refusing to start." >&2
     exit 1
 fi
