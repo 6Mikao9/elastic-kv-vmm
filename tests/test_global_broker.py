@@ -8,6 +8,9 @@ from pathlib import Path
 from elastic_kv.global_broker import GlobalAdmissionBroker
 
 
+PROCESS_START_TIMEOUT_SECONDS = 60
+
+
 def _race_for_lease(path, index, barrier, results):
     broker = GlobalAdmissionBroker(
         path,
@@ -16,10 +19,10 @@ def _race_for_lease(path, index, barrier, results):
         heartbeat_seconds=None,
     )
     try:
-        barrier.wait(timeout=10)
+        barrier.wait(timeout=PROCESS_START_TIMEOUT_SECONDS)
         decision = broker.reserve({f"owner-{index}/chunk-0": 1})
         results.put(decision.admit)
-        barrier.wait(timeout=10)
+        barrier.wait(timeout=PROCESS_START_TIMEOUT_SECONDS)
     finally:
         broker.close()
 
@@ -32,13 +35,13 @@ def _race_for_mixed_capacity(path, index, barrier, results):
         heartbeat_seconds=None,
     )
     try:
-        barrier.wait(timeout=10)
+        barrier.wait(timeout=PROCESS_START_TIMEOUT_SECONDS)
         if index % 2:
             decision = broker.claim(f"claim-{index}", 1)
         else:
             decision = broker.reserve({f"lease-{index}": 1})
         results.put(decision.admit)
-        barrier.wait(timeout=10)
+        barrier.wait(timeout=PROCESS_START_TIMEOUT_SECONDS)
     finally:
         broker.close()
 
