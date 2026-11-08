@@ -310,8 +310,9 @@ allocator，也不能把预测变成硬 OOM 保证。动态 demotion 在物理�
 总预测，动态升级时会扣除从 staging 基线到当前长度已经生成的 token。升级迁移在
 清理 host hot buffer 时只释放当前 reservation，保留 baseline，使后续
 demote/promote 仍按同一生成进度扣减；只有真实请求完成或 abort 才删除 baseline。
-请求完成与中止则无条件清理残留承诺。加入 prefill reservation 回归后，当前在
-SGLang 0.5.17 镜像内 157 项测试通过、3 项因无 GPU 跳过；在线迁移开销、预测误差和端到端
+请求完成与中止则无条件清理残留承诺。加入 prefill reservation 和 0.5.17
+IPC transport 回归后，当前在 SGLang 0.5.17 镜像内 167 项测试通过、2 项因无
+GPU 跳过；在线迁移开销、预测误差和端到端
 收益仍需真实 serving 配对实验。
 
 ### 5.3 已知未来请求的 prefill 预留

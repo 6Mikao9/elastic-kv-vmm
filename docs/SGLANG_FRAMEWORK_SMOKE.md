@@ -45,6 +45,40 @@ output token。每轮有独立 warmup；每个模式另跑 12 个固定 greedy �
 机器生成的汇总与逐请求结果见
 [`results/sglang-framework-smoke`](../results/sglang-framework-smoke/)。
 
+## 2026-11-08 SGLang 0.5.17 接入复核
+
+5090 新增了 0.5.17 的 tokenizer-to-scheduler transport。0.5.17 的
+`TokenizedGenerateReqInput` 是基于 `msgspec.Struct` 的二进制 IPC schema，普通
+Python 动态属性不会进入 msgpack。适配器在 worker 启动前重新生成带
+`kv_hints` 字段的同名 struct，tokenizer 发送规范化的 mapping，scheduler 再恢复
+为不可变 envelope。对应请求类和 scheduler 排队 wrapper 均保持原生
+`PrefillPlan`、`PrefillAdder` 和容量检查不变。
+
+同一镜像内全量结果为 167 passed、2 skipped；跳过项都要求 CUDA device。
+随后尝试在 5090 GPU0 启动 `Qwen2.5-3B`。服务已越过请求 transport 并进入 SGLang
+启动流程，但 GPU0/1/3 的 Docker 容器均报 `CUDA unknown error`，最终在
+`ServerArgs._handle_missing_default_values()` 报 `No accelerator`。宿主
+`nvidia-container-cli info` 同时报 `nvml error: unknown error`，而 GPU2 在宿主
+NVML 中本身为 `Unknown Error`。因此没有生成 serving 延迟或显存结果，也没有把
+启动失败记成算法收益。带 SHA256 的服务日志与环境摘要保存在
+[`results/future-smoke/5090-gpu-blocker`](../results/future-smoke/5090-gpu-blocker/)。
+
+恢复 GPU runtime 后，先复跑 baseline，再以相同模型和输出目录版本运行 VMM：
+
+```bash
+FUTURE_SMOKE_IMAGE=lmsysorg/sglang:latest \
+  bash scripts/container_future_smoke.sh 0 /data/model/Qwen2.5-3B \
+  results/future-smoke/5090-qwen25-3b-baseline-r4
+
+FUTURE_SMOKE_IMAGE=lmsysorg/sglang:latest \
+  bash scripts/container_future_smoke.sh 0 /data/model/Qwen2.5-3B \
+  results/future-smoke/5090-qwen25-3b-v5-r1 \
+  --elastic-mode v5 --elastic-retain-chunks 1
+```
+
+runner 现在会落盘逐请求 TTFT、TPOT、总延迟、输出 token/s、整卡 NVML、future hook
+计数和 VMM logical/backed bytes；只有 baseline 和 V5 都完成后才能比较内存与效率。
+
 ## 本次修复
 
 第一次 V5 smoke 没有进入 `ElasticPool`：服务日志仍显示原生固定 pool。原因是新启动器

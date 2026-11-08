@@ -1,17 +1,19 @@
-# SGLang 0.5.2 `kv_hints` compatibility
+# SGLang 0.5.2/0.5.17 `kv_hints` compatibility
 
-SGLang 0.5.2 carries ordinary request metadata across the HTTP, tokenizer and
-scheduler processes, but it predates the native `kv_hints` field used by the
-future-aware scheduler hook. The dense VMM adapter is measured on 0.5.2, so the
-future policy has to cross those three process-local boundaries without
-requiring a different serving build for its baseline and VMM arms.
+Neither SGLang 0.5.2 nor 0.5.17 carries the `kv_hints` transport used by this
+project's future-aware scheduler hook. The compatibility layer crosses the HTTP,
+tokenizer and scheduler process boundaries on both releases while keeping the
+same baseline and VMM serving build.
 
 `adaptive_sparse/kv_hints_compat.py` provides that transport only:
 
 1. `GenerateReqInput` gains an appended `kv_hints` field before `http_server`
    imports the request class. Single, batch-broadcast, per-item and parallel
    sampling forms are normalized at this boundary.
-2. The tokenizer wrapper copies the typed envelope onto the tokenized request.
+2. The tokenizer wrapper validates and converts the envelope to a wire-safe
+   mapping. On 0.5.17, it appends `kv_hints` to the msgspec
+   `TokenizedGenerateReqInput` schema before the scheduler starts; SGLang uses
+   that schema for msgpack IPC, so a dynamic Python attribute is insufficient.
    It does not parse or change prompt tokens, sampling parameters or output.
 3. The scheduler wrapper attaches the envelope and scheduler receive time to
    `Req` before the native `SchedulePolicy.calc_priority()` call. The future hook
@@ -60,9 +62,10 @@ memory admission checks.
 
 The focused tests cover immutable envelope decoding, malformed input, batch and
 parallel expansion, pickling, HTTP-to-tokenizer-to-scheduler transport,
-receive-time propagation and native `kv_hints` detection. A real A100 run also
-passes the complete VMM-plus-future path in both eager and CUDA Graph modes;
-the checked-in evidence is under `results/integration-smoke/`.
+receive-time propagation, native `kv_hints` detection and the 0.5.17 msgspec
+field extension. A real A100 run also passes the complete VMM-plus-future path
+in both eager and CUDA Graph modes; the checked-in evidence is under
+`results/integration-smoke/`.
 
 Run the CPU checks from the project root:
 
