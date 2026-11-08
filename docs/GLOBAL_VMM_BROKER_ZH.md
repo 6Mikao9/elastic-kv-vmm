@@ -67,7 +67,8 @@ prefill 的临时 claim 默认关闭。`EKV_GLOBAL_BROKER_PREFILL_MODE=observe` 
 `Scheduler.get_new_batch_prefill` 选择 batch 前原子插入 claim。broker 的可用字节
 和 fairness 用量都会同时扣除 lease 与 claim，因此预热/压缩之后能腾出的空间不会
 被两个实例在同一时刻重复花掉。原生调度器选出实际 batch 后，适配器会在同一事务
-中把 claim 缩到 `batch.input_ids.numel()` 对应的 workspace 估算；尚未进入本批的
+中把 claim 缩到所选 batch 的 workspace 估算；兼容旧版 `batch.input_ids` 和新版
+`batch.prefill_input_ids_cpu` 两种 token staging 形态，尚未进入本批的
 等待请求不会继续占着跨实例额度。`ModelRunner.forward` 成功返回后才删除 claim；
 scheduler 返回空 batch 时立即删除。scheduler 或 forward 抛错时不猜测激活和在途
 kernel 已经静止，claim 保留到 backend/process teardown。

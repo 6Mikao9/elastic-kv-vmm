@@ -1,7 +1,7 @@
-from contextlib import nullcontext
 import sys
-from types import ModuleType, SimpleNamespace
 import unittest
+from contextlib import nullcontext
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 from elastic_kv import activation
@@ -378,6 +378,18 @@ class ActivationTest(unittest.TestCase):
                 SimpleNamespace(batch_size=1), bytes_per_token=3, max_bytes=12
             )
         )
+
+    def test_prefill_batch_workspace_uses_newer_staged_cpu_inputs(self):
+        batch = SimpleNamespace(
+            batch_size=2,
+            input_ids=None,
+            prefill_input_ids_cpu=SimpleNamespace(numel=lambda: 4),
+        )
+        estimate = activation.estimate_prefill_batch_workspace(
+            batch, bytes_per_token=3, max_bytes=20
+        )
+        self.assertEqual(estimate.bytes, 12)
+        self.assertEqual(estimate.prompt_tokens, 4)
 
     def test_global_prefill_claim_survives_forward_error_until_teardown(self):
         cuda = Mock()

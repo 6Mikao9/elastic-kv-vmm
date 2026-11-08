@@ -4,13 +4,12 @@ The configured headroom is an experimental target. Remaining pressure is
 recorded and normal allocation continues; scheduler admission is unchanged.
 """
 
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-import os
 from functools import wraps
 from threading import local
 from time import monotonic_ns, perf_counter_ns
-
 
 _CONTEXT = local()
 _POLICY = "off"
@@ -110,22 +109,27 @@ def estimate_prefill_batch_workspace(batch, *, bytes_per_token, max_bytes):
         raise ValueError("prefill workspace limits must be nonnegative")
     if _batch_is_empty(batch):
         return PrefillWorkspaceEstimate(bytes=0)
-    ids = getattr(batch, "input_ids", None)
-    if ids is None:
-        return None
-    numel = getattr(ids, "numel", None)
-    try:
-        tokens = numel() if callable(numel) else len(ids)
-        tokens = int(tokens)
-    except (TypeError, ValueError):
-        return None
-    if tokens < 0:
-        return None
-    return PrefillWorkspaceEstimate(
-        bytes=min(max_bytes, tokens * bytes_per_token),
-        prompt_tokens=tokens,
-        requests=1 if tokens else 0,
-    )
+    # Newer SGLang stages extend tokens in ``prefill_input_ids_cpu`` and leaves
+    # ``input_ids`` as None until forward resolves the pinned CPU tensor on the
+    # compute stream. 0.5.2 keeps the flattened extend tensor in ``input_ids``.
+    for attribute in ("input_ids", "prefill_input_ids_cpu"):
+        ids = getattr(batch, attribute, None)
+        if ids is None:
+            continue
+        numel = getattr(ids, "numel", None)
+        try:
+            tokens = numel() if callable(numel) else len(ids)
+            tokens = int(tokens)
+        except (TypeError, ValueError):
+            continue
+        if tokens < 0:
+            continue
+        return PrefillWorkspaceEstimate(
+            bytes=min(max_bytes, tokens * bytes_per_token),
+            prompt_tokens=tokens,
+            requests=1 if tokens else 0,
+        )
+    return None
 
 
 def _find_broker_backing(controller):
