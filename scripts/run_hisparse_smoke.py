@@ -369,7 +369,7 @@ def main():
     parser.add_argument("--future-workload", type=Path,
                         help="plan and execute a known-future workload")
     parser.add_argument("--future-planning-policy",
-                        choices=("fifo", "longest", "mode-aware", "future", "oracle"),
+                        choices=("fifo", "longest", "mode-aware", "future", "online", "oracle"),
                         default="future")
     parser.add_argument("--future-no-hints", action="store_true")
     parser.add_argument("--future-service-time-feedback", action="store_true")

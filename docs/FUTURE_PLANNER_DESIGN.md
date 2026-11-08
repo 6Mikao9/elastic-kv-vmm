@@ -5,8 +5,8 @@ SGLang 的准入顺序和 VMM 驻留决策。第一阶段以正确、可离线�
 GPU 结果出来前，不把规划收益写成已证实的性能收益。
 
 当前实现状态：`adaptive_sparse/future_plan.py` 已提供不依赖 SGLang/CUDA 的
-确定性事件模拟，比较 `fifo`、`longest`、`mode-aware`、`future` 和有界
-`oracle` 五种策略；
+确定性事件模拟，比较 `fifo`、`longest`、`mode-aware`、`future`、有界
+`online` 和有界 `oracle` 六种策略；
 `adaptive_sparse/sglang_future_hook.py` 已实现默认关闭的 scheduler 排序 hook。
 在带原生 `kv_hints` 的 SGLang revision 上它直接复用上游传输；在 0.5.2 上则
 由 `adaptive_sparse/kv_hints_compat.py` 在 HTTP 请求类、tokenizer 和 scheduler
@@ -247,7 +247,22 @@ duration = prompt_tokens / prefill_rate + expected_output_tokens / decode_rate
 短窗口 EWMA 声称 deadline 可满足。真实收益必须比较关闭/开启反馈的两组相同
 GPU trace。
 
-### 4.0 已知未来的有界 oracle
+### 4.0 有界在线 rollout
+
+`online` 用于缩小可部署启发式与离线 oracle 之间的决策差。它不回放最终计划，
+而是在每个 scheduler 决策边界枚举当前已到达请求及其可行驻留模式。每个候选
+首动作都交给普通 `future` 启发式完成剩余事件模拟，再按与 oracle 相同的分层
+目标比较结果；规划器只提交获胜分支的第一个动作，到下一边界重新求解。因此该
+策略不会把 rollout 中未执行的未来动作当成固定承诺。
+
+`online_max_rollouts` 限制单次 trace 的完成模拟次数。预算不足时，当前状态直接
+完成后缀 `future` 模拟，并输出 `search_truncated=true` 与
+`fallback_policy="online_prefix_then_future"`。该结果保留已提交的 online
+前缀，并非从头运行的普通 `future` 计划。`online` 的 `search_exact` 始终为 false：完整
+rollout 等于离线质量诊断；它仍受 `lookahead_ms` 和启发式后缀限制，也不证明
+真实 serving 最优或改变 `PrefillAdder` 的最终准入权。
+
+### 4.1 已知未来的有界 oracle
 
 `oracle` 用于离线研究和在线调度器的上界参照。它在每个可决策边界枚举：
 
@@ -260,16 +275,20 @@ GPU trace。
 属于对称节点；只展开其中 ID 最小的一个，能够去掉工具批次的阶乘重复，同时
 保持上述确定性平局结果。
 
-搜索受 `oracle_max_expansions` 限制。实现先把现有 `future` 计划作为 incumbent，
-因此达到上限或搜索失败时不会产生比启发式更差的计划；此时输出
-`search_truncated=true`、`search_exact=false`、`fallback_policy="future"`。
-只有搜索完整且产生了搜索 incumbent 时才报告 `search_exact=true`。这套 bounded
-oracle 只验证离线决策质量，不会在 scheduler 热路径运行，也不能绕过
+搜索受 `oracle_max_expansions` 限制。实现先把现有 `future` 与 `online` 计划中
+按同一分层目标更优者作为 incumbent，因此达到上限或搜索失败时不会产生比可部署
+启发式更差的计划；此时输出 `search_truncated=true`、`search_exact=false`，
+并由 `fallback_policy` 标明实际采用的 `future` 或 `online`。
+构造 incumbent 所需的 online rollout 独立受 `online_max_rollouts` 限制，其成本由
+`search_preparation_rollouts` 单独记录，不从 `oracle_max_expansions` 中隐式扣除。
+只要搜索完整、没有触发 expansion cap，即使最优结果是预先评估的 deployable
+incumbent，也报告 `search_exact=true`。这套 bounded oracle 只验证离线决策质量，
+不会在 scheduler 热路径运行，也不能绕过
 `PrefillAdder`。请求的 `priority` 是历史 JSON 字段名，表示离线目标中的软业务
 权重；`plan_rollout()` 只把它写成 `FutureHint.weight`，不会赋值给 SGLang 的
 `request.priority`，因此原生硬优先级层级仍由 SGLang 所有。
 
-### 4.0.1 已实现：共享前缀的规划容量抵扣
+### 4.1.1 已实现：共享前缀的规划容量抵扣
 
 `prefix_group` 与 `shared_prefix_tokens` 现在进入规划器和运行时 hint。对于同一
 prefix group 的多个同时驻留请求，规划器只计算一份不可变共享前缀 KV：
@@ -310,7 +329,7 @@ HiSparse hot-set，峰值反而只有 2,200 token。固定速率下，前者模�
 为 254 ms，后者为 1,004 ms。这个例子说明共享前缀用少量额外驻留字节换取了更少
 的 HiSparse 模式，也说明不能只比较峰值显存；它是确定性策略回放，不是模型实测。
 
-### 4.1 受控 rollout 的可执行计划
+### 4.2 受控 rollout 的可执行计划
 
 `plan_rollout()` 把离线策略结果转换成 orchestrator 可执行的动作。每个 action
 包含原始与计划到达时间、预计完成时间、请求类型，以及可直接放入
@@ -321,7 +340,7 @@ hint 使用 `release_after_ms=0`，并把绝对 deadline 换算成相对 schedul
 ```bash
 python3 scripts/future_plan_compare.py \
   benchmarks/workloads/known-future-rollout.json \
-  --policies fifo future oracle \
+  --policies fifo future online oracle \
   --emit-policy oracle \
   --output results/future-planning/oracle-comparison.json
 ```
@@ -381,7 +400,7 @@ python3 scripts/run_future_smoke.py \
 `planned_residence` 与 `actual_residence`，并要求各 TP rank 对实际模式一致。
 只有这一证据存在时，才能把“计划让哪些请求驻留”与端到端性能一起分析。
 
-### 4.2 已知请求类型画像
+### 4.3 已知请求类型画像
 
 同一模型下的 tool call、chat turn 和长 rollout 往往有不同的 prefill 吞吐、
 decode 吞吐、HiSparse 热集、prefill workspace 和自动驻留阈值。`PlannerConfig`
@@ -437,12 +456,13 @@ workload 生成，但服务端执行原生排队。两次运行必须写到不�
 orchestrator 的真实提交时刻；runtime hook 中的 `release_after_ms` 仍只是软排序
 提示，不能被误写成 `PrefillAdder` 的硬准入门槛。
 
-仓库内合成样例只用于回归 harness。该样例中 FIFO、mode-aware、future 分别记录
-3、2、0 个 deadline miss，future 的模拟 makespan 为 1,988 ms，峰值预算为
-4,008,192 bytes。默认 100,000 次展开的有界 oracle 在该七请求 trace 上触发上限，
-并按契约保留 future incumbent；这不表示真实服务应在线运行 oracle。构造性小
-样例会在单元测试中证明 oracle 能找到 FIFO 漏掉的期限可行方案，并验证主动
-idle 和两种驻留模式都会被搜索。以上都是固定输入上的策略行为证据，不是模型、
+仓库内合成样例只用于回归 harness。该七请求 trace 中 FIFO 记录 3 个 deadline
+miss，`future` 的加权完成时间为 757.682 ms、makespan 为 1,988 ms；`online`
+把加权完成时间降到 644.955 ms，但 makespan 增至 2,052 ms，说明分层目标仍在
+权衡批次完成时间。默认 100,000 次展开的有界 oracle 在该 trace 上触发上限，
+并把已评估的 `online` 作为 `fallback_policy`；这不表示真实服务应运行 oracle。
+另一个三点构造样例中，`online` 与完整 oracle 都达到 64.571 ms 加权完成时间，
+而普通 `future` 为 67.143 ms。以上都是固定输入上的策略行为证据，不是模型、
 GPU 或生产负载上的性能结论；真实效果必须用同一模型、权重、请求体和 TP 配置
 重新测量。
 

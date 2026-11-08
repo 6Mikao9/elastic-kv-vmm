@@ -126,7 +126,81 @@ class FuturePlanTest(unittest.TestCase):
         self.assertEqual(result.policy, "oracle")
         self.assertTrue(result.search_truncated)
         self.assertFalse(result.search_exact)
-        self.assertEqual(result.fallback_policy, "future")
+        self.assertIn(result.fallback_policy, {"future", "online"})
+        self.assertGreater(result.search_preparation_rollouts, 0)
+        self.assertLessEqual(
+            result.search_preparation_rollouts,
+            bounded.online_max_rollouts,
+        )
+        self.assertLessEqual(result.search_expansions, 1)
+        self.assertEqual(len(result.admissions), len(self.workload))
+        self.assertLessEqual(result.peak_memory_bytes, bounded.memory_budget_bytes)
+
+    def test_online_rollouts_close_a_mode_choice_gap(self):
+        config = PlannerConfig(
+            memory_budget_bytes=900_000,
+            kv_bytes_per_token=1000,
+            prefill_workspace_bytes_per_token=1,
+            sparse_hot_tokens=64,
+            prefill_tokens_per_ms=8,
+            resident_decode_tokens_per_ms=10,
+            sparse_decode_tokens_per_ms=16,
+            max_active_requests=3,
+            lookahead_ms=40,
+            auto_resident_output_threshold=32,
+            oracle_max_expansions=20_000,
+        )
+        workload = [
+            RequestProfile(
+                "r0", 20, 64, 32, priority=1.0, deadline_ms=140
+            ),
+            RequestProfile(
+                "r1", 30, 320, 64, priority=2.0, deadline_ms=110
+            ),
+            RequestProfile(
+                "r2", 50, 192, 32, priority=0.5, deadline_ms=230
+            ),
+        ]
+
+        future = simulate(workload, config, "future")
+        online = simulate(workload, config, "online")
+        oracle = simulate(workload, config, "oracle")
+
+        self.assertTrue(oracle.search_exact)
+        self.assertLess(
+            online.weighted_completion_ms,
+            future.weighted_completion_ms,
+        )
+        self.assertEqual(
+            (
+                online.deadline_misses,
+                online.weighted_completion_ms,
+                online.makespan_ms,
+            ),
+            (
+                oracle.deadline_misses,
+                oracle.weighted_completion_ms,
+                oracle.makespan_ms,
+            ),
+        )
+        self.assertGreater(online.search_expansions, 0)
+        self.assertFalse(online.search_truncated)
+
+    def test_online_rollout_budget_falls_back_to_future(self):
+        bounded = PlannerConfig(
+            **{
+                **self.config.as_dict(),
+                "online_max_rollouts": 1,
+            }
+        )
+        result = simulate(self.workload, bounded, "online")
+
+        self.assertEqual(result.policy, "online")
+        self.assertTrue(result.search_truncated)
+        self.assertEqual(
+            result.fallback_policy,
+            "online_prefix_then_future",
+        )
         self.assertEqual(len(result.admissions), len(self.workload))
         self.assertLessEqual(result.peak_memory_bytes, bounded.memory_budget_bytes)
 

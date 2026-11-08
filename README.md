@@ -229,16 +229,23 @@ clocks require a separate calibration protocol. A matching unhinted control arm
 can be run with `--no-hints` for paired real-serving measurements.
 The offline comparison also includes a bounded `oracle` policy. It searches
 request order, resident/HiSparse placement and intentional idle transitions;
-identical request signatures are collapsed, and the existing `future` plan is
-retained as an incumbent when the expansion cap is reached. Search telemetry is
-exported as `search_expansions`, `search_truncated` and `fallback_policy`.
+identical request signatures are collapsed, and the better of the deployable
+`future` and `online` plans is retained as an incumbent when the expansion cap
+is reached. Search telemetry is exported as `search_expansions`,
+`search_truncated` and `fallback_policy`.
 `search_exact` distinguishes a completed search from a capped incumbent. Use
-`--policies fifo future oracle` to limit offline work; an emitted policy is
-automatically included and its simulation is reused. Each result also carries
-`oracle_gap` metrics when the comparison includes oracle. A negative makespan
-gap is possible because deadline misses and weighted completion are optimized
-before makespan. This is an offline planning upper bound, not a scheduler
-hot-path algorithm.
+`online` to evaluate each immediate action by completing the deployable
+`future` heuristic from that branch, then commit only the first action. Its
+`online_max_rollouts` budget makes the search bounded. Exhaustion keeps the
+already committed `online` prefix and completes it with a `future` suffix; the
+`fallback_policy="online_prefix_then_future"` label makes this hybrid explicit.
+Use
+`--policies fifo future online oracle` to limit offline work; an emitted policy
+is automatically included and its simulation is reused. Each result also
+carries `oracle_gap` metrics when the comparison includes oracle. A negative
+makespan gap is possible because deadline misses and weighted completion are
+optimized before makespan. This is an offline planning upper bound, not a
+scheduler hot-path algorithm.
 The same executor can treat each planned timestamp as an earliest admission
 time, bound the observed in-flight set, prioritize deadline-bearing requests,
 and demote only newly admitted long requests when the live predicted KV set

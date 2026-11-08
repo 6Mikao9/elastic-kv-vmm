@@ -138,6 +138,9 @@ Scheduler wrapper
   不保证包含共享前缀，因此新增回归禁止对其做乐观抵扣。
 - 物理预热与准入窗口已解耦：准入继续覆盖完整 horizon，真实 scheduler
   wrapper 只把 `start_in_ms <= EKV_PREDICTIVE_PREWARM_TTL_MS` 的需求交给 VMM。
+- 新增 `online` 策略：每个当前动作都通过一次有界 `future` rollout 评估，只
+  承诺首动作；三点模式选择回归从 `future` 的 67.142857 ms 加权完成时间收敛到
+  oracle 的 64.571429 ms，rollout 预算耗尽时回退 `future`。
 - CUDA hit/miss 和同 trace serving A/B 仍未运行；本审计只
   确认代码契约、CPU 策略与资源记账，不把 CPU 证据外推成真实服务收益或正确性
   结论。

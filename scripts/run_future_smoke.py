@@ -144,7 +144,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--planning-policy",
-        choices=("fifo", "longest", "mode-aware", "future", "oracle"),
+        choices=("fifo", "longest", "mode-aware", "future", "online", "oracle"),
         default="future",
     )
     parser.add_argument(

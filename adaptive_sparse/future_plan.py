@@ -24,7 +24,7 @@ from pathlib import Path
 from .future_residency import RESIDENCE_HINTS
 
 
-POLICIES = ("fifo", "longest", "mode-aware", "future", "oracle")
+POLICIES = ("fifo", "longest", "mode-aware", "future", "online", "oracle")
 RUNTIME_HINT_MAX_MS = 86_400_000
 
 
@@ -242,6 +242,7 @@ class PlannerConfig:
     lookahead_ms: int = 0
     auto_resident_output_threshold: int = 1
     oracle_max_expansions: int = 100_000
+    online_max_rollouts: int = 2_000
     kind_profiles: (
         tuple[tuple[str, KindServiceProfile], ...]
         | Mapping[str, KindServiceProfile | Mapping[str, object]]
@@ -255,6 +256,7 @@ class PlannerConfig:
             "max_active_requests": self.max_active_requests,
             "auto_resident_output_threshold": self.auto_resident_output_threshold,
             "oracle_max_expansions": self.oracle_max_expansions,
+            "online_max_rollouts": self.online_max_rollouts,
         }
         for name, value in positive_ints.items():
             _bounded_int(value, name, minimum=1)
@@ -332,6 +334,7 @@ class PlannerConfig:
             "lookahead_ms": self.lookahead_ms,
             "auto_resident_output_threshold": self.auto_resident_output_threshold,
             "oracle_max_expansions": self.oracle_max_expansions,
+            "online_max_rollouts": self.online_max_rollouts,
             "kind_profiles": {
                 kind: profile.as_dict()
                 for kind, profile in self.kind_profiles
@@ -389,17 +392,14 @@ class PlanResult:
     search_expansions: int = 0
     search_truncated: bool = False
     fallback_policy: str | None = None
+    search_preparation_rollouts: int = 0
     peak_shared_prefix_credit_bytes: int = 0
 
     @property
     def search_exact(self) -> bool:
         """Whether a bounded oracle proved its returned schedule optimal."""
 
-        return (
-            self.policy == "oracle"
-            and not self.search_truncated
-            and self.fallback_policy is None
-        )
+        return self.policy == "oracle" and not self.search_truncated
 
     @property
     def throughput_requests_per_second(self) -> float:
@@ -420,6 +420,7 @@ class PlanResult:
             "search_truncated": self.search_truncated,
             "search_exact": self.search_exact,
             "fallback_policy": self.fallback_policy,
+            "search_preparation_rollouts": self.search_preparation_rollouts,
             "throughput_requests_per_second": self.throughput_requests_per_second,
             "admissions": [
                 {
@@ -885,7 +886,7 @@ def _normalize_active(
     return tuple(item for item in active if item.admission.finish_ms > now_ms)
 
 
-def _oracle_admission_child(
+def _admission_child(
     state: _OracleState,
     request: RequestProfile,
     mode: ResidencyMode,
@@ -916,7 +917,7 @@ def _oracle_admission_child(
         kind=request.kind,
         resident_kv_bytes=hold,
         prefill_workspace_bytes=workspace,
-        reason=f"oracle:{reason}",
+        reason=reason,
     )
     return _OracleState(
         now_ms=state.now_ms + prefill,
@@ -1007,6 +1008,7 @@ def _result_from_admissions(
     search_expansions: int = 0,
     search_truncated: bool = False,
     fallback_policy: str | None = None,
+    search_preparation_rollouts: int = 0,
 ) -> PlanResult:
     admission_by_id = {item.request_id: item for item in admissions}
     weight = sum(item.priority for item in workload)
@@ -1037,6 +1039,7 @@ def _result_from_admissions(
         search_expansions=search_expansions,
         search_truncated=search_truncated,
         fallback_policy=fallback_policy,
+        search_preparation_rollouts=search_preparation_rollouts,
         peak_shared_prefix_credit_bytes=peak_shared_prefix_credit_bytes,
     )
 
@@ -1064,10 +1067,13 @@ def _simulate_oracle(
         peak_shared_prefix_credit_bytes=0,
     )
     stack = [initial]
+    future = _simulate_greedy(workload, config, "future")
+    online = _simulate_online(workload, config)
+    incumbent = min((future, online), key=_oracle_objective)
     best = replace(
-        _simulate_greedy(workload, config, "future"),
+        incumbent,
         policy="oracle",
-        fallback_policy="future",
+        fallback_policy=incumbent.policy,
     )
     best_from_search = False
     expansions = 0
@@ -1129,7 +1135,13 @@ def _simulate_oracle(
             seen_symmetry.add(symmetry)
             for mode, reason in _feasible_modes(request, active, config):
                 children.append(
-                    _oracle_admission_child(state, request, mode, reason, config)
+                    _admission_child(
+                        state,
+                        request,
+                        mode,
+                        f"oracle:{reason}",
+                        config,
+                    )
                 )
 
         # Explore useful work before spending the expansion budget on an idle
@@ -1152,7 +1164,8 @@ def _simulate_oracle(
         policy="oracle",
         search_expansions=expansions,
         search_truncated=truncated,
-        fallback_policy=None if best_from_search else "future",
+        fallback_policy=None if best_from_search else incumbent.policy,
+        search_preparation_rollouts=online.search_expansions,
     )
 
 
@@ -1175,6 +1188,8 @@ def simulate(
         return PlanResult(policy, (), 0, 0, 0, 0.0, 0, 0, 0)
     if policy == "oracle":
         return _simulate_oracle(workload, config)
+    if policy == "online":
+        return _simulate_online(workload, config)
     return _simulate_greedy(workload, config, policy)
 
 
@@ -1209,40 +1224,62 @@ def _validate_workload(
         )
 
 
-def _simulate_greedy(
+def _initial_state(workload: Sequence[RequestProfile]) -> _OracleState:
+    return _OracleState(
+        now_ms=min(item.arrival_ms for item in workload),
+        prefill_busy_until=-1,
+        remaining_ids=tuple(item.request_id for item in workload),
+        active=(),
+        admissions=(),
+        peak_memory_bytes=0,
+        peak_shared_prefix_credit_bytes=0,
+    )
+
+
+def _simulate_heuristic_from_state(
     workload: tuple[RequestProfile, ...],
     config: PlannerConfig,
     policy: str,
+    state: _OracleState,
 ) -> PlanResult:
-    """Run the existing deterministic event simulation for online policies."""
+    """Complete a rollout from ``state`` with a deterministic heuristic."""
 
     if policy not in ("fifo", "longest", "mode-aware", "future"):
         raise ValueError(f"unknown greedy planning policy: {policy!r}")
 
-    unstarted = {item.request_id: item for item in workload}
-    active: list[_Active] = []
-    admissions: list[Admission] = []
-    now_ms = min(item.arrival_ms for item in workload)
-    prefill_busy_until = -1
-    peak = 0
-    peak_shared_credit = 0
-
-    while unstarted or active:
-        active = [item for item in active if item.admission.finish_ms > now_ms]
-        if not unstarted and not active:
+    requests_by_id = {item.request_id: item for item in workload}
+    while state.remaining_ids or state.active:
+        active = _normalize_active(state.active, state.now_ms)
+        state = replace(state, active=active)
+        if not state.remaining_ids and not active:
             break
-        if not unstarted:
-            now_ms = min(item.admission.finish_ms for item in active)
+        if not state.remaining_ids:
+            state = replace(
+                state,
+                now_ms=min(item.admission.finish_ms for item in active),
+            )
             continue
 
-        if prefill_busy_until > now_ms:
-            candidates = [prefill_busy_until]
-            candidates.extend(item.arrival_ms for item in unstarted.values() if item.arrival_ms > now_ms)
-            candidates.extend(item.admission.finish_ms for item in active if item.admission.finish_ms > now_ms)
-            now_ms = min(candidates)
+        if state.prefill_busy_until > state.now_ms:
+            candidates = [state.prefill_busy_until]
+            candidates.extend(
+                requests_by_id[request_id].arrival_ms
+                for request_id in state.remaining_ids
+                if requests_by_id[request_id].arrival_ms > state.now_ms
+            )
+            candidates.extend(
+                item.admission.finish_ms
+                for item in active
+                if item.admission.finish_ms > state.now_ms
+            )
+            state = replace(state, now_ms=min(candidates))
             continue
 
-        selected = _select(policy, unstarted, active, now_ms, config)
+        unstarted = {
+            request_id: requests_by_id[request_id]
+            for request_id in state.remaining_ids
+        }
+        selected = _select(policy, unstarted, active, state.now_ms, config)
         if selected is not None:
             request, mode, reason = selected
             workspace = request.prompt_tokens * config.prefill_workspace_rate(
@@ -1256,8 +1293,8 @@ def _simulate_greedy(
             admission = Admission(
                 request_id=request.request_id,
                 arrival_ms=request.arrival_ms,
-                start_ms=now_ms,
-                finish_ms=now_ms + duration,
+                start_ms=state.now_ms,
+                finish_ms=state.now_ms + duration,
                 mode=mode,
                 kind=request.kind,
                 resident_kv_bytes=hold,
@@ -1271,33 +1308,181 @@ def _simulate_greedy(
                 ),
                 config,
             )
-            peak = max(peak, aggregate + workspace)
-            peak_shared_credit = max(peak_shared_credit, shared_credit)
-            unstarted.pop(request.request_id)
-            active.append(_Active(request, admission))
-            admissions.append(admission)
-            prefill_busy_until = now_ms + prefill
-            now_ms = prefill_busy_until
+            prefill_busy_until = state.now_ms + prefill
+            state = replace(
+                state,
+                now_ms=prefill_busy_until,
+                prefill_busy_until=prefill_busy_until,
+                remaining_ids=tuple(
+                    request_id
+                    for request_id in state.remaining_ids
+                    if request_id != request.request_id
+                ),
+                active=(*active, _Active(request, admission)),
+                admissions=(*state.admissions, admission),
+                peak_memory_bytes=max(
+                    state.peak_memory_bytes, aggregate + workspace
+                ),
+                peak_shared_prefix_credit_bytes=max(
+                    state.peak_shared_prefix_credit_bytes, shared_credit
+                ),
+            )
             continue
 
-        future_times = [item.arrival_ms for item in unstarted.values() if item.arrival_ms > now_ms]
-        finish_times = [item.admission.finish_ms for item in active if item.admission.finish_ms > now_ms]
-        candidates = future_times + finish_times
-        if not candidates:
+        idle = _oracle_idle_child(state, requests_by_id)
+        if idle is None:
             blocked = sorted(
-                item.request_id for item in unstarted.values() if item.arrival_ms <= now_ms
+                item.request_id
+                for item in unstarted.values()
+                if item.arrival_ms <= state.now_ms
             )
-            raise RuntimeError(f"planning deadlock at {now_ms} ms for {blocked}")
-        now_ms = min(candidates)
+            raise RuntimeError(
+                f"planning deadlock at {state.now_ms} ms for {blocked}"
+            )
+        state = idle
 
-    if len(admissions) != len(workload):
+    if len(state.admissions) != len(workload):
         raise RuntimeError("planner did not admit every request")
     return _result_from_admissions(
         policy,
         workload,
-        admissions,
-        peak,
-        peak_shared_prefix_credit_bytes=peak_shared_credit,
+        state.admissions,
+        state.peak_memory_bytes,
+        peak_shared_prefix_credit_bytes=state.peak_shared_prefix_credit_bytes,
+    )
+
+
+def _simulate_greedy(
+    workload: tuple[RequestProfile, ...],
+    config: PlannerConfig,
+    policy: str,
+) -> PlanResult:
+    """Run the existing deterministic event simulation for online policies."""
+
+    return _simulate_heuristic_from_state(
+        workload,
+        config,
+        policy,
+        _initial_state(workload),
+    )
+
+
+def _simulate_online(
+    workload: tuple[RequestProfile, ...],
+    config: PlannerConfig,
+) -> PlanResult:
+    """Use receding-horizon rollouts while committing one action at a time.
+
+    Each candidate first action is completed by the deployable ``future``
+    heuristic. Only that first action is committed; the next scheduler boundary
+    searches again. This captures short-horizon interactions without claiming
+    the exhaustive ``oracle``'s lookahead or running an unbounded search on the
+    serving hot path.
+    """
+
+    requests_by_id = {item.request_id: item for item in workload}
+    state = _initial_state(workload)
+    rollouts = 0
+
+    while state.remaining_ids or state.active:
+        active = _normalize_active(state.active, state.now_ms)
+        state = replace(state, active=active)
+        if not state.remaining_ids:
+            if not active:
+                break
+            state = replace(
+                state,
+                now_ms=min(item.admission.finish_ms for item in active),
+            )
+            continue
+
+        if state.prefill_busy_until > state.now_ms:
+            candidates = [state.prefill_busy_until]
+            candidates.extend(
+                requests_by_id[request_id].arrival_ms
+                for request_id in state.remaining_ids
+                if requests_by_id[request_id].arrival_ms > state.now_ms
+            )
+            candidates.extend(
+                item.admission.finish_ms
+                for item in active
+                if item.admission.finish_ms > state.now_ms
+            )
+            state = replace(state, now_ms=min(candidates))
+            continue
+
+        pending = sorted(
+            (
+                requests_by_id[request_id]
+                for request_id in state.remaining_ids
+                if requests_by_id[request_id].arrival_ms <= state.now_ms
+            ),
+            key=lambda item: (item.arrival_ms, item.request_id),
+        )
+        if not pending:
+            idle = _oracle_idle_child(state, requests_by_id)
+            if idle is None:
+                raise RuntimeError(f"online planner deadlock at {state.now_ms} ms")
+            state = idle
+            continue
+
+        children: list[_OracleState] = []
+        seen_symmetry: set[tuple[object, ...]] = set()
+        for request in pending:
+            symmetry = _oracle_symmetry_key(request)
+            if symmetry in seen_symmetry:
+                continue
+            seen_symmetry.add(symmetry)
+            for mode, reason in _feasible_modes(request, active, config):
+                children.append(
+                    _admission_child(
+                        state,
+                        request,
+                        mode,
+                        f"online:{reason}",
+                        config,
+                    )
+                )
+        idle = _oracle_idle_child(state, requests_by_id)
+        if idle is not None:
+            children.append(idle)
+        if not children:
+            raise RuntimeError(f"online planner found no action at {state.now_ms} ms")
+
+        if rollouts + len(children) > config.online_max_rollouts:
+            suffix = _simulate_heuristic_from_state(
+                workload, config, "future", state
+            )
+            return replace(
+                suffix,
+                policy="online",
+                search_expansions=rollouts,
+                search_truncated=True,
+                fallback_policy="online_prefix_then_future",
+            )
+
+        best_child = None
+        best_result = None
+        for child in children:
+            result = _simulate_heuristic_from_state(
+                workload, config, "future", child
+            )
+            rollouts += 1
+            if best_result is None or _oracle_objective(result) < _oracle_objective(
+                best_result
+            ):
+                best_child = child
+                best_result = result
+        assert best_child is not None
+        state = best_child
+
+    return _result_from_admissions(
+        "online",
+        workload,
+        state.admissions,
+        state.peak_memory_bytes,
+        peak_shared_prefix_credit_bytes=state.peak_shared_prefix_credit_bytes,
+        search_expansions=rollouts,
     )
 
 

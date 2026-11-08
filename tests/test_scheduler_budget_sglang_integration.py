@@ -101,10 +101,13 @@ class RealSGLangSchedulerBudgetTest(unittest.TestCase):
         scheduler._ekv_adaptive_budget = controller
 
         source_sha256 = hashlib.sha256(Path(scheduler_module.__file__).read_bytes()).hexdigest()
+        reservation_prewarm_calls = []
         reservation = SimpleNamespace(
             signature=("future",),
             kv_bytes=4096,
-            prewarm_bytes=lambda lead_ms: 2048,
+            prewarm_bytes=lambda lead_ms: (
+                reservation_prewarm_calls.append(lead_ms) or 2048
+            ),
         )
         env = {
             "EKV_ADAPTIVE_BUDGET_BYTES": "8192",
@@ -149,6 +152,7 @@ class RealSGLangSchedulerBudgetTest(unittest.TestCase):
 
         self.assertEqual(result, "native-prefill-result")
         self.assertEqual(native_calls, ["prefill"])
+        self.assertEqual(reservation_prewarm_calls, [250])
         self.assertEqual(tracker.demand_bytes, 2048)
         self.assertEqual(controller.stats["predictive_prewarm_hook_errors"], 1)
         self.assertEqual(len(invalidations), 1)
