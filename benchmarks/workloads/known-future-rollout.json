@@ -1,0 +1,83 @@
+{
+  "description": "Synthetic controlled-arrival workload for comparing offline rollout plans. Values are policy-harness inputs, not measured hardware constants.",
+  "config": {
+    "memory_budget_bytes": 8500000,
+    "kv_bytes_per_token": 1000,
+    "prefill_workspace_bytes_per_token": 2,
+    "sparse_hot_tokens": 2000,
+    "prefill_tokens_per_ms": 8.0,
+    "resident_decode_tokens_per_ms": 20.0,
+    "sparse_decode_tokens_per_ms": 16.0,
+    "max_active_requests": 8,
+    "lookahead_ms": 200,
+    "auto_resident_output_threshold": 128
+  },
+  "requests": [
+    {
+      "request_id": "background-long",
+      "arrival_ms": 0,
+      "prompt_tokens": 4096,
+      "output_tokens": 3072,
+      "kind": "background",
+      "priority": 1.0,
+      "residence_hint": "auto"
+    },
+    {
+      "request_id": "tool-0",
+      "arrival_ms": 20,
+      "prompt_tokens": 512,
+      "output_tokens": 128,
+      "kind": "tool",
+      "priority": 2.0,
+      "deadline_ms": 500,
+      "residence_hint": "auto"
+    },
+    {
+      "request_id": "tool-1",
+      "arrival_ms": 60,
+      "prompt_tokens": 768,
+      "output_tokens": 96,
+      "kind": "tool",
+      "priority": 2.0,
+      "deadline_ms": 650,
+      "residence_hint": "auto"
+    },
+    {
+      "request_id": "rollout-short",
+      "arrival_ms": 100,
+      "prompt_tokens": 2048,
+      "output_tokens": 128,
+      "kind": "rollout",
+      "priority": 1.5,
+      "residence_hint": "auto"
+    },
+    {
+      "request_id": "chat-0",
+      "arrival_ms": 180,
+      "prompt_tokens": 1024,
+      "output_tokens": 512,
+      "kind": "chat",
+      "priority": 1.0,
+      "residence_hint": "auto"
+    },
+    {
+      "request_id": "tool-2",
+      "arrival_ms": 260,
+      "prompt_tokens": 640,
+      "output_tokens": 160,
+      "kind": "tool",
+      "priority": 2.0,
+      "deadline_ms": 900,
+      "residence_hint": "auto"
+    },
+    {
+      "request_id": "rollout-long",
+      "arrival_ms": 360,
+      "prompt_tokens": 6144,
+      "output_tokens": 2048,
+      "kind": "rollout",
+      "priority": 1.5,
+      "residence_hint": "auto"
+    }
+  ]
+}

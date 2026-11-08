@@ -31,6 +31,7 @@ GPU 结果出来前，不把规划收益写成已证实的性能收益。
 - 截止时间；
 - 实际 prompt 长度；
 - 预计输出 token 数；
+- 请求类型，例如 `tool`、`chat`、`background` 或 `rollout`；
 - 期望驻留模式：`auto`、`resident` 或 `host_backed`；
 - 业务权重或硬优先级。
 
@@ -64,6 +65,7 @@ Mamba 和 paged allocator 约束仍由原生 `PrefillAdder` 决定。规划器�
     "release_after_ms": 250,
     "deadline_after_ms": 1800,
     "expected_output_tokens": 192,
+    "kind": "tool",
     "residence": "auto",
     "weight": 1.0
   }
@@ -184,6 +186,31 @@ decode_time  = expected_output_tokens / decode_tokens_per_s
 
 初值来自配置，之后只用真实完成样本更新。estimator 必须带置信区间或保守倍率；
 没有样本时宁可使用宽裕估计，也不要声称能精确满足 deadline。
+
+### 4.1 受控 rollout 的可执行计划
+
+`plan_rollout()` 把离线策略结果转换成 orchestrator 可执行的动作。每个 action
+包含原始与计划到达时间、预计完成时间、请求类型，以及可直接放入
+`elastic.future` payload 的字段。控制器在 `submit_at_ms` 才实际提交请求；
+hint 使用 `release_after_ms=0`，并把绝对 deadline 换算成相对 scheduler
+接收时刻的 `deadline_after_ms`。
+
+```bash
+python scripts/future_plan_compare.py \
+  benchmarks/workloads/known-future-rollout.json \
+  --emit-policy future \
+  --output results/future-planning/known-future-rollout.json
+```
+
+当有限 horizon 内的高价值请求即将到来、当前长 prefill 会让它错过硬期限，而
+短暂空转能保住期限时，`future` 策略允许 idle 到该请求到达。这里控制的是
+orchestrator 的真实提交时刻；runtime hook 中的 `release_after_ms` 仍只是软排序
+提示，不能被误写成 `PrefillAdder` 的硬准入门槛。
+
+仓库内合成样例只用于回归 harness。该样例中 FIFO、mode-aware、future 分别记录
+3、2、0 个 deadline miss，future 的模拟 makespan 为 1,988 ms，峰值预算为
+4,008,192 bytes。它是固定输入上的策略行为证据，不是模型、GPU 或生产负载上的
+性能结论；真实效果必须用同一模型、权重、请求体和 TP 配置重新测量。
 
 ## 5. VMM 驻留计划
 
@@ -312,7 +339,8 @@ resident kv = (prompt + expected_output) * kv_bytes_per_token
 host_backed kv = min(prompt + expected_output, native_hot_tokens)
                  * kv_bytes_per_token
 
-reservation = kv + prompt * activation_bytes_per_token
+activation_rate = kind_override.get(kind, activation_bytes_per_token)
+reservation = kv + prompt * activation_rate
 ```
 
 `resident` 缺少输出长度预测时不进入预留；显式 `host_backed` 仍可按
@@ -327,6 +355,7 @@ reservation = kv + prompt * activation_bytes_per_token
 | `EKV_FUTURE_PREFILL_HORIZON_MS` | `2000` | 只考虑该时间窗内将释放的请求 |
 | `EKV_FUTURE_PREFILL_MAX_BYTES` | `256 MiB` | 单次聚合预留上限 |
 | `EKV_FUTURE_PREFILL_ACTIVATION_BYTES_PER_TOKEN` | `0` | 实测校准的 prefill 激活预算 |
+| `EKV_FUTURE_PREFILL_KIND_ACTIVATION_JSON` | `{}` | 按请求 `kind` 覆盖 activation bytes/token，例如 `{"tool":1536,"chat":1024}` |
 | `EKV_FUTURE_PREFILL_AUTO_RESIDENT_TOKENS` | `128` | `auto` 选择完整驻留的输出阈值 |
 
 `dry_run` 只写 telemetry；`enforce` 把 reservation 作为预填充边界的有效

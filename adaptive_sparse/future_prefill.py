@@ -27,6 +27,7 @@ class FuturePrefillConfig:
     horizon_ms: int = 2_000
     max_reserve_bytes: int = 256 << 20
     activation_bytes_per_token: int = 0
+    kind_activation_bytes_per_token: tuple[tuple[str, int], ...] = ()
     auto_resident_output_tokens: int = 128
     sparse_hot_tokens: int = 1_024
 
@@ -47,6 +48,21 @@ class FuturePrefillConfig:
             raise ValueError("auto_resident_output_tokens must be positive")
         if self.sparse_hot_tokens < 1:
             raise ValueError("sparse_hot_tokens must be positive")
+        if not isinstance(self.kind_activation_bytes_per_token, tuple):
+            raise ValueError("kind activation overrides must be a tuple of pairs")
+        seen = set()
+        for kind, value in self.kind_activation_bytes_per_token:
+            if not isinstance(kind, str) or not kind or len(kind) > 64:
+                raise ValueError(
+                    "kind activation keys must be short non-empty strings"
+                )
+            if kind in seen:
+                raise ValueError(f"duplicate kind activation override: {kind!r}")
+            seen.add(kind)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(
+                    "kind activation overrides must be nonnegative integers"
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +70,7 @@ class FuturePrefillEntry:
     """One request's bounded contribution to the aggregate reservation."""
 
     request_id: str
+    kind: str
     residence: str
     prompt_tokens: int
     expected_output_tokens: int
@@ -104,7 +121,7 @@ class FuturePrefillPlan:
             self.mode,
             self.reserve_bytes,
             tuple(
-                (entry.request_id, entry.total_bytes, entry.residence)
+                (entry.request_id, entry.kind, entry.total_bytes, entry.residence)
                 for entry in self.entries
             ),
         )
@@ -178,6 +195,11 @@ def _residence(hint: Any, expected: int, config: FuturePrefillConfig) -> str:
     return "resident"
 
 
+def _activation_bytes_per_token(hint: Any, config: FuturePrefillConfig) -> int:
+    overrides = dict(config.kind_activation_bytes_per_token)
+    return overrides.get(hint.kind, config.activation_bytes_per_token)
+
+
 def plan_future_prefill(
     waiting_queue: Iterable[Any],
     *,
@@ -243,7 +265,7 @@ def plan_future_prefill(
             else min(sequence_tokens, config.sparse_hot_tokens)
         )
         kv_bytes = kv_tokens * kv_bytes_per_token
-        activation_bytes = prompt * config.activation_bytes_per_token
+        activation_bytes = prompt * _activation_bytes_per_token(hint, config)
         total = kv_bytes + activation_bytes
         if reserve + total > config.max_reserve_bytes:
             capped += 1
@@ -252,6 +274,7 @@ def plan_future_prefill(
         selected.append(
             FuturePrefillEntry(
                 request_id=request_id,
+                kind=hint.kind,
                 residence=residence,
                 prompt_tokens=prompt,
                 expected_output_tokens=expected,

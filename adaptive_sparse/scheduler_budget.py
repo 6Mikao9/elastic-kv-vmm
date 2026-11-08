@@ -516,6 +516,11 @@ def install_scheduler_budget():
     capture_plans = os.environ.get("EKV_ADAPTIVE_PLAN_CAPTURE") == "1"
     trim_low_water = os.environ.get("EKV_ADAPTIVE_TRIM_LOW_WATER") == "1"
     future_mode = os.environ.get("EKV_FUTURE_PREFILL_MODE", "off")
+    kind_activation_raw = json.loads(os.environ.get(
+        "EKV_FUTURE_PREFILL_KIND_ACTIVATION_JSON", "{}"
+    ))
+    if not isinstance(kind_activation_raw, dict):
+        raise ValueError("EKV_FUTURE_PREFILL_KIND_ACTIVATION_JSON must be an object")
     future_config = FuturePrefillConfig(
         mode=future_mode,
         horizon_ms=int(os.environ.get("EKV_FUTURE_PREFILL_HORIZON_MS", "2000")),
@@ -525,6 +530,7 @@ def install_scheduler_budget():
         activation_bytes_per_token=int(os.environ.get(
             "EKV_FUTURE_PREFILL_ACTIVATION_BYTES_PER_TOKEN", "0"
         )),
+        kind_activation_bytes_per_token=tuple(kind_activation_raw.items()),
         auto_resident_output_tokens=int(os.environ.get(
             "EKV_FUTURE_PREFILL_AUTO_RESIDENT_TOKENS", "128"
         )),

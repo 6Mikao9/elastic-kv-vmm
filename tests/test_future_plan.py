@@ -1,4 +1,7 @@
+import json
 import math
+from pathlib import Path
+import tempfile
 import unittest
 
 from adaptive_sparse.future_plan import (
@@ -6,6 +9,8 @@ from adaptive_sparse.future_plan import (
     PlannerConfig,
     RequestProfile,
     ResidencyMode,
+    main,
+    plan_rollout,
     simulate,
 )
 
@@ -50,6 +55,35 @@ class FuturePlanTest(unittest.TestCase):
         self.assertGreater(fifo.deadline_misses, future.deadline_misses)
         self.assertEqual(future.deadline_misses, 0)
         self.assertGreaterEqual(future.weighted_completion_ms, 0)
+
+    def test_future_policy_can_idle_to_protect_an_imminent_deadline(self):
+        workload = [
+            RequestProfile(
+                "background",
+                arrival_ms=0,
+                prompt_tokens=5000,
+                output_tokens=1000,
+                kind="background",
+            ),
+            RequestProfile(
+                "tool",
+                arrival_ms=2,
+                prompt_tokens=100,
+                output_tokens=200,
+                kind="tool",
+                priority=2,
+                deadline_ms=130,
+            ),
+        ]
+        future = simulate(workload, self.config, "future")
+
+        self.assertEqual(future.admissions[0].request_id, "tool")
+        self.assertEqual(future.admissions[0].start_ms, 2)
+        self.assertEqual(future.deadline_misses, 0)
+        background = next(
+            item for item in future.admissions if item.request_id == "background"
+        )
+        self.assertGreaterEqual(background.start_ms, 3)
 
     def test_prefill_workspace_can_force_bounded_hot_set(self):
         config = PlannerConfig(
@@ -208,7 +242,7 @@ class FuturePlanTest(unittest.TestCase):
     def test_non_finite_priority_is_rejected(self):
         for priority in (math.nan, math.inf, -math.inf):
             with self.subTest(priority=priority), self.assertRaisesRegex(
-                ValueError, "priority must be positive"
+                ValueError, "priority must be finite"
             ):
                 RequestProfile(
                     "bad-priority",
@@ -217,6 +251,117 @@ class FuturePlanTest(unittest.TestCase):
                     output_tokens=1,
                     priority=priority,
                 )
+
+    def test_kind_and_priority_match_runtime_hint_bounds(self):
+        for kind in ("", "x" * 65):
+            with self.subTest(kind=kind), self.assertRaisesRegex(
+                ValueError, "kind must be a short non-empty string"
+            ):
+                RequestProfile(
+                    "bad-kind",
+                    arrival_ms=0,
+                    prompt_tokens=1,
+                    output_tokens=1,
+                    kind=kind,
+                )
+        with self.assertRaisesRegex(ValueError, "priority must be finite"):
+            RequestProfile(
+                "too-heavy",
+                arrival_ms=0,
+                prompt_tokens=1,
+                output_tokens=1,
+                priority=1_000_001,
+            )
+
+    def test_rollout_plan_emits_controlled_submissions_and_runtime_hints(self):
+        plan = plan_rollout(self.workload, self.config, "future")
+        submissions = {item.request_id: item for item in plan.submissions}
+
+        self.assertEqual(len(plan.submissions), len(self.workload))
+        self.assertLessEqual(
+            plan.simulation.peak_memory_bytes, self.config.memory_budget_bytes
+        )
+        for item in plan.submissions:
+            self.assertGreaterEqual(item.submit_at_ms, item.planned_arrival_ms)
+            self.assertEqual(item.hint["release_after_ms"], 0)
+            self.assertEqual(
+                item.hint["residence"],
+                "resident"
+                if next(
+                    admission.mode
+                    for admission in plan.simulation.admissions
+                    if admission.request_id == item.request_id
+                ) is ResidencyMode.RESIDENT
+                else "host_backed",
+            )
+
+        long = submissions["long"]
+        self.assertEqual(long.kind, "generic")
+        self.assertEqual(long.hint["expected_output_tokens"], 7000)
+        self.assertNotIn("deadline_after_ms", long.hint)
+
+        short = submissions["short-0"]
+        self.assertEqual(short.kind, "tool")
+        self.assertEqual(short.hint["weight"], 2.0)
+        self.assertEqual(
+            short.hint["deadline_after_ms"],
+            max(0, 500 - short.submit_at_ms),
+        )
+
+    def test_rollout_plan_is_json_serializable_and_rejects_unknown_policy(self):
+        payload = plan_rollout(self.workload, self.config, "future").as_dict()
+        rendered = json.dumps(payload, sort_keys=True)
+        self.assertIn('"submissions"', rendered)
+        self.assertIn('"kind": "tool"', rendered)
+        with self.assertRaisesRegex(ValueError, "unknown planning policy"):
+            plan_rollout(self.workload, self.config, "oracle")
+
+    def test_cli_can_emit_a_selected_rollout(self):
+        raw = {
+            "config": {
+                "memory_budget_bytes": self.config.memory_budget_bytes,
+                "kv_bytes_per_token": self.config.kv_bytes_per_token,
+                "prefill_workspace_bytes_per_token": (
+                    self.config.prefill_workspace_bytes_per_token
+                ),
+                "sparse_hot_tokens": self.config.sparse_hot_tokens,
+                "prefill_tokens_per_ms": self.config.prefill_tokens_per_ms,
+                "resident_decode_tokens_per_ms": (
+                    self.config.resident_decode_tokens_per_ms
+                ),
+                "sparse_decode_tokens_per_ms": self.config.sparse_decode_tokens_per_ms,
+                "max_active_requests": self.config.max_active_requests,
+                "lookahead_ms": self.config.lookahead_ms,
+            },
+            "requests": [
+                {
+                    "request_id": item.request_id,
+                    "arrival_ms": item.arrival_ms,
+                    "prompt_tokens": item.prompt_tokens,
+                    "output_tokens": item.output_tokens,
+                    "kind": item.kind,
+                    "priority": item.priority,
+                    "deadline_ms": item.deadline_ms,
+                }
+                for item in self.workload
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            workload = Path(directory) / "workload.json"
+            output = Path(directory) / "plan.json"
+            workload.write_text(json.dumps(raw), encoding="utf-8")
+            self.assertEqual(
+                main([
+                    str(workload), "--emit-policy", "future",
+                    "--output", str(output),
+                ]),
+                0,
+            )
+            payload = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(payload["rollout"]["policy"], "future")
+        self.assertEqual(
+            len(payload["rollout"]["submissions"]), len(self.workload)
+        )
 
 
 if __name__ == "__main__":

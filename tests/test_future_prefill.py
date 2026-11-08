@@ -17,10 +17,12 @@ def request(
     release_after_ms=0,
     expected_output_tokens=5,
     residence="resident",
+    kind="generic",
 ):
     payload = {
         "release_after_ms": release_after_ms,
         "residence": residence,
+        "kind": kind,
     }
     if expected_output_tokens is not None:
         payload["expected_output_tokens"] = expected_output_tokens
@@ -63,6 +65,26 @@ class FuturePrefillPlanTest(unittest.TestCase):
         self.assertEqual(entry.kv_bytes, 150)
         self.assertEqual(entry.activation_bytes, 20)
         self.assertEqual(plan.reserve_bytes, 170)
+
+    def test_kind_specific_activation_overrides_the_global_rate(self):
+        config = self.config(
+            activation_bytes_per_token=2,
+            kind_activation_bytes_per_token=(("tool", 7), ("chat", 3)),
+        )
+        plan = plan_future_prefill(
+            [
+                request("tool", prompt=10, kind="tool"),
+                request("chat", prompt=10, kind="chat"),
+                request("other", prompt=10, kind="other"),
+            ],
+            now_s=1.0,
+            kv_bytes_per_token=10,
+            config=config,
+        )
+        by_id = {entry.request_id: entry for entry in plan.entries}
+        self.assertEqual(by_id["tool"].activation_bytes, 70)
+        self.assertEqual(by_id["chat"].activation_bytes, 30)
+        self.assertEqual(by_id["other"].activation_bytes, 20)
 
     def test_host_backed_plan_is_bounded_by_sparse_hot_tokens(self):
         plan = plan_future_prefill(
@@ -183,6 +205,14 @@ class FuturePrefillPlanTest(unittest.TestCase):
             self.config(max_reserve_bytes=-1)
         with self.assertRaisesRegex(ValueError, "auto_resident_output_tokens"):
             self.config(auto_resident_output_tokens=0)
+        with self.assertRaisesRegex(ValueError, "kind activation"):
+            self.config(kind_activation_bytes_per_token=(("tool", -1),))
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            self.config(
+                kind_activation_bytes_per_token=(("tool", 1), ("tool", 2))
+            )
+        with self.assertRaisesRegex(ValueError, "tuple of pairs"):
+            self.config(kind_activation_bytes_per_token={"tool": 1})
 
     def test_tp_plan_mismatch_falls_back_atomically(self):
         plan = plan_future_prefill(

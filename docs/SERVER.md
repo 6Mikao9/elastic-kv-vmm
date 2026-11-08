@@ -57,7 +57,8 @@ requests into a bounded prefill reservation.  Set
 or `enforce` with a positive `EKV_ADAPTIVE_BUDGET_BYTES` to trigger the existing
 prefill-pressure migration path. `EKV_FUTURE_PREFILL_HORIZON_MS`,
 `EKV_FUTURE_PREFILL_MAX_BYTES`,
-`EKV_FUTURE_PREFILL_ACTIVATION_BYTES_PER_TOKEN`, and
+`EKV_FUTURE_PREFILL_ACTIVATION_BYTES_PER_TOKEN`,
+`EKV_FUTURE_PREFILL_KIND_ACTIVATION_JSON`, and
 `EKV_FUTURE_PREFILL_AUTO_RESIDENT_TOKENS` bound the estimate.  This reserves
 headroom for native allocation; it does not create future KV or activation
 buffers eagerly. See [the future planner design](FUTURE_PLANNER_DESIGN.md#53-已知未来请求的-prefill-预留).

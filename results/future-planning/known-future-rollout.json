@@ -1,0 +1,558 @@
+{
+  "fifo": {
+    "admissions": [
+      {
+        "arrival_ms": 0,
+        "finish_ms": 666,
+        "kind": "background",
+        "mode": "resident",
+        "prefill_workspace_bytes": 8192,
+        "reason": "fits-resident",
+        "request_id": "background-long",
+        "resident_kv_bytes": 7168000,
+        "start_ms": 0
+      },
+      {
+        "arrival_ms": 20,
+        "finish_ms": 584,
+        "kind": "tool",
+        "mode": "hi-sparse",
+        "prefill_workspace_bytes": 1024,
+        "reason": "fits-native-hot-set",
+        "request_id": "tool-0",
+        "resident_kv_bytes": 640000,
+        "start_ms": 512
+      },
+      {
+        "arrival_ms": 60,
+        "finish_ms": 686,
+        "kind": "tool",
+        "mode": "hi-sparse",
+        "prefill_workspace_bytes": 1536,
+        "reason": "fits-native-hot-set",
+        "request_id": "tool-1",
+        "resident_kv_bytes": 864000,
+        "start_ms": 584
+      },
+      {
+        "arrival_ms": 100,
+        "finish_ms": 943,
+        "kind": "rollout",
+        "mode": "resident",
+        "prefill_workspace_bytes": 4096,
+        "reason": "fits-resident",
+        "request_id": "rollout-short",
+        "resident_kv_bytes": 2176000,
+        "start_ms": 680
+      },
+      {
+        "arrival_ms": 180,
+        "finish_ms": 1096,
+        "kind": "chat",
+        "mode": "hi-sparse",
+        "prefill_workspace_bytes": 2048,
+        "reason": "fits-native-hot-set",
+        "request_id": "chat-0",
+        "resident_kv_bytes": 1536000,
+        "start_ms": 936
+      },
+      {
+        "arrival_ms": 260,
+        "finish_ms": 1154,
+        "kind": "tool",
+        "mode": "hi-sparse",
+        "prefill_workspace_bytes": 1280,
+        "reason": "fits-native-hot-set",
+        "request_id": "tool-2",
+        "resident_kv_bytes": 800000,
+        "start_ms": 1064
+      },
+      {
+        "arrival_ms": 360,
+        "finish_ms": 2040,
+        "kind": "rollout",
+        "mode": "hi-sparse",
+        "prefill_workspace_bytes": 12288,
+        "reason": "fits-bounded-hot-set",
+        "request_id": "rollout-long",
+        "resident_kv_bytes": 2000000,
+        "start_ms": 1144
+      }
+    ],
+    "deadline_misses": 3,
+    "makespan_ms": 2040,
+    "mode_switches": 0,
+    "peak_backed_bytes": 8033536,
+    "peak_memory_bytes": 8033536,
+    "policy": "fifo",
+    "sparse_requests": 5,
+    "throughput_requests_per_second": 3.4313725490196076,
+    "weighted_completion_ms": 1007.6818181818181
+  },
+  "future": {
+    "admissions": [
+      {
+        "arrival_ms": 20,
+        "finish_ms": 92,
+        "kind": "tool",
+        "mode": "hi-sparse",
+        "prefill_workspace_bytes": 1024,
+        "reason": "fits-native-hot-set",
+        "request_id": "tool-0",
+        "resident_kv_bytes": 640000,
+        "start_ms": 20
+      },
+      {
+        "arrival_ms": 60,
+        "finish_ms": 186,
+        "kind": "tool",
+        "mode": "hi-sparse",
+        "prefill_workspace_bytes": 1536,
+        "reason": "fits-native-hot-set",
+        "request_id": "tool-1",
+        "resident_kv_bytes": 864000,
+        "start_ms": 84
+      },
+      {
+        "arrival_ms": 100,
+        "finish_ms": 443,
+        "kind": "rollout",
+        "mode": "resident",
+        "prefill_workspace_bytes": 4096,
+        "reason": "fits-resident",
+        "request_id": "rollout-short",
+        "resident_kv_bytes": 2176000,
+        "start_ms": 180
+      },
+      {
+        "arrival_ms": 260,
+        "finish_ms": 526,
+        "kind": "tool",
+        "mode": "hi-sparse",
+        "prefill_workspace_bytes": 1280,
+        "reason": "fits-native-hot-set",
+        "request_id": "tool-2",
+        "resident_kv_bytes": 800000,
+        "start_ms": 436
+      },
+      {
+        "arrival_ms": 360,
+        "finish_ms": 1412,
+        "kind": "rollout",
+        "mode": "hi-sparse",
+        "prefill_workspace_bytes": 12288,
+        "reason": "fits-bounded-hot-set",
+        "request_id": "rollout-long",
+        "resident_kv_bytes": 2000000,
+        "start_ms": 516
+      },
+      {
+        "arrival_ms": 0,
+        "finish_ms": 1988,
+        "kind": "background",
+        "mode": "hi-sparse",
+        "prefill_workspace_bytes": 8192,
+        "reason": "fits-bounded-hot-set",
+        "request_id": "background-long",
+        "resident_kv_bytes": 2000000,
+        "start_ms": 1284
+      },
+      {
+        "arrival_ms": 180,
+        "finish_ms": 1956,
+        "kind": "chat",
+        "mode": "hi-sparse",
+        "prefill_workspace_bytes": 2048,
+        "reason": "fits-native-hot-set",
+        "request_id": "chat-0",
+        "resident_kv_bytes": 1536000,
+        "start_ms": 1796
+      }
+    ],
+    "deadline_misses": 0,
+    "makespan_ms": 1988,
+    "mode_switches": 0,
+    "peak_backed_bytes": 4008192,
+    "peak_memory_bytes": 4008192,
+    "policy": "future",
+    "sparse_requests": 6,
+    "throughput_requests_per_second": 3.5211267605633805,
+    "weighted_completion_ms": 757.6818181818181
+  },
+  "longest": {
+    "admissions": [
+      {
+        "arrival_ms": 0,
+        "finish_ms": 666,
+        "kind": "background",
+        "mode": "resident",
+        "prefill_workspace_bytes": 8192,
+        "reason": "fits-resident",
+        "request_id": "background-long",
+        "resident_kv_bytes": 7168000,
+        "start_ms": 0
+      },
+      {
+        "arrival_ms": 60,
+        "finish_ms": 614,
+        "kind": "tool",
+        "mode": "hi-sparse",
+        "prefill_workspace_bytes": 1536,
+        "reason": "fits-native-hot-set",
+        "request_id": "tool-1",
+        "resident_kv_bytes": 864000,
+        "start_ms": 512
+      },
+      {
+        "arrival_ms": 260,
+        "finish_ms": 704,
+        "kind": "tool",
+        "mode": "hi-sparse",
+        "prefill_workspace_bytes": 1280,
+        "reason": "fits-native-hot-set",
+        "request_id": "tool-2",
+        "resident_kv_bytes": 800000,
+        "start_ms": 614
+      },
+      {
+        "arrival_ms": 360,
+        "finish_ms": 1590,
+        "kind": "rollout",
+        "mode": "hi-sparse",
+        "prefill_workspace_bytes": 12288,
+        "reason": "fits-bounded-hot-set",
+        "request_id": "rollout-long",
+        "resident_kv_bytes": 2000000,
+        "start_ms": 694
+      },
+      {
+        "arrival_ms": 100,
+        "finish_ms": 1725,
+        "kind": "rollout",
+        "mode": "resident",
+        "prefill_workspace_bytes": 4096,
+        "reason": "fits-resident",
+        "request_id": "rollout-short",
+        "resident_kv_bytes": 2176000,
+        "start_ms": 1462
+      },
+      {
+        "arrival_ms": 180,
+        "finish_ms": 1878,
+        "kind": "chat",
+        "mode": "hi-sparse",
+        "prefill_workspace_bytes": 2048,
+        "reason": "fits-native-hot-set",
+        "request_id": "chat-0",
+        "resident_kv_bytes": 1536000,
+        "start_ms": 1718
+      },
+      {
+        "arrival_ms": 20,
+        "finish_ms": 1918,
+        "kind": "tool",
+        "mode": "hi-sparse",
+        "prefill_workspace_bytes": 1024,
+        "reason": "fits-native-hot-set",
+        "request_id": "tool-0",
+        "resident_kv_bytes": 640000,
+        "start_ms": 1846
+      }
+    ],
+    "deadline_misses": 1,
+    "makespan_ms": 1918,
+    "mode_switches": 0,
+    "peak_backed_bytes": 8033536,
+    "peak_memory_bytes": 8033536,
+    "policy": "longest",
+    "sparse_requests": 5,
+    "throughput_requests_per_second": 3.6496350364963503,
+    "weighted_completion_ms": 1271.6818181818182
+  },
+  "mode-aware": {
+    "admissions": [
+      {
+        "arrival_ms": 0,
+        "finish_ms": 666,
+        "kind": "background",
+        "mode": "resident",
+        "prefill_workspace_bytes": 8192,
+        "reason": "fits-resident",
+        "request_id": "background-long",
+        "resident_kv_bytes": 7168000,
+        "start_ms": 0
+      },
+      {
+        "arrival_ms": 20,
+        "finish_ms": 584,
+        "kind": "tool",
+        "mode": "hi-sparse",
+        "prefill_workspace_bytes": 1024,
+        "reason": "fits-native-hot-set",
+        "request_id": "tool-0",
+        "resident_kv_bytes": 640000,
+        "start_ms": 512
+      },
+      {
+        "arrival_ms": 60,
+        "finish_ms": 686,
+        "kind": "tool",
+        "mode": "hi-sparse",
+        "prefill_workspace_bytes": 1536,
+        "reason": "fits-native-hot-set",
+        "request_id": "tool-1",
+        "resident_kv_bytes": 864000,
+        "start_ms": 584
+      },
+      {
+        "arrival_ms": 260,
+        "finish_ms": 770,
+        "kind": "tool",
+        "mode": "hi-sparse",
+        "prefill_workspace_bytes": 1280,
+        "reason": "fits-native-hot-set",
+        "request_id": "tool-2",
+        "resident_kv_bytes": 800000,
+        "start_ms": 680
+      },
+      {
+        "arrival_ms": 100,
+        "finish_ms": 1023,
+        "kind": "rollout",
+        "mode": "resident",
+        "prefill_workspace_bytes": 4096,
+        "reason": "fits-resident",
+        "request_id": "rollout-short",
+        "resident_kv_bytes": 2176000,
+        "start_ms": 760
+      },
+      {
+        "arrival_ms": 360,
+        "finish_ms": 1912,
+        "kind": "rollout",
+        "mode": "hi-sparse",
+        "prefill_workspace_bytes": 12288,
+        "reason": "fits-bounded-hot-set",
+        "request_id": "rollout-long",
+        "resident_kv_bytes": 2000000,
+        "start_ms": 1016
+      },
+      {
+        "arrival_ms": 180,
+        "finish_ms": 1944,
+        "kind": "chat",
+        "mode": "hi-sparse",
+        "prefill_workspace_bytes": 2048,
+        "reason": "fits-native-hot-set",
+        "request_id": "chat-0",
+        "resident_kv_bytes": 1536000,
+        "start_ms": 1784
+      }
+    ],
+    "deadline_misses": 2,
+    "makespan_ms": 1944,
+    "mode_switches": 0,
+    "peak_backed_bytes": 8033536,
+    "peak_memory_bytes": 8033536,
+    "policy": "mode-aware",
+    "sparse_requests": 5,
+    "throughput_requests_per_second": 3.60082304526749,
+    "weighted_completion_ms": 1008.4090909090909
+  },
+  "rollout": {
+    "policy": "future",
+    "simulation": {
+      "admissions": [
+        {
+          "arrival_ms": 20,
+          "finish_ms": 92,
+          "kind": "tool",
+          "mode": "hi-sparse",
+          "prefill_workspace_bytes": 1024,
+          "reason": "fits-native-hot-set",
+          "request_id": "tool-0",
+          "resident_kv_bytes": 640000,
+          "start_ms": 20
+        },
+        {
+          "arrival_ms": 60,
+          "finish_ms": 186,
+          "kind": "tool",
+          "mode": "hi-sparse",
+          "prefill_workspace_bytes": 1536,
+          "reason": "fits-native-hot-set",
+          "request_id": "tool-1",
+          "resident_kv_bytes": 864000,
+          "start_ms": 84
+        },
+        {
+          "arrival_ms": 100,
+          "finish_ms": 443,
+          "kind": "rollout",
+          "mode": "resident",
+          "prefill_workspace_bytes": 4096,
+          "reason": "fits-resident",
+          "request_id": "rollout-short",
+          "resident_kv_bytes": 2176000,
+          "start_ms": 180
+        },
+        {
+          "arrival_ms": 260,
+          "finish_ms": 526,
+          "kind": "tool",
+          "mode": "hi-sparse",
+          "prefill_workspace_bytes": 1280,
+          "reason": "fits-native-hot-set",
+          "request_id": "tool-2",
+          "resident_kv_bytes": 800000,
+          "start_ms": 436
+        },
+        {
+          "arrival_ms": 360,
+          "finish_ms": 1412,
+          "kind": "rollout",
+          "mode": "hi-sparse",
+          "prefill_workspace_bytes": 12288,
+          "reason": "fits-bounded-hot-set",
+          "request_id": "rollout-long",
+          "resident_kv_bytes": 2000000,
+          "start_ms": 516
+        },
+        {
+          "arrival_ms": 0,
+          "finish_ms": 1988,
+          "kind": "background",
+          "mode": "hi-sparse",
+          "prefill_workspace_bytes": 8192,
+          "reason": "fits-bounded-hot-set",
+          "request_id": "background-long",
+          "resident_kv_bytes": 2000000,
+          "start_ms": 1284
+        },
+        {
+          "arrival_ms": 180,
+          "finish_ms": 1956,
+          "kind": "chat",
+          "mode": "hi-sparse",
+          "prefill_workspace_bytes": 2048,
+          "reason": "fits-native-hot-set",
+          "request_id": "chat-0",
+          "resident_kv_bytes": 1536000,
+          "start_ms": 1796
+        }
+      ],
+      "deadline_misses": 0,
+      "makespan_ms": 1988,
+      "mode_switches": 0,
+      "peak_backed_bytes": 4008192,
+      "peak_memory_bytes": 4008192,
+      "policy": "future",
+      "sparse_requests": 6,
+      "throughput_requests_per_second": 3.5211267605633805,
+      "weighted_completion_ms": 757.6818181818181
+    },
+    "submissions": [
+      {
+        "estimated_finish_ms": 92,
+        "hint": {
+          "deadline_after_ms": 480,
+          "expected_output_tokens": 128,
+          "kind": "tool",
+          "release_after_ms": 0,
+          "residence": "host_backed",
+          "weight": 2.0
+        },
+        "kind": "tool",
+        "planned_arrival_ms": 20,
+        "request_id": "tool-0",
+        "submit_at_ms": 20
+      },
+      {
+        "estimated_finish_ms": 186,
+        "hint": {
+          "deadline_after_ms": 566,
+          "expected_output_tokens": 96,
+          "kind": "tool",
+          "release_after_ms": 0,
+          "residence": "host_backed",
+          "weight": 2.0
+        },
+        "kind": "tool",
+        "planned_arrival_ms": 60,
+        "request_id": "tool-1",
+        "submit_at_ms": 84
+      },
+      {
+        "estimated_finish_ms": 443,
+        "hint": {
+          "expected_output_tokens": 128,
+          "kind": "rollout",
+          "release_after_ms": 0,
+          "residence": "resident",
+          "weight": 1.5
+        },
+        "kind": "rollout",
+        "planned_arrival_ms": 100,
+        "request_id": "rollout-short",
+        "submit_at_ms": 180
+      },
+      {
+        "estimated_finish_ms": 526,
+        "hint": {
+          "deadline_after_ms": 464,
+          "expected_output_tokens": 160,
+          "kind": "tool",
+          "release_after_ms": 0,
+          "residence": "host_backed",
+          "weight": 2.0
+        },
+        "kind": "tool",
+        "planned_arrival_ms": 260,
+        "request_id": "tool-2",
+        "submit_at_ms": 436
+      },
+      {
+        "estimated_finish_ms": 1412,
+        "hint": {
+          "expected_output_tokens": 2048,
+          "kind": "rollout",
+          "release_after_ms": 0,
+          "residence": "host_backed",
+          "weight": 1.5
+        },
+        "kind": "rollout",
+        "planned_arrival_ms": 360,
+        "request_id": "rollout-long",
+        "submit_at_ms": 516
+      },
+      {
+        "estimated_finish_ms": 1988,
+        "hint": {
+          "expected_output_tokens": 3072,
+          "kind": "background",
+          "release_after_ms": 0,
+          "residence": "host_backed",
+          "weight": 1.0
+        },
+        "kind": "background",
+        "planned_arrival_ms": 0,
+        "request_id": "background-long",
+        "submit_at_ms": 1284
+      },
+      {
+        "estimated_finish_ms": 1956,
+        "hint": {
+          "expected_output_tokens": 512,
+          "kind": "chat",
+          "release_after_ms": 0,
+          "residence": "host_backed",
+          "weight": 1.0
+        },
+        "kind": "chat",
+        "planned_arrival_ms": 180,
+        "request_id": "chat-0",
+        "submit_at_ms": 1796
+      }
+    ]
+  }
+}

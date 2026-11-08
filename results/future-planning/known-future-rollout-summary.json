@@ -1,0 +1,47 @@
+{
+  "scope": "Deterministic synthetic policy harness; not a GPU serving measurement.",
+  "workload": "benchmarks/workloads/known-future-rollout.json",
+  "command": "python scripts/future_plan_compare.py benchmarks/workloads/known-future-rollout.json --emit-policy future --output results/future-planning/known-future-rollout.json",
+  "policy_metrics": {
+    "fifo": {
+      "deadline_misses": 3,
+      "makespan_ms": 2040,
+      "weighted_completion_ms": 1007.6818181818181,
+      "peak_memory_bytes": 8033536,
+      "sparse_requests": 5
+    },
+    "longest": {
+      "deadline_misses": 1,
+      "makespan_ms": 1918,
+      "weighted_completion_ms": 1271.6818181818182,
+      "peak_memory_bytes": 8033536,
+      "sparse_requests": 5
+    },
+    "mode-aware": {
+      "deadline_misses": 2,
+      "makespan_ms": 1944,
+      "weighted_completion_ms": 1008.4090909090909,
+      "peak_memory_bytes": 8033536,
+      "sparse_requests": 5
+    },
+    "future": {
+      "deadline_misses": 0,
+      "makespan_ms": 1988,
+      "weighted_completion_ms": 757.6818181818181,
+      "peak_memory_bytes": 4008192,
+      "sparse_requests": 6
+    }
+  },
+  "observations": [
+    "The future policy begins with short deadline work instead of the background request.",
+    "All policy schedules remain within the configured memory budget.",
+    "The future policy uses a lower synthetic peak because fewer requests retain full KV.",
+    "Longest makespan is smaller than the future policy's makespan, so deadline protection is a tradeoff rather than a universal throughput win."
+  ],
+  "not_claimed": [
+    "GPU throughput or latency improvement",
+    "prediction accuracy on an online rollout generator",
+    "real transfer or migration cost",
+    "production workload representativeness"
+  ]
+}

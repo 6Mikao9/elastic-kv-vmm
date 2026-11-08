@@ -62,6 +62,16 @@ requests and SGLang's `PrefillAdder` remains authoritative.  The activation
 coefficient defaults to zero until calibrated because no source-level estimate
 has yet been validated on the target MiniMax workload.
 
+Controlled-rollout planning now emits an executable submission schedule from
+the offline policy.  Each request carries its planned arrival, type, expected
+output length, relative deadline and selected resident/host-backed mode, so a
+rollout controller can feed the existing SGLang hint transport without
+bypassing native admission.  The planner may deliberately idle a short interval
+when starting a long prefill now would make an imminent hard-deadline request
+miss.  This behavior is validated in the deterministic harness; it remains to
+measure whether control-plane idle time and prediction error are worthwhile on
+real serving workloads.
+
 ### Performance targets and next optimizations (2026-11-04)
 
 The dynamic policy has two reference targets: approach fully GPU-resident

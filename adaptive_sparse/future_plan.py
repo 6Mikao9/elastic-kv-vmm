@@ -62,8 +62,14 @@ class RequestProfile:
             raise ValueError(f"{self.request_id}: arrival_ms must be non-negative")
         if self.prompt_tokens < 1 or self.output_tokens < 1:
             raise ValueError(f"{self.request_id}: prompt and output must be positive")
-        if not math.isfinite(self.priority) or self.priority <= 0:
-            raise ValueError(f"{self.request_id}: priority must be positive")
+        if not math.isfinite(self.priority) or not 0 < self.priority <= 1e6:
+            raise ValueError(
+                f"{self.request_id}: priority must be finite and in (0, 1e6]"
+            )
+        if not isinstance(self.kind, str) or not self.kind or len(self.kind) > 64:
+            raise ValueError(
+                f"{self.request_id}: kind must be a short non-empty string"
+            )
         if self.deadline_ms is not None and self.deadline_ms < self.arrival_ms:
             raise ValueError(f"{self.request_id}: deadline precedes arrival")
         if self.shared_prefix_tokens < 0 or self.shared_prefix_tokens > self.prompt_tokens:
@@ -130,6 +136,7 @@ class Admission:
     start_ms: int
     finish_ms: int
     mode: ResidencyMode
+    kind: str
     resident_kv_bytes: int
     prefill_workspace_bytes: int
     reason: str
@@ -173,11 +180,55 @@ class PlanResult:
                     "start_ms": item.start_ms,
                     "finish_ms": item.finish_ms,
                     "mode": item.mode.value,
+                    "kind": item.kind,
                     "resident_kv_bytes": item.resident_kv_bytes,
                     "prefill_workspace_bytes": item.prefill_workspace_bytes,
                     "reason": item.reason,
                 }
                 for item in self.admissions
+            ],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class RolloutSubmission:
+    """One controller action that reproduces a simulated admission."""
+
+    request_id: str
+    planned_arrival_ms: int
+    submit_at_ms: int
+    estimated_finish_ms: int
+    kind: str
+    hint: dict[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class RolloutPlan:
+    """A simulation plus executable ``elastic.future`` hints.
+
+    The controller delays each request until ``submit_at_ms``.  The emitted
+    hint therefore uses ``release_after_ms=0`` and converts absolute deadlines
+    to scheduler-relative deadlines.  SGLang still performs every native
+    admission check; this object only carries scheduling metadata.
+    """
+
+    simulation: PlanResult
+    submissions: tuple[RolloutSubmission, ...]
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "policy": self.simulation.policy,
+            "simulation": self.simulation.as_dict(),
+            "submissions": [
+                {
+                    "request_id": item.request_id,
+                    "planned_arrival_ms": item.planned_arrival_ms,
+                    "submit_at_ms": item.submit_at_ms,
+                    "estimated_finish_ms": item.estimated_finish_ms,
+                    "kind": item.kind,
+                    "hint": item.hint,
+                }
+                for item in self.submissions
             ],
         }
 
@@ -262,10 +313,18 @@ def _feasible_mode(
     active: Sequence[_Active],
     config: PlannerConfig,
     preferred: ResidencyMode = ResidencyMode.RESIDENT,
+    *,
+    extra_hold_bytes: int = 0,
+    extra_active_requests: int = 0,
 ) -> tuple[ResidencyMode, str] | None:
-    if len(active) >= config.max_active_requests:
+    if extra_hold_bytes < 0 or extra_active_requests < 0:
+        raise ValueError("extra active state must be nonnegative")
+    if len(active) + extra_active_requests > config.max_active_requests:
         return None
-    active_bytes = sum(item.admission.resident_kv_bytes for item in active)
+    active_bytes = (
+        sum(item.admission.resident_kv_bytes for item in active)
+        + extra_hold_bytes
+    )
     workspace = request.prompt_tokens * config.prefill_workspace_bytes_per_token
     native_hold = _hold_bytes(request, ResidencyMode.HI_SPARSE, config)
     if request.sequence_tokens <= config.sparse_hot_tokens:
@@ -297,6 +356,71 @@ def _feasible_mode(
                 reason = "fits-resident" if mode is ResidencyMode.RESIDENT else "fits-bounded-hot-set"
             return mode, reason
     return None
+
+
+def _defer_for_imminent_work(
+    choice: RequestProfile,
+    mode: ResidencyMode,
+    active: Sequence[_Active],
+    future: Sequence[RequestProfile],
+    now_ms: int,
+    config: PlannerConfig,
+) -> bool:
+    """Return whether starting ``choice`` now blocks more valuable work.
+
+    This helper models the controlled-rollout case where the caller knows a
+    request is about to arrive and may intentionally leave the prefill engine
+    idle for a short interval.  It only defers when the future request fits the
+    current live set, the current prefill would delay it, and the current
+    choice can tolerate being placed behind that work.
+    """
+
+    current_prefill = _ceil_duration(choice.prompt_tokens, config.prefill_tokens_per_ms)
+    held_choice = _hold_bytes(choice, mode, config)
+    choice_duration = _duration_ms(choice, mode, config)
+    for item in future:
+        if item.arrival_ms > now_ms + config.lookahead_ms:
+            break
+        if item.deadline_ms is None:
+            continue
+        standalone = _feasible_mode(item, active, config)
+        if standalone is None:
+            continue
+        future_mode = standalone[0]
+        future_duration = _duration_ms(item, future_mode, config)
+        future_prefill = _ceil_duration(item.prompt_tokens, config.prefill_tokens_per_ms)
+        blocked_start = max(item.arrival_ms, now_ms + current_prefill)
+        delayed_finish = blocked_start + future_duration
+
+        with_choice = _feasible_mode(
+            item,
+            active,
+            config,
+            extra_hold_bytes=held_choice,
+            extra_active_requests=1,
+        )
+        memory_blocked = with_choice is None
+        deadline_blocked = (
+            delayed_finish > item.deadline_ms
+            and item.arrival_ms + future_duration <= item.deadline_ms
+        )
+        # Idle only to protect a hard latency objective.  Merely having a
+        # higher-priority request in the horizon should not leave otherwise
+        # useful prefill capacity idle: native priority handles that case when
+        # the request actually arrives.
+        if not (memory_blocked or deadline_blocked):
+            continue
+
+        if choice.deadline_ms is not None:
+            delayed_choice_finish = (
+                item.arrival_ms + future_prefill + choice_duration
+            )
+            if delayed_choice_finish > choice.deadline_ms:
+                continue
+            if item.deadline_ms > choice.deadline_ms:
+                continue
+        return True
+    return False
 
 
 def _select(
@@ -393,6 +517,10 @@ def _select(
             0 if item[4] is ResidencyMode.RESIDENT else 1,
         ),
     )
+    if _defer_for_imminent_work(
+        choice, mode, active, future, now_ms, config
+    ):
+        return None
     return choice, mode, reason
 
 
@@ -458,6 +586,7 @@ def simulate(
                 start_ms=now_ms,
                 finish_ms=now_ms + duration,
                 mode=mode,
+                kind=request.kind,
                 resident_kv_bytes=hold,
                 prefill_workspace_bytes=workspace,
                 reason=reason,
@@ -504,6 +633,56 @@ def simulate(
     )
 
 
+def plan_rollout(
+    requests: Iterable[RequestProfile],
+    config: PlannerConfig,
+    policy: str = "future",
+) -> RolloutPlan:
+    """Convert a simulated policy into delayed submissions and runtime hints.
+
+    The rollout controller should submit request ``i`` at ``submit_at_ms``.
+    Its attached ``elastic.future`` action emits the selected residency mode,
+    expected output length, weight, type and scheduler-relative deadline.  This
+    keeps the oracle-to-runtime boundary explicit and leaves memory admission,
+    routing and fallback inside SGLang.
+    """
+
+    workload = tuple(requests)
+    if policy not in POLICIES:
+        raise ValueError(f"unknown planning policy: {policy!r}")
+    simulation = simulate(workload, config, policy)
+    requests_by_id = {item.request_id: item for item in workload}
+    submissions = []
+    for admission in simulation.admissions:
+        request = requests_by_id[admission.request_id]
+        hint: dict[str, object] = {
+            "release_after_ms": 0,
+            "expected_output_tokens": request.output_tokens,
+            "weight": request.priority,
+            "kind": request.kind,
+            "residence": (
+                "resident"
+                if admission.mode is ResidencyMode.RESIDENT
+                else "host_backed"
+            ),
+        }
+        if request.deadline_ms is not None:
+            hint["deadline_after_ms"] = max(
+                0, request.deadline_ms - admission.start_ms
+            )
+        submissions.append(
+            RolloutSubmission(
+                request_id=request.request_id,
+                planned_arrival_ms=admission.arrival_ms,
+                submit_at_ms=admission.start_ms,
+                estimated_finish_ms=admission.finish_ms,
+                kind=request.kind,
+                hint=hint,
+            )
+        )
+    return RolloutPlan(simulation, tuple(submissions))
+
+
 def compare(request_path: str | Path) -> dict[str, dict[str, object]]:
     """Load ``{config, requests}`` JSON and simulate every built-in policy."""
 
@@ -519,9 +698,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("workload", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--emit-policy", choices=POLICIES)
     args = parser.parse_args(argv)
 
-    rendered = json.dumps(compare(args.workload), indent=2, sort_keys=True)
+    payload: dict[str, object] = compare(args.workload)
+    if args.emit_policy is not None:
+        raw = json.loads(args.workload.read_text(encoding="utf-8"))
+        config = PlannerConfig(**raw["config"])
+        workload = [RequestProfile(**item) for item in raw["requests"]]
+        payload["rollout"] = plan_rollout(
+            workload, config, args.emit_policy
+        ).as_dict()
+    rendered = json.dumps(payload, indent=2, sort_keys=True)
     if args.output is None:
         print(rendered)
     else:
