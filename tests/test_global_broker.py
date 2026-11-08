@@ -85,6 +85,27 @@ class GlobalAdmissionBrokerTest(unittest.TestCase):
             first.close()
             second.close()
 
+    def test_fair_share_fast_path_skips_tenant_queries_when_off(self):
+        broker = self.broker("owner")
+        try:
+            self.assertTrue(broker.claim("prefill-0", 4).admit)
+            connection = broker._connect()
+            statements = []
+            connection.set_trace_callback(statements.append)
+            before = connection.total_changes
+            fair = broker._fair_state(connection, time.time())
+            connection.set_trace_callback(None)
+            self.assertEqual(connection.total_changes, before)
+            self.assertEqual(fair["used"], 4)
+            self.assertEqual(fair["usage"], {})
+            self.assertEqual(fair["targets"], {})
+            self.assertEqual(fair["starved"], ())
+            self.assertFalse(any("JOIN owners" in sql for sql in statements))
+            self.assertFalse(any("FROM demands" in sql for sql in statements))
+            self.assertFalse(any("FROM tenants" in sql for sql in statements))
+        finally:
+            broker.close()
+
     def test_release_and_close_return_capacity(self):
         first = self.broker("first")
         second = self.broker("second")

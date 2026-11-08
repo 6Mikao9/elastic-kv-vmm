@@ -684,7 +684,7 @@ class GlobalAdmissionBroker:
         ).fetchone()
         if fair_mode is None or fair_mode[0] != self.fair_mode:
             raise RuntimeError("global broker fair mode changed while owner is active")
-        if prune_expired:
+        if prune_expired and self.fair_mode != "off":
             connection.execute("DELETE FROM demands WHERE expires_at <= ?", (now,))
         used = int(
             connection.execute(
@@ -692,6 +692,14 @@ class GlobalAdmissionBroker:
                 "COALESCE((SELECT SUM(bytes) FROM claims), 0)"
             ).fetchone()[0]
         )
+        if self.fair_mode == "off":
+            return {
+                "used": used,
+                "usage": {},
+                "demands": {},
+                "targets": {},
+                "starved": (),
+            }
         usage = {
             str(tenant): int(bytes_used)
             for tenant, bytes_used in connection.execute(

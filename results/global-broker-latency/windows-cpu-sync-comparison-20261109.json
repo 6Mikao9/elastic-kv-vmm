@@ -23,5 +23,10 @@
     "full_p95_us": 1971.785,
     "normal_p95_us": 178.465,
     "median_speedup": 14.43
+  },
+  "post_fair_off_fast_path": {
+    "off_median_us": 105.2,
+    "off_p95_us": 155.32,
+    "speedup_vs_full": 16.42
   }
 }

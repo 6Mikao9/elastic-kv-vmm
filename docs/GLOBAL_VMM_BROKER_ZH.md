@@ -286,3 +286,11 @@ TTFT。改造前、后原始文件分别为
 `windows-cpu-sync-normal-explicit-r*-20261109.json`。该结果仍只证明 Windows CPU
 控制面开销，最终收益必须在目标 Linux/tmpfs 文件系统上通过 prefill 边界 TTFT、
 claim denial 和真实竞争负载验证；不能把约 1.6 ms 的下降直接写成 serving 吞吐收益。
+
+`fair_mode=off` 不需要读取 tenant ownership、未满足需求或权重。broker 现在在这个
+分支里只校验模式并汇总 lease/claim 字节，同时跳过无意义的过期 demand 清理。
+上述 Windows 口径再重复三轮后，`off` 的 `claim+shrink+release` 中位中位数由
+0.114 ms 进一步降到 0.105 ms，p95 由 0.178 ms 降到 0.155 ms；相对 `FULL` 共快
+16.4 倍。最终三轮原始数据为
+`windows-cpu-fair-fast-final-r*-20261109.json`。`observe/enforce` 仍需查询公平
+状态，这组数据没有证明它们有额外收益。
