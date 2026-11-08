@@ -14,22 +14,34 @@ def submission(
     prompt=100,
     output=100,
     residence="resident",
+    weight=1.0,
+    submit_at_ms=0,
+    estimated_finish_ms=100,
+    deadline_after_ms=None,
 ):
+    hint = {
+        "release_after_ms": 0,
+        "expected_output_tokens": output,
+        "weight": weight,
+        "kind": "rollout",
+        "residence": residence,
+    }
+    if deadline_after_ms is not None:
+        hint["deadline_after_ms"] = deadline_after_ms
     return RolloutSubmission(
         request_id=request_id,
         planned_arrival_ms=0,
-        submit_at_ms=0,
-        estimated_finish_ms=100,
+        submit_at_ms=submit_at_ms,
+        estimated_finish_ms=estimated_finish_ms,
         kind="rollout",
         prompt_tokens=prompt,
         output_tokens=output,
-        hint={
-            "release_after_ms": 0,
-            "expected_output_tokens": output,
-            "weight": 1.0,
-            "kind": "rollout",
-            "residence": residence,
-        },
+        hint=hint,
+        deadline_ms=(
+            None
+            if deadline_after_ms is None
+            else submit_at_ms + deadline_after_ms
+        ),
     )
 
 
@@ -99,6 +111,101 @@ class ElasticAdmissionTest(unittest.TestCase):
         self.assertEqual(decision.chosen_residence, "host_backed")
         self.assertTrue(decision.defer_for_budget)
         self.assertTrue(decision.over_budget)
+
+    def test_imminent_urgent_request_demotes_current_resident_request(self):
+        current = submission("background", weight=1.0, estimated_finish_ms=100)
+        urgent = submission(
+            "urgent",
+            weight=2.0,
+            submit_at_ms=20,
+            estimated_finish_ms=120,
+            deadline_after_ms=180,
+        )
+        config = ElasticKVConfig(
+            memory_budget_bytes=700,
+            kv_bytes_per_token=2,
+            sparse_hot_tokens=64,
+            lookahead_ms=200,
+        )
+
+        decision = decide_elastic_admission(
+            current,
+            active_bytes=0,
+            config=config,
+            future_submissions=(current, urgent),
+            now_ms=0,
+        )
+
+        self.assertEqual(decision.chosen_residence, "host_backed")
+        self.assertEqual(decision.reason, "imminent-future-demotion")
+        self.assertEqual(decision.future_reserved_bytes, 400)
+        self.assertEqual(decision.future_reserved_requests, 1)
+        self.assertEqual(decision.active_after_bytes, 128)
+        self.assertEqual(decision.future_effective_after_bytes, 528)
+        self.assertFalse(decision.defer_for_budget)
+
+    def test_future_reservation_ignores_nonoverlap_equal_weight_and_far_work(self):
+        current = submission("current", weight=1.0, estimated_finish_ms=50)
+        same_weight = submission(
+            "same-weight", weight=1.0, submit_at_ms=10, estimated_finish_ms=60
+        )
+        later = submission(
+            "later",
+            weight=2.0,
+            submit_at_ms=100,
+            estimated_finish_ms=150,
+            deadline_after_ms=200,
+        )
+        beyond_horizon = submission(
+            "beyond-horizon",
+            weight=2.0,
+            submit_at_ms=250,
+            estimated_finish_ms=300,
+            deadline_after_ms=350,
+        )
+        config = ElasticKVConfig(
+            memory_budget_bytes=700,
+            kv_bytes_per_token=2,
+            sparse_hot_tokens=64,
+            lookahead_ms=200,
+        )
+
+        decision = decide_elastic_admission(
+            current,
+            active_bytes=0,
+            config=config,
+            future_submissions=(current, same_weight, later, beyond_horizon),
+            now_ms=0,
+        )
+
+        self.assertEqual(decision.chosen_residence, "resident")
+        self.assertEqual(decision.future_reserved_bytes, 0)
+        self.assertEqual(decision.future_reserved_requests, 0)
+
+    def test_future_reservation_requires_time_and_fits_planner_projection(self):
+        config = ElasticKVConfig(
+            memory_budget_bytes=1_000,
+            kv_bytes_per_token=2,
+            sparse_hot_tokens=64,
+            lookahead_ms=200,
+        )
+        with self.assertRaisesRegex(ValueError, "now_ms"):
+            decide_elastic_admission(
+                submission("current"),
+                active_bytes=0,
+                config=config,
+                future_submissions=(submission("other"),),
+            )
+
+        planner = PlannerConfig(
+            memory_budget_bytes=1_000,
+            kv_bytes_per_token=2,
+            prefill_workspace_bytes_per_token=0,
+            sparse_hot_tokens=64,
+            lookahead_ms=200,
+            auto_resident_output_threshold=128,
+        )
+        self.assertEqual(elastic_config_from_planner(planner).lookahead_ms, 200)
 
     def test_invalid_active_bytes_are_rejected(self):
         for value in (-1, 1.5, True):

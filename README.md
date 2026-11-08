@@ -137,6 +137,10 @@ time, bound the observed in-flight set, prioritize deadline-bearing requests,
 and demote only newly admitted long requests when the live predicted KV set
 would cross the planner's aggregate byte budget. Runtime demotion and capacity
 waiting are written into every request record and the paired summary.
+When the planner enables a positive `lookahead_ms`, the same admission check
+also reserves bounded capacity for imminent deadline or higher-weight requests
+that can overlap the current request. This decision is made once at admission;
+the existing scheduler hysteresis owns later demotion and promotion.
 The 0.5.17 API and request-transport tests pass; a real model server could not
 start on the available 5090 host because PyTorch CUDA initialization failed after
 container `nvidia-smi` succeeded. That blocker is recorded without converting it

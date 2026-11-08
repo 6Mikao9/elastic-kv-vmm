@@ -161,6 +161,79 @@ class RolloutExecutorTest(unittest.TestCase):
         self.assertEqual(second_hint["actions"][0]["payload"]["residence"], "host_backed")
         self.assertEqual(result["summary"]["runtime_demotions"], 1)
 
+    def test_managed_rollout_reserves_for_imminent_urgent_request(self):
+        background = RolloutSubmission(
+            request_id="background",
+            planned_arrival_ms=0,
+            submit_at_ms=0,
+            estimated_finish_ms=100,
+            kind="background",
+            prompt_tokens=100,
+            output_tokens=100,
+            hint={
+                "release_after_ms": 0,
+                "expected_output_tokens": 100,
+                "weight": 1.0,
+                "kind": "background",
+                "residence": "resident",
+            },
+        )
+        urgent = RolloutSubmission(
+            request_id="urgent",
+            planned_arrival_ms=10,
+            submit_at_ms=10,
+            estimated_finish_ms=110,
+            kind="tool",
+            prompt_tokens=100,
+            output_tokens=100,
+            hint={
+                "release_after_ms": 0,
+                "deadline_after_ms": 190,
+                "expected_output_tokens": 100,
+                "weight": 2.0,
+                "kind": "tool",
+                "residence": "resident",
+            },
+            deadline_ms=200,
+        )
+        seen = {}
+
+        def generate(url, spec, timeout, stream):
+            seen[spec["request_id"]] = spec["future_hint"]
+            started = time.perf_counter()
+            return {
+                "_started_perf_s": started,
+                "end_to_end_s": 0.01,
+                "output_tokens": 100,
+                "ttft_s": 0.004,
+                "tpot_s": 0.0001,
+            }
+
+        result = execute_rollout(
+            "http://server/generate",
+            [background, urgent],
+            generator=generate,
+            elastic_kv_config=ElasticKVConfig(
+                memory_budget_bytes=700,
+                kv_bytes_per_token=2,
+                sparse_hot_tokens=64,
+                lookahead_ms=200,
+            ),
+            poll_interval_ms=1,
+        )
+
+        by_id = {row["request_id"]: row for row in result["requests"]}
+        self.assertEqual(by_id["background"]["runtime_residence"], "host_backed")
+        self.assertEqual(
+            by_id["background"]["elastic_admission_reason"],
+            "imminent-future-demotion",
+        )
+        self.assertEqual(
+            seen["background"]["actions"][0]["payload"]["residence"],
+            "host_backed",
+        )
+        self.assertEqual(result["summary"]["future_reservation_demotions"], 1)
+
     def test_deadline_queue_policy_orders_contended_requests(self):
         base = submission()
         background = RolloutSubmission(

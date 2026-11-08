@@ -479,6 +479,33 @@ deferred/missing/invalid/unestimated/capped/TP-fallback 和 reservation-pressure
 `dry_run`、`enforce` 三组，并同时观察 TTFT、TPOT、吞吐、OOM/retraction、迁移
 字节和整卡 NVML。
 
+### 5.4 请求准入的最短期未来预留
+
+滚动执行器现在会在决定一个请求能否占用完整 KV 前，查看同一已知 plan 中有限
+horizon 内的后续请求。预留只覆盖同时满足以下条件的请求：
+
+1. 可能在该请求预计完成前启动；
+2. 位于 `lookahead_ms` 内；
+3. 带 deadline，或 soft business weight 严格高于当前请求。
+
+默认 `lookahead_ms=0`，因此不传未来队列时行为与原来的实时 active-byte 准入
+相同。启用后最多计入 `max_future_reservations` 条近期请求；未来请求若是短请求
+或显式 `host_backed`，只预留其有界 HiSparse hot-set，不会为所有未来请求永久
+映射完整 KV。
+
+当前请求仍在预算内时，若 `active + current + imminent_future` 超限，它会在
+请求级选择上退为 `host_backed`，原因记为 `imminent-future-demotion`。这个决定
+只发生在请求准入，随后的整个请求生命周期保持稳定；运行中的动态迁移继续由
+`SchedulerBudget` 的 dwell、low-water stable interval、joint demotion、每轮
+字节上限和 in-flight 限制防抖。rollout 结果逐请求记录
+`elastic_future_reserved_bytes`、`elastic_future_reserved_requests`、
+`elastic_future_effective_after_bytes` 和 `elastic_future_over_budget`，汇总
+记录 `future_reservation_admissions` 与 `future_reservation_demotions`。
+
+这是已知未来控制面的容量策略，不是对未知线上请求的预测。共享前缀或跨请求
+共享物理 chunk 仍应使用实际 owner index 抵扣；当前 CPU 测试只验证确定性预算
+和接入，不能据此宣称端到端吞吐、TTFT 或 OOM 收益。
+
 ## 6. 状态机与失败回退
 
 ```text

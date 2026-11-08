@@ -453,6 +453,12 @@ def _measure_result(
                 "elastic_active_before_bytes": admission.active_before_bytes,
                 "elastic_active_after_bytes": admission.active_after_bytes,
                 "elastic_over_budget": admission.over_budget,
+                "elastic_future_reserved_bytes": admission.future_reserved_bytes,
+                "elastic_future_reserved_requests": admission.future_reserved_requests,
+                "elastic_future_effective_after_bytes": (
+                    admission.future_effective_after_bytes
+                ),
+                "elastic_future_over_budget": admission.future_over_budget,
             }
         )
     return row
@@ -545,6 +551,8 @@ def _execute_managed_rollout(
                     submission,
                     active_bytes=active_bytes,
                     config=elastic_kv_config,
+                    future_submissions=queue,
+                    now_ms=now_ms,
                 )
                 if admission.defer_for_budget:
                     predicted_duration = max(
@@ -687,6 +695,13 @@ def _finalize_rollout(
         ),
         "over_budget_admissions": sum(
             row.get("elastic_over_budget") is True for row in rows
+        ),
+        "future_reservation_admissions": sum(
+            int(row.get("elastic_future_reserved_requests", 0)) > 0 for row in rows
+        ),
+        "future_reservation_demotions": sum(
+            row.get("elastic_admission_reason") == "imminent-future-demotion"
+            for row in rows
         ),
         "efficiency": _efficiency(rows),
     }
