@@ -26,10 +26,12 @@ docker run --rm --pull=never --gpus "device=$gpu" --network none --shm-size 2g \
     --user "$(id -u):$(id -g)" \
     --mount "type=bind,src=$model,dst=/model,readonly" \
     --mount "type=bind,src=$root,dst=/experiment" --workdir /experiment \
+    -e USER=experiment -e LOGNAME=experiment \
     -e HOME=/experiment/cache/e2e/home \
     -e HF_HOME=/experiment/cache/e2e/hf -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
     -e XDG_CACHE_HOME=/experiment/cache/e2e/xdg -e TORCH_HOME=/experiment/cache/e2e/torch \
     -e TRITON_CACHE_DIR=/experiment/cache/e2e/triton \
+    -e TORCHINDUCTOR_CACHE_DIR=/experiment/cache/e2e/torchinductor \
     -e FLASHINFER_WORKSPACE_BASE=/experiment/cache/e2e/flashinfer \
     -e SGLANG_JIT_CACHE_DIR=/experiment/cache/e2e/sglang-jit \
     -e CUDA_CACHE_PATH=/experiment/cache/e2e/cuda -e PYTHONDONTWRITEBYTECODE=1 \
