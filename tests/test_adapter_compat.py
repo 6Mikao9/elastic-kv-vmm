@@ -191,6 +191,58 @@ class AdapterCompatibilityTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "post-capture"):
                 guarded(configurator_instance, pre_model_load_memory=1)
 
+    def test_installs_on_0_5_17_without_kind_registry(self):
+        class LegacyMHA:
+            pass
+
+        class LegacyAllocator:
+            pass
+
+        class ModelRunner:
+            pass
+
+        class Configurator:
+            def configure(self, *args, **kwargs):
+                return "configured"
+
+        modules = {
+            "sglang": _module("sglang", __version__="0.5.17"),
+            "sglang.srt": _module("sglang.srt"),
+            "sglang.srt.model_executor": _module("sglang.srt.model_executor"),
+            "sglang.srt.model_executor.model_runner": _module(
+                "sglang.srt.model_executor.model_runner", ModelRunner=ModelRunner
+            ),
+            "sglang.srt.mem_cache": _module("sglang.srt.mem_cache"),
+            "sglang.srt.mem_cache.memory_pool": _module(
+                "sglang.srt.mem_cache.memory_pool", MHATokenToKVPool=LegacyMHA
+            ),
+            "sglang.srt.mem_cache.kv_cache_configurator": _module(
+                "sglang.srt.mem_cache.kv_cache_configurator",
+                KVCacheConfigurator=Configurator,
+                MHATokenToKVPool=LegacyMHA,
+                TokenToKVPoolAllocator=LegacyAllocator,
+            ),
+            "sglang.srt.mem_cache.allocator": _module(
+                "sglang.srt.mem_cache.allocator",
+                TokenToKVPoolAllocator=LegacyAllocator,
+            ),
+            "sglang.srt.mem_cache.allocator.token": _module(
+                "sglang.srt.mem_cache.allocator.token",
+                TokenToKVPoolAllocator=LegacyAllocator,
+            ),
+        }
+        with patch.dict(sys.modules, modules):
+            adapter.install()
+            memory_pool = sys.modules["sglang.srt.mem_cache.memory_pool"]
+            configurator = sys.modules[
+                "sglang.srt.mem_cache.kv_cache_configurator"
+            ]
+            self.assertNotEqual(memory_pool.MHATokenToKVPool, LegacyMHA)
+            self.assertNotEqual(configurator.MHATokenToKVPool, LegacyMHA)
+            self.assertNotEqual(
+                configurator.TokenToKVPoolAllocator, LegacyAllocator
+            )
+
     def test_installs_on_legacy_model_runner_api(self):
         calls = []
 

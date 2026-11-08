@@ -52,16 +52,97 @@ def _releasable_pair(tracker, left_pages, left_counts, right_pages, right_counts
     return _releasable_counts(tracker, left_counts + right_counts)
 
 
+def _releasable_group(tracker, candidates):
+    """Return chunks that become releasable after a bounded request group.
+
+    Candidates normally own disjoint physical pages.  If two requests name the
+    same page, additive chunk counts would count that page twice, so recompute
+    from the page union for that uncommon case.
+    """
+    pages = set()
+    counts = Counter()
+    overlap = False
+    for candidate_pages, candidate_counts in candidates:
+        if pages & candidate_pages:
+            overlap = True
+        pages.update(candidate_pages)
+        counts.update(candidate_counts)
+    if overlap:
+        return _releasable(tracker, pages)
+    return _releasable_counts(tracker, counts)
+
+
+def _bounded_demotion_groups(tracker, requests, cost, *, max_group,
+                             byte_cap, search_limit, rotation=0):
+    """Enumerate small request groups with a deterministic work bound.
+
+    The common case has only a handful of resident long requests, so exhaustive
+    enumeration through ``max_group`` is cheaper and more predictable than
+    maintaining a chunk-to-request inverted index at every scheduler boundary.
+    The bound protects the pressure path if a dense deployment has many active
+    requests; telemetry reports when that bound was reached.
+    """
+    groups = {}
+    chunks = {}
+    examined = 0
+    truncated = False
+    rejected_by_cap = 0
+    if search_limit < 1:
+        raise ValueError("search_limit must be positive")
+    request_ids = sorted(requests)
+    if request_ids:
+        rotation %= len(request_ids)
+        request_ids = request_ids[rotation:] + request_ids[:rotation]
+    sizes = tuple(range(2, min(max_group, len(request_ids)) + 1))
+    base_quota, extra = divmod(search_limit, max(1, len(sizes)))
+    quotas = [base_quota + (index < extra) for index in range(len(sizes))]
+    for size, quota in zip(sizes, quotas):
+        size_examined = 0
+        for group in combinations(request_ids, size):
+            if size_examined >= quota:
+                truncated = True
+                break
+            examined += 1
+            size_examined += 1
+            transfer = sum(cost(request_id) for request_id in group)
+            if transfer > byte_cap:
+                rejected_by_cap += 1
+                continue
+            released = _releasable_group(
+                tracker,
+                (
+                    (requests[request_id][1], requests[request_id][2])
+                    for request_id in group
+                ),
+            )
+            if released:
+                group = tuple(sorted(group))
+                groups[group] = (len(released) * tracker.chunk_bytes, transfer)
+                chunks[group] = released
+    return groups, chunks, examined, truncated, rejected_by_cap
+
+
 def _rank_demotions(rank_candidates):
-    common = set.intersection(*(set(rank) for rank in rank_candidates))
+    ranks = tuple(rank_candidates)
+    if not ranks:
+        return []
+    common = set(ranks[0])
+    for rank in ranks[1:]:
+        common.intersection_update(rank)
     return sorted(common, key=lambda rid: (
-        -Fraction(min(rank[rid][0] for rank in rank_candidates),
-                  max(1, max(rank[rid][1] for rank in rank_candidates))), rid))
+        -Fraction(min(rank[rid][0] for rank in ranks),
+                  max(1, max(rank[rid][1] for rank in ranks))), rid))
 
 
 class SchedulerBudget:
     def __init__(self, budget, headroom, dwell, force_step, low=0, stable=2,
-                 observe=16, promote_step=0, stats_path=None, byte_cap=512 << 20, max_group=1, capture_plans=False, trim_low_water=False):
+                 observe=16, promote_step=0, stats_path=None, byte_cap=512 << 20,
+                 max_group=1, capture_plans=False, trim_low_water=False,
+                 group_search_limit=256):
+        if max_group not in (1, 2, 3, 4):
+            raise ValueError("max_group must be between 1 and 4")
+        if group_search_limit < 1:
+            raise ValueError("group_search_limit must be positive")
         self.budget = budget
         self.headroom = headroom
         self.dwell = dwell
@@ -75,6 +156,7 @@ class SchedulerBudget:
         self.stats_path = stats_path
         self.byte_cap = byte_cap
         self.max_group = max_group
+        self.group_search_limit = group_search_limit
         self.capture_plans = capture_plans
         self.trim_low_water = trim_low_water
         self.plan_snapshots = []
@@ -87,6 +169,8 @@ class SchedulerBudget:
                       "pressure_observations": 0, "no_reclaimable_candidate": 0,
                       "group_actions": 0, "group_sizes": {}, "group_released_bytes": 0,
                       "group_requests_demoted": 0,
+                      "group_search_ticks": 0, "group_search_evaluated": 0,
+                      "group_search_truncated": 0,
                       "slack_reclaim_actions": 0, "slack_reclaim_bytes": 0,
                       "low_water_slack_actions": 0, "low_water_slack_bytes": 0,
                       "broker_rejected_promotions": 0,
@@ -262,7 +346,6 @@ class SchedulerBudget:
         resident = coordinator._ekv_resident
         requests = {}
         plans = {}
-        release_counts = {}
         for request in batch.reqs:
             kv = request.kv
             if (kv.req_pool_idx not in resident or request.finished() or request.hisparse_staging
@@ -284,8 +367,7 @@ class SchedulerBudget:
             unique_pages = set(released_pages)
             counts = _chunk_release_counts(tracker, unique_pages)
             chunks = _releasable_counts(tracker, counts)
-            requests[request.rid] = (request, unique_pages, chunks)
-            release_counts[request.rid] = counts
+            requests[request.rid] = (request, unique_pages, counts, chunks)
             if self.capture_plans:
                 plans[kv.req_pool_idx] = {"page_ids": pages, "retained": retained_pages,
                                           "released": released_pages,
@@ -295,32 +377,28 @@ class SchedulerBudget:
             return self.transfer_cost(requests[rid][0], coordinator.mem_pool_device)
 
         metrics = {rid: (len(chunks) * tracker.chunk_bytes, cost(rid))
-                   for rid, (_, _, chunks) in requests.items() if chunks or force}
+                   for rid, (_, _, _, chunks) in requests.items() if chunks or force}
         ranked = _rank_demotions(exchange(metrics))
         if not ranked and not force:
             self.capture_plan(plans, tracker, page_size)
         if ranked:
             chosen = (ranked[0],)
-            chunks = requests[chosen[0]][2]
-        elif self.max_group == 2 and not force:
-            pair_chunks = {}
-            pairs = {}
-            for pair in combinations(sorted(requests), 2):
-                transfer = sum(cost(rid) for rid in pair)
-                if transfer > self.byte_cap:
-                    self.stats["rejected_cap"] += 1
-                    continue
-                left, right = pair
-                released = _releasable_pair(
-                    tracker, requests[left][1], release_counts[left],
-                    requests[right][1], release_counts[right],
-                )
-                if released:
-                    pairs[pair] = (len(released) * tracker.chunk_bytes, transfer)
-                    pair_chunks[pair] = released
-            ranked_pairs = _rank_demotions(exchange(pairs))
-            chosen = ranked_pairs[0] if ranked_pairs else ()
-            chunks = pair_chunks.get(chosen, set())
+            chunks = requests[chosen[0]][3]
+        elif self.max_group > 1 and not force and len(requests) > 1:
+            (groups, group_chunks, examined, truncated,
+             rejected_by_cap) = _bounded_demotion_groups(
+                tracker, requests, cost,
+                max_group=self.max_group, byte_cap=self.byte_cap,
+                search_limit=self.group_search_limit,
+                rotation=self.stats["group_search_ticks"],
+            )
+            self.stats["group_search_ticks"] += 1
+            self.stats["group_search_evaluated"] += examined
+            self.stats["group_search_truncated"] += int(truncated)
+            self.stats["rejected_cap"] += rejected_by_cap
+            ranked_groups = _rank_demotions(exchange(groups))
+            chosen = ranked_groups[0] if ranked_groups else ()
+            chunks = group_chunks.get(chosen, set())
         else:
             chosen = ()
         if not chosen:
@@ -513,6 +591,9 @@ def install_scheduler_budget():
     stats_dir = os.environ.get("EKV_ADAPTIVE_STATS_DIR")
     cap = int(os.environ.get("EKV_ADAPTIVE_MIGRATION_BYTE_CAP", str(512 << 20)))
     max_group = int(os.environ.get("EKV_ADAPTIVE_MAX_GROUP", "1"))
+    group_search_limit = int(os.environ.get(
+        "EKV_ADAPTIVE_GROUP_SEARCH_LIMIT", "256"
+    ))
     capture_plans = os.environ.get("EKV_ADAPTIVE_PLAN_CAPTURE") == "1"
     trim_low_water = os.environ.get("EKV_ADAPTIVE_TRIM_LOW_WATER") == "1"
     future_mode = os.environ.get("EKV_FUTURE_PREFILL_MODE", "off")
@@ -537,7 +618,9 @@ def install_scheduler_budget():
     )
     if not budget and not force and not promote and future_mode == "off":
         return
-    if (min(budget, headroom, force, dwell, low, stable, promote) < 0 or observe < 1 or cap < 1 or max_group not in (1, 2)
+    if (min(budget, headroom, force, dwell, low, stable, promote) < 0
+            or observe < 1 or cap < 1 or group_search_limit < 1
+            or max_group not in (1, 2, 3, 4)
             or (low and low >= budget) or (promote and (not force or promote <= force))):
         raise ValueError("adaptive scheduler settings must be nonnegative")
     if future_mode == "enforce" and budget <= 0:
@@ -573,7 +656,7 @@ def install_scheduler_budget():
                           if stats_dir else None)
             self._ekv_adaptive_budget = SchedulerBudget(
                 budget, headroom, dwell, force, low, stable, observe, promote, stats_path, cap, max_group, capture_plans,
-                trim_low_water)
+                trim_low_water, group_search_limit)
 
         def exchange(value):
             if coordinator.tp_world_size == 1:

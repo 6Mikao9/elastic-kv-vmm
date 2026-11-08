@@ -288,6 +288,10 @@ def install():
             # ServerArgs, so pin the buffer metadata to the layout we build.
             self.use_hnd = False
             self.kv_cache_layout = "nhd"
+            self.k_scale_buffer = None
+            self.v_scale_buffer = None
+            self.dq_k_buffer = None
+            self.dq_v_buffer = None
             chunk = int(os.environ.get("EKV_CHUNK_MIB", "2")) << 20
             slots = self.size + self.page_size
             elements = self.head_num * self.head_dim
@@ -319,10 +323,27 @@ def install():
                 self.k_buffer = [packed[:, layer, 0] for layer in range(self.layer_num)]
                 self.v_buffer = [packed[:, layer, 1] for layer in range(self.layer_num)]
                 layout = "token_major"
-            self.k_data_ptrs = torch.tensor([x.data_ptr() for x in self.k_buffer], dtype=torch.uint64, device=self.device)
-            self.v_data_ptrs = torch.tensor([x.data_ptr() for x in self.v_buffer], dtype=torch.uint64, device=self.device)
-            self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs])
-            self.data_strides = torch.tensor([x.stride(0) * itemsize for x in self.k_buffer + self.v_buffer], device=self.device)
+            if hasattr(self, "_build_kv_buffer_descs"):
+                self._kv_buffer_descs = self._build_kv_buffer_descs()
+                self._init_data_ptrs_and_strides()
+            else:
+                self.k_data_ptrs = torch.tensor(
+                    [x.data_ptr() for x in self.k_buffer],
+                    dtype=torch.uint64,
+                    device=self.device,
+                )
+                self.v_data_ptrs = torch.tensor(
+                    [x.data_ptr() for x in self.v_buffer],
+                    dtype=torch.uint64,
+                    device=self.device,
+                )
+                self.data_ptrs = torch.cat(
+                    [self.k_data_ptrs, self.v_data_ptrs]
+                )
+                self.data_strides = torch.tensor(
+                    [x.stride(0) * itemsize for x in self.k_buffer + self.v_buffer],
+                    device=self.device,
+                )
             self.residency = Residency(self, arenas, stride, layout)
             self.residency.publish(force=True)
 

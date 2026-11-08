@@ -186,7 +186,8 @@ def main():
     parser.add_argument("--adaptive-low-stable-seconds", type=float, default=2)
     parser.add_argument("--adaptive-observe-steps", type=int, default=16)
     parser.add_argument("--adaptive-migration-cap-mib", type=int, default=512)
-    parser.add_argument("--adaptive-max-group", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--adaptive-max-group", type=int, choices=(1, 2, 3, 4), default=1)
+    parser.add_argument("--adaptive-group-search-limit", type=int, default=256)
     parser.add_argument("--adaptive-plan-capture", action="store_true")
     parser.add_argument("--adaptive-trim-low-water", action="store_true")
     parser.add_argument("--chunk-aware-retention", action="store_true")
@@ -260,6 +261,7 @@ def main():
         "EKV_ADAPTIVE_OBSERVE_STEPS": args.adaptive_observe_steps,
         "EKV_ADAPTIVE_MIGRATION_BYTE_CAP": args.adaptive_migration_cap_mib * (1 << 20),
         "EKV_ADAPTIVE_MAX_GROUP": args.adaptive_max_group,
+        "EKV_ADAPTIVE_GROUP_SEARCH_LIMIT": args.adaptive_group_search_limit,
         "EKV_ADAPTIVE_PLAN_CAPTURE": int(args.adaptive_plan_capture),
         "EKV_ADAPTIVE_TRIM_LOW_WATER": int(args.adaptive_trim_low_water),
     }

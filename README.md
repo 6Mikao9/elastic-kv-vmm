@@ -14,6 +14,8 @@ The optional future-aware scheduler hook has its own [scheduler report](docs/FUT
 
 The [MiniMax integration report](docs/MINIMAX_FUTURE_INTEGRATION.md) records a stronger composition check: native sparse HiSparse, VMM backing, request-level residency, automatic joint demotion and future-aware ordering all ran in the same four-A100 server process. The checked-in runs show that the mechanisms compose and that two requests can jointly release physical chunks that neither request alone can free. They do **not** show a stable throughput win: sequential runs have a clear warmup/order effect, and the future-aware arm improved TTFT in one pressure run while regressing TPOT.
 
+The joint pressure path now supports bounded two-to-four-request planning. It ranks only groups that can release at least one complete physical chunk on every TP rank, keeps the existing dwell and byte caps, and records how many combinations were evaluated or truncated. CPU coverage includes the three-owner shared-chunk case; GPU placement, migration cost and end-to-end benefit still require the pending serving comparison.
+
 ## Request-level HiSparse
 
 The MiniMax prototype lets selected long requests keep full GPU history while other requests use the native CPU history and fixed GPU hot buffer. Under a main-KV backing budget, it can demote and promote active requests at safe eager boundaries. The sparse attention selection remains unchanged in both modes. VMM reclaims whole physical chunks after their page references disappear.
@@ -107,6 +109,10 @@ their own implementation. The VMM adapter and future-ordering hook can therefore
 share one process without changing sampling or attention behavior. See [the
 compatibility boundary](docs/KV_HINTS_COMPAT.md), [scheduler integration
 design](docs/FUTURE_PLANNER_DESIGN.md), and [smoke script](scripts/container_future_smoke.sh).
+The 0.5.17 API and request-transport tests pass; a real model server could not
+start on the available 5090 host because PyTorch CUDA initialization failed after
+container `nvidia-smi` succeeded. That blocker is recorded without converting it
+into a performance result.
 
 The MiniMax request-residency path can consume the same hint. With
 `--resident-hint-policy adaptive`, `host_backed` yields a complete-GPU KV slot,

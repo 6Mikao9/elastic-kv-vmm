@@ -6,8 +6,9 @@ import unittest
 from unittest.mock import Mock, call, patch
 
 from adaptive_sparse.scheduler_budget import (
-    SchedulerBudget, _chunk_release_counts, _rank_demotions, _releasable,
-    _releasable_counts, _releasable_pair,
+    SchedulerBudget, _bounded_demotion_groups, _chunk_release_counts,
+    _rank_demotions, _releasable, _releasable_counts, _releasable_group,
+    _releasable_pair,
 )
 from adaptive_sparse.future_prefill import empty_plan
 
@@ -79,6 +80,87 @@ class SchedulerBudgetTest(unittest.TestCase):
                  {"a": (20, 20), "b": (50, 10)}]
         self.assertEqual(_rank_demotions(ranks), ["b", "a"])
         self.assertEqual(_rank_demotions(ranks[::-1]), ["b", "a"])
+        self.assertEqual(_rank_demotions(()), [])
+
+    def test_releasable_group_requires_every_shared_chunk_owner(self):
+        tracker = B(
+            backing=B(mapped_chunks={9}),
+            refs={9: 3},
+            chunk_bytes=10,
+        )
+        candidates = [
+            ({1}, Counter({9: 1})),
+            ({2}, Counter({9: 1})),
+            ({3}, Counter({9: 1})),
+        ]
+        self.assertEqual(_releasable_group(tracker, candidates[:2]), set())
+        self.assertEqual(_releasable_group(tracker, candidates), {9})
+
+    def test_bounded_group_search_finds_three_request_release(self):
+        tracker = B(
+            backing=B(mapped_chunks={9}),
+            refs={9: 3},
+            chunk_bytes=10,
+        )
+        requests = {
+            "a": (None, {1}, Counter({9: 1}), set()),
+            "b": (None, {2}, Counter({9: 1}), set()),
+            "c": (None, {3}, Counter({9: 1}), set()),
+        }
+        costs = {"a": 4, "b": 5, "c": 6}
+        groups, chunks, examined, truncated, rejected = _bounded_demotion_groups(
+            tracker, requests, costs.__getitem__, max_group=3,
+            byte_cap=20, search_limit=8,
+        )
+        self.assertEqual(groups[("a", "b", "c")], (10, 15))
+        self.assertEqual(chunks[("a", "b", "c")], {9})
+        self.assertFalse(truncated)
+        self.assertEqual(examined, 4)
+        self.assertEqual(rejected, 0)
+
+        groups, _, examined, truncated, rejected = _bounded_demotion_groups(
+            tracker, requests, costs.__getitem__, max_group=3,
+            byte_cap=20, search_limit=3, rotation=0,
+        )
+        self.assertEqual(groups[("a", "b", "c")], (10, 15))
+        self.assertTrue(truncated)
+        self.assertEqual(examined, 3)
+        self.assertEqual(rejected, 0)
+
+        groups, _, examined, truncated, rejected = _bounded_demotion_groups(
+            tracker, requests, costs.__getitem__, max_group=3,
+            byte_cap=12, search_limit=8,
+        )
+        self.assertFalse(groups)
+        self.assertFalse(truncated)
+        self.assertEqual(examined, 4)
+        self.assertEqual(rejected, 1)
+
+    def test_group_search_rotation_reaches_later_shared_pair(self):
+        tracker = B(
+            backing=B(mapped_chunks={9}),
+            refs={9: 2},
+            chunk_bytes=10,
+        )
+        requests = {
+            "a": (None, {1}, Counter(), set()),
+            "b": (None, {2}, Counter(), set()),
+            "c": (None, {3}, Counter({9: 1}), set()),
+            "d": (None, {4}, Counter({9: 1}), set()),
+        }
+        cost = lambda _: 1
+        first, _, _, truncated, _ = _bounded_demotion_groups(
+            tracker, requests, cost, max_group=2, byte_cap=10,
+            search_limit=1, rotation=0,
+        )
+        self.assertFalse(first)
+        self.assertTrue(truncated)
+        later, chunks, _, _, _ = _bounded_demotion_groups(
+            tracker, requests, cost, max_group=2, byte_cap=10,
+            search_limit=1, rotation=2,
+        )
+        self.assertEqual(later[("c", "d")], (10, 2))
+        self.assertEqual(chunks[("c", "d")], {9})
 
     def test_state_change_restarts_dwell_and_force_bypasses_cap(self):
         policy = SchedulerBudget(100, 0, 3, 0, byte_cap=10)
