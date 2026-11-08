@@ -628,6 +628,11 @@ NVML。
 启动，真实 admission 仍需在第一次 `ensure` 上等待清零完成。预热不会 claim
 逻辑槽、不会改变 waiting queue，也不会绕过原生 `PrefillAdder`。
 
+容量预留和物理预热使用不同时间窗口。准入仍按完整 future horizon 求并发峰值；
+物理预热只统计 `start_in_ms <= EKV_PREDICTIVE_PREWARM_TTL_MS` 的请求，避免为较晚
+到达的请求提前占用 lease。未提供 TTL 环境变量时保留旧的 full-horizon 行为。
+因此同一份 plan 可以同时提供保守准入结论和更紧凑的即时 `cuMemCreate` 范围。
+
 每条新 lease 使用固定 `EKV_PREDICTIVE_PREWARM_TTL_MS`，重复 planning 不会延长
 已有 lease。真实 `admit`/`admit_ranges` 消费命中 chunk 时记录 hit；TTL 到期且
 引用数仍为零时，在单个 CUDA synchronize 后回收。池暂时 drain 时也会保留这些

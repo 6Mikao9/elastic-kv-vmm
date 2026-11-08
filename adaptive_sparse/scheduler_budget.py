@@ -74,13 +74,17 @@ def _invalidate_predictive_prewarm(tracker, stage, exc):
             pass
 
 
-def _best_effort_predictive_prewarm(tracker, demand_bytes, controller=None):
+def _best_effort_predictive_prewarm(
+    tracker, demand, controller=None, *, lead_ms=None
+):
     """Run the optional VMM hint without replacing native admission."""
 
     prewarm = getattr(tracker, "predictive_prewarm", None)
     if not callable(prewarm):
         return 0
     try:
+        due_bytes = getattr(demand, "prewarm_bytes", None)
+        demand_bytes = due_bytes(lead_ms) if callable(due_bytes) else demand
         return prewarm(demand_bytes)
     except Exception as exc:
         if controller is not None:
@@ -1222,6 +1226,14 @@ def install_scheduler_budget():
     capture_plans = os.environ.get("EKV_ADAPTIVE_PLAN_CAPTURE") == "1"
     trim_low_water = os.environ.get("EKV_ADAPTIVE_TRIM_LOW_WATER") == "1"
     shared_prefix_direct = os.environ.get("EKV_SHARED_PREFIX_REUSE") == "direct"
+    prewarm_lead_raw = os.environ.get("EKV_PREDICTIVE_PREWARM_TTL_MS")
+    prewarm_lead_ms = (
+        None
+        if prewarm_lead_raw in (None, "")
+        else int(prewarm_lead_raw)
+    )
+    if prewarm_lead_ms is not None and prewarm_lead_ms < 0:
+        raise ValueError("predictive prewarm TTL must be nonnegative")
     future_mode = os.environ.get("EKV_FUTURE_PREFILL_MODE", "off")
     kind_activation_raw = json.loads(os.environ.get(
         "EKV_FUTURE_PREFILL_KIND_ACTIVATION_JSON", "{}"
@@ -1360,7 +1372,10 @@ def install_scheduler_budget():
         )
         if should_plan_future and not tp_fallback:
             _best_effort_predictive_prewarm(
-                tracker, reservation.kv_bytes, controller
+                tracker,
+                reservation,
+                controller,
+                lead_ms=prewarm_lead_ms,
             )
 
     prefill = cls.get_new_batch_prefill

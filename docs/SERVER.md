@@ -150,6 +150,13 @@ scratch is applied only to prefill pressure. `EKV_FUTURE_PREFILL_HORIZON_MS`,
 headroom for native allocation; it does not create future KV or activation
 buffers eagerly. See [the future planner design](FUTURE_PLANNER_DESIGN.md#53-已知未来请求的-prefill-预留).
 
+When `EKV_PREDICTIVE_PREWARM_MODE` is enabled, physical prewarming uses
+`EKV_PREDICTIVE_PREWARM_TTL_MS` as its start-time lead window. The admission
+reservation still covers the configured future horizon, but only requests whose
+`release_after_ms` falls inside that TTL may trigger immediate `cuMemCreate` and
+mapping. Leaving the TTL environment variable unset preserves full-horizon
+prewarming for existing experiments.
+
 For active MiniMax KV demotion, `EKV_ADAPTIVE_DEADLINE_GUARD_MS` (default
 `500`) protects requests whose hinted deadline is imminent. Within the same
 guard tier, demotion candidate efficiency is adjusted by hint weight,

@@ -75,6 +75,20 @@ class SchedulerBudgetTest(unittest.TestCase):
         invalidate.assert_called_once()
         self.assertIn("broker failed", invalidate.call_args.args[0])
 
+    def test_predictive_prewarm_uses_bounded_lead_window(self):
+        policy = SchedulerBudget(100, 0, 0, 0)
+        plan = B(prewarm_bytes=Mock(return_value=2048))
+        tracker = B(predictive_prewarm=Mock(return_value=1), invalidate_predictive_prewarm=Mock())
+
+        self.assertEqual(
+            _best_effort_predictive_prewarm(
+                tracker, plan, policy, lead_ms=250
+            ),
+            1,
+        )
+        plan.prewarm_bytes.assert_called_once_with(250)
+        tracker.predictive_prewarm.assert_called_once_with(2048)
+
     def test_predictive_prewarm_expiry_failure_does_not_escape_idle(self):
         policy = SchedulerBudget(100, 0, 0, 0)
         tracker = B(

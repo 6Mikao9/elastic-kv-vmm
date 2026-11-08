@@ -123,6 +123,37 @@ class FuturePrefillPlan:
     def reserve_bytes(self) -> int:
         return self.kv_bytes + self.activation_bytes
 
+    def prewarm_bytes(self, lead_ms: float | None = None) -> int:
+        """Return KV bytes worth mapping now for requests due inside a lead window.
+
+        Admission reservations use the full horizon so the scheduler can make a
+        safe residency decision. Physical prewarming has a shorter useful life:
+        mapping a request that is expected to start much later only occupies a
+        VMM lease that may expire or delay more imminent work. ``None`` keeps
+        the legacy full-horizon behavior; a finite lead filters request starts
+        while retaining the same interval-peak accounting.
+        """
+
+        if lead_ms is None:
+            return self.kv_bytes
+        if isinstance(lead_ms, bool):
+            raise ValueError("prewarm lead must be a finite nonnegative number")
+        try:
+            lead = float(lead_ms)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "prewarm lead must be a finite nonnegative number"
+            ) from exc
+        if not math.isfinite(lead) or lead < 0:
+            raise ValueError("prewarm lead must be a finite nonnegative number")
+        entries = tuple(entry for entry in self.entries if entry.start_in_ms <= lead)
+        return _interval_peak(
+            entries,
+            "kv_bytes",
+            "kv_finish_in_ms",
+            shared_prefix=True,
+        )
+
     @property
     def selected_count(self) -> int:
         return len(self.entries)

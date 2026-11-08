@@ -202,6 +202,44 @@ class FuturePrefillPlanTest(unittest.TestCase):
         self.assertEqual(plan.kv_bytes, 300)
         self.assertEqual(plan.activation_bytes, 40)
 
+    def test_prewarm_window_excludes_later_request_starts(self):
+        plan = plan_future_prefill(
+            [
+                request(
+                    "now",
+                    prompt=1_000,
+                    expected_output_tokens=1_000,
+                    release_after_ms=0,
+                    prefill_tokens_per_s=1_000,
+                    decode_tokens_per_s=1_000,
+                ),
+                request(
+                    "later",
+                    prompt=1_000,
+                    expected_output_tokens=1_000,
+                    release_after_ms=200,
+                    prefill_tokens_per_s=1_000,
+                    decode_tokens_per_s=1_000,
+                ),
+            ],
+            now_s=1.0,
+            kv_bytes_per_token=1,
+            config=self.config(max_reserve_bytes=10_000),
+        )
+
+        self.assertEqual(plan.kv_bytes, 4_000)
+        self.assertEqual(plan.prewarm_bytes(0), 2_000)
+        self.assertEqual(plan.prewarm_bytes(199), 2_000)
+        self.assertEqual(plan.prewarm_bytes(200), 4_000)
+        self.assertEqual(plan.prewarm_bytes(None), 4_000)
+
+    def test_prewarm_window_rejects_invalid_leads(self):
+        plan = plan_future_prefill([], now_s=1.0, kv_bytes_per_token=1,
+                                   config=self.config())
+        for value in (-1, True, float("inf"), "bad"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                plan.prewarm_bytes(value)
+
     def test_shared_prefix_is_counted_once_while_members_overlap(self):
         plan = plan_future_prefill(
             [

@@ -120,6 +120,7 @@ Scheduler wrapper
 | scheduler 中 VMM exception | 记录错误并使预测租约失效；测试明确验证不会把预测失败伪装成成功 |
 | 空闲 TTL | 创建 lease 后删除 waiting request、停止 running batch，推进时钟，断言 backing 和 broker 回到初始值 |
 | 时间重叠账本 | 两个不重叠的未来请求不按并发相加；真正重叠时按峰值相加 |
+| 预热起始窗口 | 准入仍使用完整 horizon；物理预热只包含 start 落入 TTL 的请求 |
 | 共享前缀 | 同一 group 同时活跃时只计一次共享前缀，超出成员仍各自计费 |
 | CUDA hit/miss | 冒烟分别制造真实命中和过期 miss，核对 mapped、hit、expired bytes 与原生 `ev_backed` |
 | serving A/B | 同一独占 GPU、同一 trace，至少比较 forecast-off、`dry_run`、`enforce`；只有正确性、OOM 和无额外 retraction 同时通过后才报告延迟与吞吐 |
@@ -132,9 +133,11 @@ Scheduler wrapper
 - 加固后需求按 `slot_bytes *` 全部 arena 的 plane 数换算逻辑槽；物理字节遥测
   单独记录 requested、candidate 和 mapped bytes。
 - SGLang 0.5.17 真实 scheduler wrapper 异常注入回归通过；完整容器套件为
-  `420 passed, 2 skipped, 131 subtests passed`。
+  `423 passed, 2 skipped, 135 subtests passed`。
 - 共享前缀抵扣只作用于明确 `resident` 的成员；`host_backed` 请求的 hot set
   不保证包含共享前缀，因此新增回归禁止对其做乐观抵扣。
+- 物理预热与准入窗口已解耦：准入继续覆盖完整 horizon，真实 scheduler
+  wrapper 只把 `start_in_ms <= EKV_PREDICTIVE_PREWARM_TTL_MS` 的需求交给 VMM。
 - CUDA hit/miss 和同 trace serving A/B 仍未运行；本审计只
   确认代码契约、CPU 策略与资源记账，不把 CPU 证据外推成真实服务收益或正确性
   结论。
