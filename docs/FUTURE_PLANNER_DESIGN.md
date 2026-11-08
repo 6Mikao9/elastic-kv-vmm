@@ -660,6 +660,13 @@ python3 scripts/future_plan_compare.py \
 长请求本身的完成时间从 3501 ms 增至 4376 ms，因此这是一个延迟分配决策，
 不是“所有指标同时更好”的性能结论。
 
+当比较集合包含 `oracle` 时，每个策略的 JSON 现在还包含 `oracle_gap`：
+加权完成时间、makespan、deadline miss 和峰值显存的绝对差及百分比，并标明
+oracle 是否在 expansion cap 前完成精确搜索。`oracle` 的目标顺序首先是 deadline
+miss，其次加权完成时间，再其次 makespan；因此某个策略的 makespan 差值可以为负，
+不能把所有负值都解释成脚本错误。反过来，也不应因为 `future` 在一组 trace 上
+接近 oracle 就宣称它在所有 rollout 上最优。
+
 ## 10. 明确不做的事
 
 - 不用预测结果绕过 `PrefillAdder`；

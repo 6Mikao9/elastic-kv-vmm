@@ -19,7 +19,7 @@ from enum import Enum
 import json
 import math
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 
 from .future_residency import RESIDENCE_HINTS
 
@@ -1217,6 +1217,41 @@ def _compare_workload(
     return {policy: simulate(workload, config, policy) for policy in requested}
 
 
+def _comparison_payload(
+    simulations: Mapping[str, PlanResult],
+) -> dict[str, dict[str, object]]:
+    oracle = simulations.get("oracle")
+    payload = {policy: result.as_dict() for policy, result in simulations.items()}
+    if oracle is None:
+        return payload
+    for policy, result in simulations.items():
+        completion_gap = result.weighted_completion_ms - oracle.weighted_completion_ms
+        makespan_gap = result.makespan_ms - oracle.makespan_ms
+        peak_gap = result.peak_memory_bytes - oracle.peak_memory_bytes
+        payload[policy]["oracle_gap"] = {
+            "weighted_completion_abs_ms": completion_gap,
+            "weighted_completion_pct": (
+                None
+                if oracle.weighted_completion_ms == 0
+                else 100.0 * completion_gap / oracle.weighted_completion_ms
+            ),
+            "makespan_abs_ms": makespan_gap,
+            "makespan_pct": (
+                None
+                if oracle.makespan_ms == 0
+                else 100.0 * makespan_gap / oracle.makespan_ms
+            ),
+            "deadline_miss_delta": (
+                result.deadline_misses - oracle.deadline_misses
+            ),
+            "peak_memory_delta_bytes": peak_gap,
+            "oracle_exact": oracle.search_exact,
+            "oracle_fallback_policy": oracle.fallback_policy,
+            "is_oracle": policy == "oracle",
+        }
+    return payload
+
+
 def compare(
     request_path: str | Path,
     policies: Sequence[str] = POLICIES,
@@ -1224,10 +1259,7 @@ def compare(
     """Load ``{config, requests}`` JSON and simulate selected policies."""
 
     config, workload = _load_workload(request_path)
-    return {
-        policy: result.as_dict()
-        for policy, result in _compare_workload(config, workload, policies).items()
-    }
+    return _comparison_payload(_compare_workload(config, workload, policies))
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1250,10 +1282,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.emit_policy is not None and args.emit_policy not in policies:
         policies = (*policies, args.emit_policy)
     simulations = _compare_workload(config, workload, policies)
-    payload: dict[str, object] = {
-        policy: simulation.as_dict()
-        for policy, simulation in simulations.items()
-    }
+    payload: dict[str, object] = _comparison_payload(simulations)
     if args.emit_policy is not None:
         payload["rollout"] = plan_rollout(
             workload,

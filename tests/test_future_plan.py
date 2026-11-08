@@ -582,6 +582,14 @@ class FuturePlanTest(unittest.TestCase):
             comparisons = compare(workload, ("fifo", "oracle"))
         self.assertEqual(set(comparisons), {"fifo", "oracle"})
         self.assertEqual(comparisons["oracle"]["policy"], "oracle")
+        self.assertTrue(comparisons["oracle"]["oracle_gap"]["is_oracle"])
+        self.assertEqual(
+            comparisons["oracle"]["oracle_gap"]["makespan_abs_ms"], 0
+        )
+        self.assertEqual(
+            comparisons["fifo"]["oracle_gap"]["makespan_abs_ms"],
+            comparisons["fifo"]["makespan_ms"] - comparisons["oracle"]["makespan_ms"],
+        )
         oracle_simulation = simulate(self.workload, self.config, "oracle")
         self.assertEqual(
             len(
