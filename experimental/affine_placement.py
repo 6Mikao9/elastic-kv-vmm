@@ -90,6 +90,7 @@ class AffineArena:
         chunk_bytes: int,
         *,
         slot_bytes: int | None = None,
+        round_to_chunks: bool = False,
     ) -> None:
         _positive_int(arena_bytes, "arena_bytes")
         _positive_int(chunk_bytes, "chunk_bytes")
@@ -101,9 +102,12 @@ class AffineArena:
                 raise ValueError("slot_bytes must be chunk aligned")
             if slot_bytes > arena_bytes:
                 raise ValueError("slot_bytes exceeds arena_bytes")
+        if round_to_chunks and slot_bytes is not None:
+            raise ValueError("slot_bytes and round_to_chunks are mutually exclusive")
         self.arena_bytes = arena_bytes
         self.chunk_bytes = chunk_bytes
         self.slot_bytes = slot_bytes
+        self.round_to_chunks = round_to_chunks
         self._free = [(0, arena_bytes)]
         self._placements: dict[str, Placement] = {}
 
@@ -136,6 +140,8 @@ class AffineArena:
         _positive_int(row_bytes, "row_bytes")
         exact_bytes = total_tokens * row_bytes
         reserved = exact_bytes if self.slot_bytes is None else self.slot_bytes
+        if self.round_to_chunks:
+            reserved = _ceil_div(exact_bytes, self.chunk_bytes) * self.chunk_bytes
         if exact_bytes > reserved:
             raise ValueError("request sequence exceeds the configured affine slot")
         if reserved > self.arena_bytes:
@@ -341,16 +347,25 @@ def simulate_affine_placement(
     ids = [item.request_id for item in workload]
     if len(ids) != len(set(ids)):
         raise ValueError("request IDs must be unique")
-    if strategy not in {"fixed-affine", "packed-affine"}:
-        raise ValueError("strategy must be fixed-affine or packed-affine")
+    if strategy not in {"fixed-affine", "packed-affine", "private-affine"}:
+        raise ValueError(
+            "strategy must be fixed-affine, packed-affine or private-affine"
+        )
 
     max_tokens = max(item.total_tokens for item in workload)
     if strategy == "fixed-affine":
         slot_bytes = _ceil_div(max_tokens * config.row_bytes, config.chunk_bytes)
         slot_bytes *= config.chunk_bytes
+        round_to_chunks = False
     else:
         slot_bytes = None
-    arena = AffineArena(config.arena_bytes, config.chunk_bytes, slot_bytes=slot_bytes)
+        round_to_chunks = strategy == "private-affine"
+    arena = AffineArena(
+        config.arena_bytes,
+        config.chunk_bytes,
+        slot_bytes=slot_bytes,
+        round_to_chunks=round_to_chunks,
+    )
 
     events: list[tuple[float, int, str, str]] = []
     for index, request in enumerate(workload):

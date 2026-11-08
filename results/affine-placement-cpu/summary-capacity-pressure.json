@@ -15,7 +15,8 @@
   },
   "placement": {
     "fixed-affine": "every request begins on a chunk-aligned slot sized for the workload's largest final sequence",
-    "packed-affine": "exact final sequence extent, best-fit in one virtual arena; adjacent requests may share VMM chunks"
+    "packed-affine": "exact final sequence extent, best-fit in one virtual arena; adjacent requests may share VMM chunks",
+    "private-affine": "every request has a chunk-aligned base and reserves its own exact final sequence rounded up to whole VMM chunks"
   },
   "results": [
     {
@@ -30,7 +31,13 @@
         "packed_shared_savings_at_peak_bytes": 8388608,
         "packed_virtual_reservation_at_peak_bytes": 55057408,
         "peak_backing_delta_bytes": 29360128,
-        "peak_backing_reduction_fraction": -1.0769230769230769
+        "peak_backing_reduction_fraction": -1.0769230769230769,
+        "private_peak_backing_bytes": 48234496,
+        "private_peak_backing_delta_vs_fixed_bytes": 20971520,
+        "private_shared_chunks_at_peak": 0,
+        "private_to_packed_makespan_delta_ms": 648.3838437796776,
+        "private_to_packed_start_delay_delta_ms": 431.07972203016084,
+        "private_virtual_reservation_at_peak_bytes": 65011712
       },
       "fixed_affine": {
         "admitted_requests": 96,
@@ -82,6 +89,30 @@
         "strategy": "packed-affine",
         "waiting_requests": 0
       },
+      "private_affine": {
+        "admitted_requests": 96,
+        "makespan_ms": 3943.1956338677783,
+        "max_active_requests": 16,
+        "max_start_delay_ms": 2049.3610441689784,
+        "mean_start_delay_ms": 598.339554557119,
+        "peak": {
+          "active_requests": 16,
+          "independent_bytes": 48234496,
+          "independent_chunks": 23,
+          "mapped_bytes": 48234496,
+          "mapped_chunks": 23,
+          "mapping_efficiency": 0.5632005774456522,
+          "reserved_bytes": 65011712,
+          "shared_chunks": 0,
+          "shared_savings_bytes": 0,
+          "tail_waste_bytes": 21068800,
+          "time_ms": 1379.0228671163784,
+          "useful_bytes": 27165696
+        },
+        "requests": 96,
+        "strategy": "private-affine",
+        "waiting_requests": 0
+      },
       "request_count": 96,
       "scenario": "mixed",
       "seed": 137,
@@ -99,7 +130,13 @@
         "packed_shared_savings_at_peak_bytes": 8388608,
         "packed_virtual_reservation_at_peak_bytes": 56881664,
         "peak_backing_delta_bytes": 6291456,
-        "peak_backing_reduction_fraction": -0.125
+        "peak_backing_reduction_fraction": -0.125,
+        "private_peak_backing_bytes": 44040192,
+        "private_peak_backing_delta_vs_fixed_bytes": -6291456,
+        "private_shared_chunks_at_peak": 0,
+        "private_to_packed_makespan_delta_ms": 74.60354603886344,
+        "private_to_packed_start_delay_delta_ms": 74.60354603886367,
+        "private_virtual_reservation_at_peak_bytes": 50331648
       },
       "fixed_affine": {
         "admitted_requests": 96,
@@ -151,6 +188,30 @@
         "strategy": "packed-affine",
         "waiting_requests": 0
       },
+      "private_affine": {
+        "admitted_requests": 96,
+        "makespan_ms": 3091.3231043778014,
+        "max_active_requests": 16,
+        "max_start_delay_ms": 1282.3381436619889,
+        "mean_start_delay_ms": 48.10882733840166,
+        "peak": {
+          "active_requests": 6,
+          "independent_bytes": 44040192,
+          "independent_chunks": 21,
+          "mapped_bytes": 44040192,
+          "mapped_chunks": 21,
+          "mapping_efficiency": 0.8259161086309523,
+          "reserved_bytes": 50331648,
+          "shared_chunks": 0,
+          "shared_savings_bytes": 0,
+          "tail_waste_bytes": 7666688,
+          "time_ms": 1413.0445583389378,
+          "useful_bytes": 36373504
+        },
+        "requests": 96,
+        "strategy": "private-affine",
+        "waiting_requests": 0
+      },
       "request_count": 96,
       "scenario": "short-heavy",
       "seed": 137,
@@ -168,7 +229,13 @@
         "packed_shared_savings_at_peak_bytes": 0,
         "packed_virtual_reservation_at_peak_bytes": 33554432,
         "peak_backing_delta_bytes": 0,
-        "peak_backing_reduction_fraction": 0.0
+        "peak_backing_reduction_fraction": 0.0,
+        "private_peak_backing_bytes": 33554432,
+        "private_peak_backing_delta_vs_fixed_bytes": 0,
+        "private_shared_chunks_at_peak": 0,
+        "private_to_packed_makespan_delta_ms": 0.0,
+        "private_to_packed_start_delay_delta_ms": 0.0,
+        "private_virtual_reservation_at_peak_bytes": 33554432
       },
       "fixed_affine": {
         "admitted_requests": 96,
@@ -218,6 +285,30 @@
         },
         "requests": 96,
         "strategy": "packed-affine",
+        "waiting_requests": 0
+      },
+      "private_affine": {
+        "admitted_requests": 96,
+        "makespan_ms": 2726.2420066622526,
+        "max_active_requests": 16,
+        "max_start_delay_ms": 2037.3698865589772,
+        "mean_start_delay_ms": 979.1073991835805,
+        "peak": {
+          "active_requests": 16,
+          "independent_bytes": 33554432,
+          "independent_chunks": 16,
+          "mapped_bytes": 33554432,
+          "mapped_chunks": 16,
+          "mapping_efficiency": 0.770172119140625,
+          "reserved_bytes": 33554432,
+          "shared_chunks": 0,
+          "shared_savings_bytes": 0,
+          "tail_waste_bytes": 7711744,
+          "time_ms": 381.5,
+          "useful_bytes": 25842688
+        },
+        "requests": 96,
+        "strategy": "private-affine",
         "waiting_requests": 0
       },
       "request_count": 96,

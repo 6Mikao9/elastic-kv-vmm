@@ -1,5 +1,6 @@
 import unittest
 
+from benchmarks.affine_placement_sim import run_scenario
 from experimental.affine_placement import (
     AffineArena,
     AffineConfig,
@@ -26,10 +27,13 @@ class AffinePlacementTest(unittest.TestCase):
         )
 
         fixed = simulate_affine_placement(requests, config, "fixed-affine")
+        private = simulate_affine_placement(requests, config, "private-affine")
         packed = simulate_affine_placement(requests, config, "packed-affine")
 
         self.assertEqual(fixed.peak.mapped_bytes, 64)
         self.assertEqual(fixed.peak.shared_chunks, 0)
+        self.assertEqual(private.peak.mapped_bytes, 64)
+        self.assertEqual(private.peak.shared_chunks, 0)
         self.assertEqual(packed.peak.mapped_bytes, 40)
         self.assertEqual(packed.peak.useful_bytes, 40)
         self.assertEqual(packed.peak.tail_waste_bytes, 0)
@@ -101,6 +105,34 @@ class AffinePlacementTest(unittest.TestCase):
 
         self.assertEqual(chunks_for_prefix(private["second"], 4, 8), {1})
 
+    def test_private_affine_rounds_each_request_without_sharing(self):
+        arena = AffineArena(32, chunk_bytes=8, round_to_chunks=True)
+        first = arena.reserve("first", total_tokens=5, row_bytes=1)
+        second = arena.reserve("second", total_tokens=3, row_bytes=1)
+        assert first is not None and second is not None
+
+        self.assertEqual((first.start_byte, first.reserved_bytes), (0, 8))
+        self.assertEqual((second.start_byte, second.reserved_bytes), (8, 8))
+        self.assertEqual(chunks_for_prefix(first, 5, 8), {0})
+        self.assertEqual(chunks_for_prefix(second, 3, 8), {1})
+
+    def test_private_affine_reclaims_all_touched_chunks_independently(self):
+        arena = AffineArena(32, chunk_bytes=8, round_to_chunks=True)
+        first = arena.reserve("first", total_tokens=9, row_bytes=1)
+        second = arena.reserve("second", total_tokens=9, row_bytes=1)
+        assert first is not None and second is not None
+        self.assertEqual(chunks_for_prefix(first, 9, 8), {0, 1})
+        self.assertEqual(chunks_for_prefix(second, 9, 8), {2, 3})
+
+        arena.release("first")
+
+        self.assertEqual(arena.free_ranges, ((0, 16),))
+        self.assertEqual(chunks_for_prefix(arena["second"], 9, 8), {2, 3})
+
+    def test_slot_and_chunk_rounding_are_mutually_exclusive(self):
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            AffineArena(16, chunk_bytes=8, slot_bytes=8, round_to_chunks=True)
+
     def test_release_coalesces_ranges_and_keeps_fragmented_ranges_apart(self):
         arena = AffineArena(32, chunk_bytes=8)
         arena.reserve("a", 8, 1)
@@ -131,6 +163,38 @@ class AffinePlacementTest(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(first.admitted_requests, 3)
         self.assertLessEqual(first.peak.mapped_bytes, config.arena_bytes)
+
+    def test_benchmark_payload_includes_private_reclaim_control(self):
+        payload = run_scenario(
+            "short-heavy",
+            request_count=20,
+            seed=17,
+            config=AffineConfig(32 << 20, 2 << 20, 512, 8),
+        )
+
+        self.assertEqual(
+            set(payload),
+            {
+                "scenario",
+                "seed",
+                "request_count",
+                "total_tokens",
+                "min_total_tokens",
+                "max_total_tokens",
+                "fixed_affine",
+                "private_affine",
+                "packed_affine",
+                "comparison",
+            },
+        )
+        self.assertEqual(
+            payload["private_affine"]["peak"]["shared_chunks"],  # type: ignore[index]
+            0,
+        )
+        self.assertGreater(
+            payload["packed_affine"]["peak"]["shared_chunks"],  # type: ignore[index]
+            0,
+        )
 
     def test_rejects_invalid_configuration_and_strategy(self):
         with self.assertRaisesRegex(ValueError, "arena_bytes"):

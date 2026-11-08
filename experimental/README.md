@@ -19,13 +19,14 @@ the ranges they reference are discarded or the arena closes.
 
 ## Request-affine packing
 
-`affine_placement.py` isolates the tail-waste question for fixed virtual
-positions. It compares maximum-length, chunk-aligned request slots with exact-
-length request intervals packed into one arena. Both retain direct
-`base + token * row_bytes` addressing. A CPU event simulation charges only
-chunks touched by live prefixes and counts a chunk as shared when multiple
-requests use it. See the [placement report](../docs/AFFINE_PLACEMENT_SIM.md)
-for the deterministic fixtures and limitations.
+`affine_placement.py` isolates the tail-waste and reclaim-coupling question for
+fixed virtual positions. It compares maximum-length chunk-aligned slots,
+per-request chunk-rounded private slabs, and exact-length request intervals
+packed into one arena. All retain direct `base + token * row_bytes` addressing.
+A CPU event simulation charges only chunks touched by live prefixes and counts
+a chunk as shared when multiple requests use it. See the [placement
+report](../docs/AFFINE_PLACEMENT_SIM.md) for the deterministic fixtures and
+limitations.
 
 The GPU microbenchmark uses the **same VMM allocation, payload addresses,
 support set, output order and gather computation** in both arms:
