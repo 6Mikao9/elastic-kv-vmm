@@ -153,9 +153,30 @@ full-batch pilot 的四道题原始输出均正确，但初版评分器未处理
 
 ### 尚待补齐的配对
 
-相同三轮协议下的静态混合、完全驻留，以及 12k 压力下原生、静态、单请求和双请求策略的对照脚本已准备好。压力组只在单请求与双请求候选上改变最大组大小，均关闭 shadow 与强制切换。并发客户端固定提交规格，实际到达与调度次序仍可能变化，因此应结合每轮实际迁移和页布局解释结果。
+相同三轮协议下的静态混合和完全驻留对照仍待独占窗口。12k 压力下原生、静态、单请求和双请求策略的脚本已准备好；本阶段新增的 future-aware 联合运行完成了 off/deadline 与自动双请求迁移的最小矩阵，见下一小节。压力组固定提交规格，但实际到达与调度次序仍可能变化，因此需要结合每轮实际迁移和页布局解释结果。
 
-28 项 CPU 测试在固定镜像的无 GPU 隔离容器中通过；两项 GPU 测试跳过。完整迁移的 GPU 证据来自第 6 节的真实模型运行。可控生成 token replay 目前只通过了 CPU 处理器测试，尚不纳入测量结论。
+### VMM、请求级 HiSparse 与 future 排队的联合运行
+
+联合实验在同一 TP4 服务进程组中同时启用原生 HiSparse、VMM backing、请求级完整驻留、自动迁移和 future-aware 排队。非自适应组只切换 future policy，每个 arm 跑一次，执行顺序与机器预热状态不同：
+
+| Run | mixed 12K token/s | short concurrent token/s | long concurrent token/s | mixed TTFT 中位，ms | mixed TPOT 中位，ms |
+|---|---:|---:|---:|---:|---:|
+| future off r2，较冷 | 14.069 | 27.893 | 22.414 | 3087.9 | 160.5 |
+| future deadline r2 | 16.032 | 31.357 | 23.636 | 2211.8 | 157.6 |
+| future off r3，预热后 | 16.743 | 32.403 | 24.522 | 2934.8 | 130.2 |
+
+deadline r2 比 off r2 快，但预热后的 off r3 又高于 deadline r2，说明这组顺序敏感的单轮结果不能证明稳定吞吐增益。可以确认的是 future 队列真实执行：deadline r2 有 84 个 scheduler tick 和 1 次重排，异常、非法 hint 与 telemetry error 均为零；对应 short-concurrent TTFT 中位从 off r2 的约 366.8 ms 降至 272.5 ms。
+
+自动压力组在每 rank 触发 3 次降级，其中一次是双请求联合动作，**回收 240 MiB/rank**，累计释放 480 MiB/rank。off 轮随后自动提升一次；deadline 轮没有在本轮触发提升。
+
+| future policy | throughput token/s | TTFT 中位，ms | TPOT 中位，ms | promotion |
+|---|---:|---:|---:|---:|
+| off | 15.789 | 2206.6 | 150.3 | 1 |
+| deadline | 15.870 | 1429 | 172.0 | 0 |
+
+deadline 轮 TTFT 降低而 TPOT 增加，吞吐基本持平。这更像等待顺序和尾延迟的重新分配，不能包装成免费加速。两组结束时 VMM backing 都回到 240 MiB/rank，`owned_pages=0`，说明未使用的物理 handle 已归还；240 MiB 是仍有 sink 等映射的稳态，不是零占用。完整表格、边界和证据链接见[MiniMax 联合集成报告](MINIMAX_FUTURE_INTEGRATION.md)。
+
+收口版本的 97 项 CPU 测试通过，3 项依赖 CUDA 或真实 SGLang 安装的测试跳过。完整迁移的 GPU 证据来自第 6 节的真实模型运行。可控生成 token replay 目前只通过了 CPU 处理器测试，尚不纳入测量结论。
 
 ## 8. 如何转化为真实场景收益
 

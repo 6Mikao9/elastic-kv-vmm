@@ -6,7 +6,7 @@ import threading
 import time
 
 from benchmarks.client import (
-    IDLE_SECONDS, SAMPLE_SECONDS, MemorySampler, distribution, generate,
+    IDLE_SECONDS, SAMPLE_SECONDS, MemorySampler, distribution, future_hint, generate,
     run_requests, safe_error_message, write_json,
 )
 
@@ -64,13 +64,27 @@ def verify(record):
     return record
 
 
-def run_phase(url, name, repeat, uuids, timeout, warmup=False, forced_replay=False):
+def run_phase(
+    url,
+    name,
+    repeat,
+    uuids,
+    timeout,
+    warmup=False,
+    forced_replay=False,
+    emit_future_hints=False,
+):
     concurrency, shapes = WORKLOADS[name]
     key = f"{'warmup' if warmup else 'measured'}/{name}/{repeat}"
     specs = [spec(key, i, *shape) for i, shape in enumerate(shapes)]
     if forced_replay:
         for request in specs:
             request["forced_replay"] = True
+    if emit_future_hints:
+        for request in specs:
+            request["future_hint"] = future_hint(
+                request["request_id"], request["requested_output_tokens"]
+            )
     sampler = RankSampler(uuids)
     with sampler:
         time.sleep(IDLE_SECONDS)
@@ -108,8 +122,17 @@ def run_phase(url, name, repeat, uuids, timeout, warmup=False, forced_replay=Fal
     }
 
 
-def run_benchmark(url, output, gpu_uuids, repeats=3, workloads=None, timeout=600, forced_replay=False,
-                  warmup_once=False):
+def run_benchmark(
+    url,
+    output,
+    gpu_uuids,
+    repeats=3,
+    workloads=None,
+    timeout=600,
+    forced_replay=False,
+    warmup_once=False,
+    emit_future_hints=False,
+):
     """Write performance and serial correctness artifacts to fresh file paths."""
     output = Path(output)
     correctness_path = output.with_name(output.stem + ".correctness.json")
@@ -130,6 +153,7 @@ def run_benchmark(url, output, gpu_uuids, repeats=3, workloads=None, timeout=600
         "rank_selection": "explicit UUIDs in launcher rank order",
         "memory_scope": "whole-device NVML usage on each selected GPU",
         "forced_replay": forced_replay,
+        "future_hints": emit_future_hints,
         "warmup_policy": "once_all_shapes" if warmup_once else "each_repeat",
         "sampling_note": ("Synthetic fixed token replay with trusted native logit processor and output logprob IDs"
                           if forced_replay else "Native greedy sampling, no custom processor"),
@@ -145,17 +169,20 @@ def run_benchmark(url, output, gpu_uuids, repeats=3, workloads=None, timeout=600
             for name in names:
                 stage = f"warmup/{name}/0"
                 results["warmups"].append(run_phase(
-                    endpoint, name, 0, gpu_uuids, timeout, warmup=True, forced_replay=forced_replay))
+                    endpoint, name, 0, gpu_uuids, timeout, warmup=True,
+                    forced_replay=forced_replay, emit_future_hints=emit_future_hints))
         for repeat in range(repeats):
             for name in names:
                 if not warmup_once:
                     stage = f"warmup/{name}/{repeat}"
                     results["warmups"].append(run_phase(
                         endpoint, name, repeat, gpu_uuids, timeout, warmup=True,
-                        forced_replay=forced_replay))
+                        forced_replay=forced_replay,
+                        emit_future_hints=emit_future_hints))
                 stage = f"measured/{name}/{repeat}"
                 results["phases"].append(run_phase(endpoint, name, repeat, gpu_uuids, timeout,
-                                                  forced_replay=forced_replay))
+                                                  forced_replay=forced_replay,
+                                                  emit_future_hints=emit_future_hints))
                 write_json(output, results)
         results["status"] = "complete"
         correctness["status"] = "running"
@@ -163,6 +190,10 @@ def run_benchmark(url, output, gpu_uuids, repeats=3, workloads=None, timeout=600
             probe = spec("probe", index, inputs, outputs)
             if forced_replay:
                 probe["forced_replay"] = True
+            if emit_future_hints:
+                probe["future_hint"] = future_hint(
+                    probe["request_id"], probe["requested_output_tokens"]
+                )
             stage = probe["request_id"]
             record = verify(generate(endpoint, probe, timeout, stream=False))
             record.pop("_started_perf_s")

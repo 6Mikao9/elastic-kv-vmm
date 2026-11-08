@@ -127,6 +127,7 @@ def main():
     parser.add_argument("--adaptive-plan-capture", action="store_true")
     parser.add_argument("--adaptive-trim-low-water", action="store_true")
     parser.add_argument("--chunk-aware-retention", action="store_true")
+    parser.add_argument("--future-policy", choices=("off", "deadline"), default="off")
     args = parser.parse_args()
     if not (args.model_path / "config.json").is_file() or args.tp_size < 4:
         parser.error("require a local MiniMax snapshot and TP >= 4")
@@ -244,6 +245,8 @@ def main():
     for name in ("EKV_VMM_STATS_DIR", "EKV_RESIDENT_LIMIT", "EKV_RESIDENT_FREE_RESERVE",
                  "EKV_LAYER_TRACE_DIR", "EKV_DISABLE_FUSED_QKNORM", "EKV_RESIDENT_RESOLVER"):
         environment.pop(name, None)
+    environment.pop("EKV_FUTURE_POLICY", None)
+    environment.pop("EKV_FUTURE_STATS_PATH", None)
     environment.pop("EKV_RESIDENT_FULL_BATCH_SWAP", None)
     if args.resident_full_batch_swap:
         environment["EKV_RESIDENT_FULL_BATCH_SWAP"] = "1"
@@ -274,6 +277,9 @@ def main():
     if args.vmm_backing:
         environment["EKV_VMM_STATS_DIR"] = str(output / "vmm_stats")
         environment["ELASTIC_VMM_LIBRARY"] = str(library)
+    if args.future_policy != "off":
+        environment["EKV_FUTURE_POLICY"] = args.future_policy
+        environment["EKV_FUTURE_STATS_PATH"] = str(output / "future_stats.json")
     if args.resident_limit:
         environment["EKV_RESIDENT_LIMIT"] = str(args.resident_limit)
         environment["EKV_RESIDENT_FREE_RESERVE"] = str(args.resident_free_reserve)
@@ -294,6 +300,8 @@ def main():
     if args.vmm_backing:
         sources += ("adaptive_sparse/minimax_vmm.py", "adaptive_sparse/vmm_runtime.py",
                     "elastic_kv/backing.py", "native/elastic_vmm.cpp", "native/libelastic_vmm.so")
+    if args.future_policy != "off":
+        sources += ("adaptive_sparse/sglang_future_hook.py", "adaptive_sparse/kv_hints_compat.py")
     if args.resident_limit:
         sources += ("adaptive_sparse/request_residency.py", "adaptive_sparse/resident_lookup.py")
     if args.diagnostic_captures:
@@ -342,12 +350,14 @@ def main():
         "resident_full_batch_swap": args.resident_full_batch_swap,
         "adaptive_settings": adaptive_settings if adaptive else None,
         "chunk_aware_retention": args.chunk_aware_retention,
+        "future_policy": args.future_policy,
         "sha256": {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in sources},
     })
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     results = {"mode": args.mode, "tp_size": args.tp_size,
                "sm80_bf16_projections": args.sm80_bf16_projections,
                "vmm_backing": args.vmm_backing, "resident_limit": args.resident_limit,
+               "future_policy": args.future_policy,
                "status": "running", "probes": []}
     server = None
     step = "startup"
@@ -375,7 +385,8 @@ def main():
             step = "benchmark"
             run_benchmark(URL, output / "performance.json", gpu_uuids,
                           repeats=args.benchmark_repeats, workloads=args.workloads,
-                          forced_replay=args.forced_replay, warmup_once=args.warmup_once)
+                          forced_replay=args.forced_replay, warmup_once=args.warmup_once,
+                          emit_future_hints=args.future_policy != "off")
         if args.logical_shadow:
             step = "logical_shadow_validation"
             if args.validation_rounds:
@@ -473,6 +484,17 @@ def main():
             semantic = semantic_smoke(URL, served_model, 180)
             write_json(output / "semantic_smoke.json", semantic)
             results["semantic_smoke_passed"] = semantic["passed"]
+        if args.future_policy != "off":
+            stats_path = output / "future_stats.json"
+            if not stats_path.is_file():
+                raise RuntimeError("future scheduler produced no telemetry")
+            future_stats = json.loads(stats_path.read_text())
+            if (future_stats.get("ticks", 0) < 1
+                    or future_stats.get("fallback_exception", 0)
+                    or future_stats.get("fallback_invalid_hint", 0)
+                    or future_stats.get("telemetry_errors", 0)):
+                raise RuntimeError("future scheduler telemetry indicates an unhealthy run")
+            results["future_stats"] = future_stats
         results["status"] = "complete"
     except BaseException as error:
         results.update(status="failed", failed_step=step, error_type=type(error).__name__)

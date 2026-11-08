@@ -13,7 +13,8 @@ keeps the NVFP4 Marlin experts.
 
 ```bash
 IMAGE=lmsysorg/sglang:dev-minimax-m31-flash
-# Recorded registry digest: lmsysorg/sglang@sha256:614b1509bcb729c653528d448bff9850f8977fcad9d12ba56bd6dbe3d7985e87
+# Recorded local image ID used by the wrapper. The registry RepoDigest was not
+# recorded and must not be inferred from this image ID.
 test "$(docker image inspect -f '{{.Id}}' "$IMAGE")" = \
   sha256:614b1509bcb729c653528d448bff9850f8977fcad9d12ba56bd6dbe3d7985e87
 
@@ -94,6 +95,42 @@ python3 scripts/summarize_hisparse.py --format markdown \
   "$OUT/pressure-native" "$OUT/pressure-static" \
   "$OUT/pressure-group-1" "$OUT/pressure-group-2"
 ```
+
+## Future ordering with adaptive residency
+
+The combined integration matrix adds `--future-policy deadline`. In this
+path, every benchmark request carries an `elastic.future` ordering hint while
+VMM, native HiSparse and request residency remain active. The ordering hook
+runs after SGLang's native priority policy; it does not replace admission or
+memory checks. Use the same pressure settings and a fresh directory for every
+run:
+
+```bash
+MIXED12K=(--workloads mixed12k_unequal)
+BENCH1=(--benchmark-repeats 1 --warmup-once --semantic-probes)
+
+bash "$RUN" "$GPUS" "$MODEL" native "$OUT/future-off" \
+  "${COMMON[@]}" "${BENCH1[@]}" "${MIXED[@]}" --future-policy off \
+  "${MIXED12K[@]}"
+
+bash "$RUN" "$GPUS" "$MODEL" native "$OUT/future-deadline" \
+  "${COMMON[@]}" "${BENCH1[@]}" "${MIXED[@]}" --future-policy deadline \
+  "${MIXED12K[@]}"
+
+bash "$RUN" "$GPUS" "$MODEL" native "$OUT/adaptive-off" \
+  "${COMMON[@]}" "${BENCH1[@]}" "${MIXED[@]}" "${PRESSURE[@]}" \
+  --future-policy off "${MIXED12K[@]}"
+
+bash "$RUN" "$GPUS" "$MODEL" native "$OUT/adaptive-deadline" \
+  "${COMMON[@]}" "${BENCH1[@]}" "${MIXED[@]}" "${PRESSURE[@]}" \
+  --future-policy deadline "${MIXED12K[@]}"
+```
+
+Before treating an arm as performance evidence, require a complete outer
+`results.json`, nonzero future telemetry when enabled, zero fallback exception,
+invalid-hint and telemetry-error counters, matching source manifests, and a
+verified idle GPU window. Sequential order and warm state can dominate small
+differences; do not establish a speed claim from a single off/deadline pair.
 
 The summarizer requires a completed outer `results.json`, the matching
 `source_manifest.json`, consistent runtime capacity and timing without

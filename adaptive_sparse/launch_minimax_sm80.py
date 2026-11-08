@@ -26,6 +26,11 @@ if os.environ.get("EKV_VMM_STATS_DIR"):
 
     install_vmm_runtime(os.environ["EKV_VMM_STATS_DIR"])
 
+if os.environ.get("EKV_FUTURE_POLICY", "off") != "off":
+    from adaptive_sparse.sglang_future_hook import install as install_future_policy
+
+    install_future_policy()
+
 if int(os.environ.get("EKV_RESIDENT_LIMIT", "0")):
     from adaptive_sparse.request_residency import install_request_residency
 
