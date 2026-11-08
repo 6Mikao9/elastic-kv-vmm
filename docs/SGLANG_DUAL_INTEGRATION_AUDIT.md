@@ -1,5 +1,9 @@
 # SGLang Dual-Instance Integration Audit
 
+> Status: the original findings below describe the audited baseline commit and
+> remain as design history. “Resolutions applied after the audit” at the end of
+> this document is authoritative for the current worktree.
+
 Audit date: 2026-11-09
 
 Repository: `D:\ws\01_研究\实验环境\sparse-kv-lab\vmm_elastic_pool\e2e`
@@ -129,6 +133,22 @@ at the share boundary while preserving atomic mapping failure semantics.
   cannot agree on the same total while computing different effective headroom.
 - A deadline hint without a scheduler timestamp now produces a neutral value and
   increments the invalid-hint counter instead of granting implied full slack.
-- The remaining provenance, phase barriers, complete telemetry and result-schema
-  findings are still open; this audit does not authorize a full GPU acceptance
-  claim yet.
+- The dual runner now hashes every serving source, records Git dirty/untracked
+  state, model/config identities, container image id/digest, package and torch
+  runtime, selected GPU identity, native-library hash, exact launch command and
+  SQLite WAL/journal state.
+- Request groups pass through an in-driver `threading.Barrier`; repeats reverse
+  the hot-instance order while keeping the joint phase last. Warmup and measured
+  KV lifecycles use an explicit drain wait rather than one widened sleep.
+- Raw request/sample artifacts are written separately. `results.json` now has
+  `status`, `arm`, `configuration`, summarized `phases`, `violations` and
+  `source_manifest`, and failed phases leave a machine-readable incomplete
+  record. Adapter samples retain mapping, reclamation, precommit and broker
+  counters; active broker failures above 25% fail the phase.
+- A fixed non-streaming correctness matrix runs outside timed phases and keeps
+  full output IDs in `correctness.json`; paired baseline/VMM runs can compare
+  the same prompt and output hashes. Broker warmup now requires every configured
+  tenant owner, not merely one owner, before measured phases begin.
+- Still open before a GPU acceptance claim: staged transition/burst arrival
+  schedules, a real-broker runner integration test, cleanup-failure persistence,
+  and the paired isolated/shared/observe/enforce GPU matrix itself.

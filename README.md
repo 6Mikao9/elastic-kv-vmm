@@ -168,7 +168,11 @@ for lease lifetimes, failure semantics, multi-GPU state paths and the paired
 validation matrix. The dense [dual-instance runner](scripts/run_dual.py) now
 accepts one fresh broker file plus per-model tenant and weight values, samples
 broker capacity/usage/demand and whole-device NVML together, and runs `a-hot`,
-`b-hot` and `both-active` phases. The full arm and acceptance protocol is in
+`b-hot` and `both-active` phases. Dispatch is barrier-synchronized, hot-instance
+order reverses across repeats, and source/runtime/native/model/image provenance
+is recorded. Raw request/sample files are written separately from summarized
+results, and an untimed non-streaming token matrix is retained for paired
+correctness checks. The full arm and acceptance protocol is in
 the [dual-instance validation plan](docs/DUAL_INSTANCE_VALIDATION_ZH.md).
 
 `EKV_PREFILL_HEADROOM_SCOPED=1` (or `--elastic-prefill-headroom-scoped`) makes

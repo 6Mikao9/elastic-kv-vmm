@@ -81,11 +81,19 @@ bash scripts/container_dual.sh 0 /path/to/huggingface/hub v2 \
   "arm": "fair-enforce",
   "configuration": {"capacity_bytes": 0, "tenants": {}, "weights": {}},
   "capacity": {"a": {}, "b": {}},
-  "phases": [{"name": "a-hot", "requests": [], "summary": {}, "samples": []}],
+  "phases": [{"name": "a-hot", "scenario": "a-hot", "repeat": 1,
+              "summary": {}, "idle": {}}],
   "violations": [],
   "source_manifest": {}
 }
 ```
+
+每个相位另写 `repeat-NN-<scenario>.requests.json` 和
+`repeat-NN-<scenario>.samples.json`；warmup 使用 `warmup-<scenario>` 前缀。
+`results.json` 只保留可聚合摘要和失败证据，避免把高频采样嵌入主结果。
+计时相位之外还执行固定提示长度和输出长度的非流式正确性矩阵，完整 token IDs
+保存在 `correctness.json`，baseline 与 VMM arm 必须按相同的 prompt/output hash
+逐项一致。
 
 ## 3. Arm 矩阵
 
@@ -202,7 +210,7 @@ non_vmm_reserved
 
 ## 9. 实施顺序
 
-1. `run_dual.py` 已接入 broker 配置、只读 snapshot、per-request 结果和 `a-hot`/`b-hot`/`both-active`；参数化 arrival schedule 与独立进程级 barrier 仍待加入。
+1. `run_dual.py` 已接入 broker 配置、只读 snapshot、两租户 owner 校验、同步 dispatch barrier、非流式正确性探针、镜像/源码/模型/GPU/native 运行时溯源、完整 adapter 计数、显式 drain 等待、失败快照和逐相位 raw 文件。三轮测量按 `a-hot, b-hot, both-active` 与 `b-hot, a-hot, both-active` 交替；分阶段 transition、显式过量 burst 和真实 broker runner 集成测试仍待加入。
 2. 先跑 `isolated`、`shared-off` 和 `fair-observe` 的 CPU/单实例兼容检查，确认输出 JSON、租约不超卖和失败路径。
 3. 在空闲 A100 上跑 dense 三种 arm 的双实例配对，验证负载反转、同时突发和 drain。
 4. 启用 `fair-enforce`，检查公平拒绝和空闲回收；不要在此阶段声称 active KV 抢占。

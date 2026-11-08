@@ -33,7 +33,10 @@ that history; all TP ranks use the conservative common result. Ownership remains
 with the original process: a lease is transferred only after successful
 `cuMemUnmap` and release. The dense dual-instance runner now exposes `off`,
 `observe` and `enforce` with per-model tenants, samples broker and NVML state,
-and executes `a-hot`, `b-hot` and `both-active` phases. The next evidence is a
+executes `a-hot`, `b-hot` and `both-active` phases, synchronizes dispatch, and
+reverses hot-instance order across repeats. It writes raw request/sample files
+plus a runtime/source-bound summary and an untimed non-streaming correctness
+matrix. The next evidence is a
 paired GPU run, including an unfair long-lived burst; MiniMax still needs its
 request-level pair driver. Until that run, the implemented weighted targets,
 anti-starvation, request-admission fallback and bounded retry are CPU and

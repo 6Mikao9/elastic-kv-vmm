@@ -5,6 +5,8 @@ gpu=$1; hub=$2; mode=$3; output=$4
 shift 4
 root=$(cd "$(dirname "$0")/.." && pwd)
 image=${SGLANG_IMAGE:-training-sandbox:torch280-cu128}
+image_id=$(docker image inspect --format '{{.Id}}' "$image")
+image_digest=$(docker image inspect --format '{{join .RepoDigests ","}}' "$image")
 model_a=models--Qwen--Qwen3-0.6B-Base/snapshots/da87bfb608c14b7cf20ba1ce41287e8de496c0cd
 model_b=models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c
 test -r "$hub/$model_a/config.json"
@@ -20,6 +22,8 @@ docker run --rm --pull=never --gpus "device=$gpu" --network none --shm-size 1g \
     --mount "type=bind,src=$hub,dst=/hf/hub,readonly" \
     --mount "type=bind,src=$root,dst=/experiment" --workdir /experiment \
     -e "BENCH_GPU_UUID=${gpu_uuid// /}" -e HOME=/experiment/cache/dual/home \
+    -e "SGLANG_IMAGE=$image" -e "EKV_IMAGE_ID=$image_id" \
+    -e "EKV_IMAGE_DIGEST=$image_digest" \
     -e HF_HOME=/experiment/cache/dual/hf -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
     -e XDG_CACHE_HOME=/experiment/cache/dual/xdg -e TORCH_HOME=/experiment/cache/dual/torch \
     -e TRITON_CACHE_DIR=/experiment/cache/dual/triton \

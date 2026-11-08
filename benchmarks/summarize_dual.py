@@ -6,14 +6,24 @@ import json
 from pathlib import Path
 from statistics import median
 
-from summarize import require
-
+try:
+    from benchmarks.summarize import require
+except ImportError:  # Direct execution from the benchmarks directory.
+    from summarize import require
 
 SCENARIOS = {"a-hot": ("a",), "b-hot": ("b",), "both-active": ("a", "b")}
 
 
-def summarize(data, mode):
-    require(data["mode"] == mode and data["models"] == {"a": "0.6B", "b": "4B"},
+def load_phase(directory, phase):
+    stem = f"repeat-{phase['repeat']:02d}-{phase['scenario']}"
+    requests = json.loads((directory / f"{stem}.requests.json").read_text(encoding="utf-8"))
+    samples = json.loads((directory / f"{stem}.samples.json").read_text(encoding="utf-8"))
+    return requests, samples
+
+
+def summarize(data, mode, directory):
+    require(data.get("status") == "complete" and data.get("arm") == mode
+            and data["mode"] == mode and data["models"] == {"a": "0.6B", "b": "4B"},
             "Unexpected mode or model assignment")
     phases = {(p["scenario"], p["repeat"]): p for p in data["phases"]}
     require(len(data["phases"]) == 9
@@ -23,7 +33,8 @@ def summarize(data, mode):
         rates, requests, active, idle = [], [], [], []
         for repeat in range(1, 4):
             phase = phases[scenario, repeat]
-            records = phase["requests"]
+            records, samples = load_phase(directory, phase)
+            details = phase["summary"]
             expected = {f"measured/{scenario}/{repeat}/{i}/{n}"
                         for i in instances for n in range(4)}
             require(len(records) == len(expected)
@@ -34,11 +45,11 @@ def summarize(data, mode):
                         and r["output_ids_sha256"] and r["ttft_s"] > 0 and r["tpot_s"] > 0
                         for r in records), "Incomplete measured response")
             output_tokens = sum(r["output_tokens"] for r in records)
-            require(output_tokens == phase["output_tokens"] and phase["elapsed_s"] > 0,
+            require(output_tokens == details["output_tokens"] and details["elapsed_s"] > 0,
                     "Invalid phase timing or token count")
-            count = phase["active_sample_count"]
-            require(0 < count < len(phase["samples"])
-                    and phase["idle"] == phase["samples"][-1], "Incomplete memory sampling")
+            count = details["active_sample_count"]
+            require(0 < count < len(samples)
+                    and phase["idle"] == samples[-1], "Incomplete memory sampling")
             if mode == "v2":
                 stats = phase["idle"]["instances"]
                 require(stats.keys() == {"a", "b"}
@@ -47,14 +58,14 @@ def summarize(data, mode):
             if "active_window_s" in phase:
                 start, end = phase["active_window_s"]
                 require(0 <= start < end, "Invalid active window")
-                active_samples = [s for s in phase["samples"]
+                active_samples = [s for s in samples
                                   if start <= s["offset_s"] <= end]
                 require(len(active_samples) == count, "Invalid active sample count")
             else:
-                active_samples = phase["samples"][:count]
+                active_samples = samples[:count]
             active.extend(s["device_used_bytes"] for s in active_samples)
             idle.append(phase["idle"]["device_used_bytes"])
-            rates.append(output_tokens / phase["elapsed_s"])
+            rates.append(output_tokens / details["elapsed_s"])
             requests.extend(records)
         yield {
             "mode": mode, "scenario": scenario, "repeats": 3, "requests": len(requests),
@@ -74,12 +85,14 @@ def main():
     prompts = {}
     try:
         for mode in ("baseline", "v2"):
-            data = json.loads((args.directory / mode / "results.json").read_text(encoding="utf-8"))
-            rows.extend(summarize(data, mode))
+            directory = args.directory / mode
+            data = json.loads((directory / "results.json").read_text(encoding="utf-8"))
+            rows.extend(summarize(data, mode, directory))
             prompts[mode] = {
                 (phase["scenario"], phase["repeat"], record["request_id"]):
                 record["prompt_sha256"]
-                for phase in data["phases"] for record in phase["requests"]
+                for phase in data["phases"]
+                for record in load_phase(directory, phase)[0]
             }
         require(all(prompts["baseline"].values()) and prompts["baseline"] == prompts["v2"],
                 "Measured request IDs or prompt hashes differ between modes")
