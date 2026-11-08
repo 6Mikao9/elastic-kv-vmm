@@ -72,6 +72,7 @@ class KvHintsTransportTest(unittest.TestCase):
         self.assertEqual(pickle.loads(pickle.dumps(envelope)), envelope)
         with self.assertRaises(Exception):
             envelope.message_id = "changed"
+        self.assertEqual(compat._encode_kv_hints(envelope), ENVELOPE)
 
     def test_rejects_malformed_envelope_and_action(self):
         cases = (
@@ -190,7 +191,7 @@ class RealSGLang052CompatibilityTest(unittest.TestCase):
     def test_installer_rejects_unknown_sglang_before_patching(self):
         modules = {"sglang": _module("sglang", __version__="dev-unknown")}
         with patch.dict(sys.modules, modules), self.assertRaisesRegex(
-            RuntimeError, "only valid for SGLang 0.5.2"
+            RuntimeError, "only valid for supported SGLang"
         ):
             compat.install()
 
@@ -199,8 +200,10 @@ class RealSGLang052CompatibilityTest(unittest.TestCase):
             import sglang
         except ImportError:
             self.skipTest("SGLang is not installed")
-        if sglang.__version__ != "0.5.2":
-            self.skipTest("real transport check is specific to SGLang 0.5.2")
+        if sglang.__version__ not in compat._SUPPORTED_SGLANG_VERSIONS:
+            self.skipTest(
+                f"unsupported real SGLang version: {sglang.__version__}"
+            )
 
         request_class = compat.install()
         request = request_class(
@@ -212,6 +215,12 @@ class RealSGLang052CompatibilityTest(unittest.TestCase):
         request.normalize_batch_and_arguments()
         self.assertTrue(request.is_single)
         self.assertEqual(request.kv_hints.message_id, "msg-1")
+        if sglang.__version__ == "0.5.17":
+            from sglang.srt.managers import io_struct
+
+            self.assertIn(
+                "kv_hints", io_struct.TokenizedGenerateReqInput.__struct_fields__
+            )
 
 
 if __name__ == "__main__":
