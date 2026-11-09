@@ -102,6 +102,11 @@ SGLang or touch CUDA.
 The CLI currently launches the guarded dense-MHA scope documented in
 [integration](INTEGRATION.md). Unsupported SGLang configurations fail at
 startup rather than silently running with an incorrect backing layout.
+SGLang's newer `--enable-unified-memory` allocator is rejected by the dense V5
+profile because it can replace the MHA pool before this adapter's ownership
+check. The launcher prints a second manifest containing the components it
+actually installed, which makes a sparse-profile selection distinguishable from
+a native fallback when no requested hook was enabled.
 
 With `--elastic-admission-policy physical`, V5's allocator reports a
 conservative physical token budget through SGLang's native `available_size()`

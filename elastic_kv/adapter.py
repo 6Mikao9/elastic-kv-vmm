@@ -1551,12 +1551,13 @@ def install():
                     all(backend in (None, "triton") for backend in backends),
                     a.disaggregation_mode == "null", not a.enable_memory_saver,
                     not a.speculative_algorithm, not a.enable_hierarchical_cache,
+                    not getattr(a, "enable_unified_memory", False),
                     not getattr(a, "enable_page_major_kv_layout", False),
                     getattr(a, "dcp_size", 1) == 1)
         if not all(required) or is_hybrid or use_mla_backend:
             raise RuntimeError(
                 "Require dense MHA, TP1, Triton, supported Graph/overlap mode, "
-                "no radix/cache/spec/PD"
+                "no radix/cache/spec/PD/unified-memory"
             )
         OVERLAP_SCHEDULE_ACTIVE = not a.disable_overlap_schedule
 

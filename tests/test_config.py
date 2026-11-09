@@ -501,9 +501,10 @@ class ElasticConfigTest(unittest.TestCase):
             {"EKV_MODE": "baseline", "EKV_FUTURE_POLICY": "deadline"},
             clear=True,
         ), patch.dict(sys.modules, modules):
-            launch._install_adapter()
+            installed = launch._install_adapter()
         vmm_install.assert_not_called()
         future_install.assert_called_once_with()
+        self.assertEqual(installed, ("future_policy",))
 
     def test_nonbaseline_mode_installs_vmm_adapter(self):
         vmm_install = unittest.mock.Mock()
@@ -511,12 +512,13 @@ class ElasticConfigTest(unittest.TestCase):
         with patch.dict(os.environ, {"EKV_MODE": "v5"}, clear=True), patch.dict(
             sys.modules, modules
         ):
-            launch._install_adapter()
+            installed = launch._install_adapter()
         vmm_install.assert_called_once_with()
+        self.assertEqual(installed, ("dense_vmm",))
 
     def test_minimax_runtime_profile_skips_dense_adapter(self):
         dense_install = unittest.mock.Mock()
-        sparse_install = unittest.mock.Mock()
+        sparse_install = unittest.mock.Mock(return_value=("vmm_runtime",))
         modules = {
             "elastic_kv.adapter": SimpleNamespace(install=dense_install),
             "adaptive_sparse.minimax_runtime": SimpleNamespace(
@@ -531,9 +533,10 @@ class ElasticConfigTest(unittest.TestCase):
             },
             clear=True,
         ), patch.dict(sys.modules, modules):
-            launch._install_adapter()
+            installed = launch._install_adapter()
         dense_install.assert_not_called()
         sparse_install.assert_called_once_with()
+        self.assertEqual(installed, ("vmm_runtime",))
 
 
 if __name__ == "__main__":

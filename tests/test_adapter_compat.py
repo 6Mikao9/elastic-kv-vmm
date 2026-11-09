@@ -212,6 +212,14 @@ class AdapterCompatibilityTest(unittest.TestCase):
                 guarded(configurator_instance, pre_model_load_memory=1)
             server_args.enable_page_major_kv_layout = False
 
+            # Newer SGLang can select its own unified allocator before this
+            # adapter sees a pool. Reject it at configuration time instead of
+            # allowing the later ownership check to fail after model loading.
+            server_args.enable_unified_memory = True
+            with self.assertRaisesRegex(RuntimeError, "unified-memory"):
+                guarded(configurator_instance, pre_model_load_memory=1)
+            server_args.enable_unified_memory = False
+
             configurator_instance.model_config.v_head_dim = 64
             with self.assertRaisesRegex(RuntimeError, "symmetric K/V"):
                 guarded(configurator_instance, pre_model_load_memory=1)

@@ -27,7 +27,7 @@ REQUESTED_RUNTIME_PROFILES = ("auto", "dense", "minimax-hisparse")
 RESOLVED_RUNTIME_PROFILES = ("dense", "minimax-hisparse")
 
 
-def _install_adapter() -> None:
+def _install_adapter() -> tuple[str, ...]:
     runtime_profile = os.environ.get(RUNTIME_PROFILE_ENV, "dense").strip().lower()
     if runtime_profile not in RESOLVED_RUNTIME_PROFILES:
         raise ValueError(
@@ -36,18 +36,22 @@ def _install_adapter() -> None:
     if runtime_profile == "minimax-hisparse":
         from adaptive_sparse.minimax_runtime import install_minimax_runtime
 
-        install_minimax_runtime()
-        return
+        installed = install_minimax_runtime()
+        return () if installed is None else tuple(installed)
 
     config = ElasticConfig.from_env()
+    installed_components: list[str] = []
     if config.mode != "baseline":
         from .adapter import install
 
         install()
+        installed_components.append("dense_vmm")
     if config.future_policy == "deadline":
         from adaptive_sparse.sglang_future_hook import install as install_future_policy
 
         install_future_policy()
+        installed_components.append("future_policy")
+    return tuple(installed_components)
 
 
 def _install_spawned_worker() -> None:
@@ -296,7 +300,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     # these environment values at import time. The sentinel makes a spawned
     # worker install the same adapter when Python reconstructs this module.
     os.environ[SPAWN_INSTALL_ENV] = "1"
-    _install_adapter()
+    installed_components = _install_adapter()
+    launch_config["installed_components"] = list(installed_components)
+    print(
+        f"elastic-sglang installed: {json.dumps(launch_config, sort_keys=True)}",
+        flush=True,
+    )
     from sglang.srt.entrypoints.http_server import launch_server
     from sglang.srt.server_args import prepare_server_args
 
