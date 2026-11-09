@@ -1,0 +1,922 @@
+From ac50029ac5c46d8ab05c6515ad3faf0bccdfa80b Mon Sep 17 00:00:00 2001
+From: Anonymous Researcher <anonymous@example.invalid>
+Date: Mon, 9 Nov 2026 11:46:54 +0800
+Subject: [PATCH] Fix cache request abort lifecycle
+
+---
+ python/sglang/srt/disaggregation/decode.py    |  25 +-
+ .../disaggregation/decode_hicache_mixin.py    |  12 +-
+ python/sglang/srt/disaggregation/prefill.py   |  40 +-
+ python/sglang/srt/managers/scheduler.py       |  66 +--
+ .../sglang/srt/mem_cache/base_prefix_cache.py |  26 +-
+ python/sglang/srt/mem_cache/common.py         |  30 ++
+ .../storage/flexkv/flexkv_radix_cache.py      |   7 +-
+ .../lmcache/lmcache_unified_radix_cache.py    |  28 +-
+ .../test_cache_request_abort_lifecycle.py     | 389 ++++++++++++++++++
+ 9 files changed, 564 insertions(+), 59 deletions(-)
+ create mode 100644 test/registered/unit/mem_cache/test_cache_request_abort_lifecycle.py
+
+diff --git a/python/sglang/srt/disaggregation/decode.py b/python/sglang/srt/disaggregation/decode.py
+index 865fb7b217..62e1a5fb27 100644
+--- a/python/sglang/srt/disaggregation/decode.py
++++ b/python/sglang/srt/disaggregation/decode.py
+@@ -99,12 +99,12 @@ from sglang.srt.mem_cache.base_prefix_cache import (
+ )
+ from sglang.srt.mem_cache.common import (
+     RetractionBackup,
++    abort_prefix_cache_request,
+     discard_kv_cache_backup,
+     dsv4_needs_rebootstrap,
+     kv_to_page_indices,
+     match_kv_cache,
+     page_align_floor,
+-    release_kv_cache,
+     restore_kv_cache,
+     suffix_page_indices,
+ )
+@@ -1832,8 +1832,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
+                 r for r in self.pending_reqs if id(r) not in failed_ids
+             ]
+             for decode_req in failed_reqs:
+-                if decode_req.req.kv.holds_mamba and not decode_req.req.kv.holds_kv:
+-                    release_kv_cache(decode_req.req, self.tree_cache, checkpoint=False)
++                abort_prefix_cache_request(
++                    decode_req.req,
++                    self.tree_cache,
++                    release_kv=(
++                        decode_req.req.kv.holds_kv or decode_req.req.kv.holds_mamba
++                    ),
++                    checkpoint=False,
++                )
+ 
+         self.queue = [
+             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
+@@ -2812,8 +2818,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
+         if self.enable_host_receive:
+             discard_kv_cache_backup(decode_req.req, self.tree_cache, "host_pool")
+             if decode_req.host_staged:
++                if not (decode_req.req.kv.holds_kv or decode_req.req.kv.holds_mamba):
++                    abort_prefix_cache_request(decode_req.req, self.tree_cache)
+                 return
+-        release_kv_cache(decode_req.req, self.tree_cache, checkpoint=False)
++        abort_prefix_cache_request(
++            decode_req.req,
++            self.tree_cache,
++            release_kv=True,
++            checkpoint=False,
++        )
+ 
+     def _is_host_destination(self, decode_req: DecodeRequest) -> bool:
+         return self.enable_host_receive and decode_req.host_staged
+@@ -3364,7 +3377,9 @@ class SchedulerDisaggregationDecodeMixin:
+             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+         )
+         self.output_streamer.stream_output([req], req.return_logprob)
+-        release_kv_cache(req, self.tree_cache, checkpoint=False)
++        abort_prefix_cache_request(
++            req, self.tree_cache, release_kv=True, checkpoint=False
++        )
+         if self.metrics_reporter.enable_metrics:
+             self.metrics_collector.increment_transfer_failed_reqs()
+ 
+diff --git a/python/sglang/srt/disaggregation/decode_hicache_mixin.py b/python/sglang/srt/disaggregation/decode_hicache_mixin.py
+index 46cbb8a973..27b264079a 100644
+--- a/python/sglang/srt/disaggregation/decode_hicache_mixin.py
++++ b/python/sglang/srt/disaggregation/decode_hicache_mixin.py
+@@ -195,13 +195,11 @@ class DecodeHiCacheTransferMixin:
+     """HiCache hooks for ``DecodeTransferQueue``: drive restore state machine."""
+ 
+     def _clean_hicache_prefetch_resources(self, decode_req: DecodeRequest) -> None:
+-        if (
+-            decode_req.prefix_match is not None
+-            and decode_req.prefix_match.prefetch_registered
+-        ):
+-            self.tree_cache.finish(
+-                decode_req.req.cache_request_handle, CacheRequestOutcome.ABORT
+-            )
++        # Cancellation must reach the cache even when no prefetch was visible
++        # through DecodePrefixMatch; the backend owns the full attempt state.
++        self.tree_cache.finish(
++            decode_req.req.cache_request_handle, CacheRequestOutcome.ABORT
++        )
+         self.tree_cache.unlock(decode_req.hicache_restore_lock)
+         decode_req.hicache_restore_lock = None
+ 
+diff --git a/python/sglang/srt/disaggregation/prefill.py b/python/sglang/srt/disaggregation/prefill.py
+index 17be9d5c39..cce1e42f86 100644
+--- a/python/sglang/srt/disaggregation/prefill.py
++++ b/python/sglang/srt/disaggregation/prefill.py
+@@ -77,6 +77,7 @@ from sglang.srt.managers.schedule_batch import (
+ )
+ from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
+ from sglang.srt.mem_cache.common import (
++    abort_prefix_cache_request,
+     checkpoint_kv_cache,
+     kv_to_page_indices,
+     kv_to_page_num,
+@@ -598,8 +599,11 @@ class SchedulerDisaggregationPrefillMixin:
+         if sender is not None and hasattr(sender, "abort"):
+             sender.abort()
+         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
+-        if req.kv.holds_kv or req.kv.holds_mamba:
+-            release_kv_cache(req, self.tree_cache, checkpoint=False)
++        self._release_aborted_request(
++            req,
++            release_kv=req.kv.holds_kv or req.kv.holds_mamba,
++            checkpoint=False,
++        )
+         req.pending_bootstrap = False
+ 
+     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
+@@ -1301,9 +1305,9 @@ class SchedulerDisaggregationPrefillMixin:
+         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+         if req.finished_reason is None:
+             req.finished_reason = FINISH_LENGTH(length=0)
+-        # unlock the tree
+-        release_kv_cache(req, self.tree_cache, checkpoint=True)
+-        self._release_aborted_request(req)
++        self._release_aborted_request(
++            req, release_kv=True, checkpoint=True
++        )
+         if not isinstance(req.finished_reason, FINISH_ABORT):
+             prepare_abort(
+                 req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+@@ -1344,9 +1348,12 @@ class SchedulerDisaggregationPrefillMixin:
+             req.update_finish_state()
+         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
+         req.pending_bootstrap = False
+-        self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
+-        if req.kv.holds_kv or req.kv.holds_mamba:
+-            release_kv_cache(req, self.tree_cache, checkpoint=False)
++        abort_prefix_cache_request(
++            req,
++            self.tree_cache,
++            release_kv=req.kv.holds_kv or req.kv.holds_mamba,
++            checkpoint=False,
++        )
+         return True
+ 
+     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
+@@ -1367,15 +1374,18 @@ class SchedulerDisaggregationPrefillMixin:
+         else:
+             logger.warning(error_message)
+         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+-        if req.kv.holds_kv or req.kv.holds_mamba:
+-            release_kv_cache(req, self.tree_cache, checkpoint=False)
++        abort_prefix_cache_request(
++            req,
++            self.tree_cache,
++            release_kv=req.kv.holds_kv or req.kv.holds_mamba,
++            checkpoint=False,
++        )
+         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
+         req.pending_bootstrap = False
+         prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+         self.output_streamer.stream_output([req], req.return_logprob)
+         if self.metrics_reporter.enable_metrics:
+             self.metrics_collector.increment_bootstrap_failed_reqs()
+-        self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
+ 
+     def handle_pending_bootstrap(self: Scheduler, req: Req, poll: KVPoll) -> bool:
+         """Return True when bootstrap is finalized and KV transfer can proceed."""
+@@ -1801,10 +1811,10 @@ class SchedulerDisaggregationPrefillMixin:
+         )
+         # The request is requeued, not aborted: keep its multimodal inputs (the
+         # re-prefill embeds its image tokens again) and its streaming session.
+-        self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
+-        # The checkpoint above already handed the prefill KV to the tree; the
+-        # request is not finished, so the release only frees the rest.
+-        release_kv_cache(req, self.tree_cache, checkpoint=False)
++        # Cancel before optional STORE; the LMCache session closes afterwards.
++        abort_prefix_cache_request(
++            req, self.tree_cache, release_kv=True, checkpoint=False
++        )
+         req.reset_for_retract()
+         req.output_ids = array("q")
+         req.start_send_idx = 0
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index d223d2e444..9a7cbe8744 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -295,11 +295,10 @@ from sglang.srt.managers.utils import (
+ )
+ from sglang.srt.mem_cache import kv_cache_builder
+ from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
+-from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
+ from sglang.srt.mem_cache.common import (
++    abort_prefix_cache_request,
+     checkpoint_kv_cache,
+     discard_kv_cache_backup,
+-    release_kv_cache,
+ )
+ from sglang.srt.mem_cache.events import KvEventLoraNames
+ from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+@@ -3542,10 +3541,21 @@ class Scheduler(
+             return False
+         return True
+ 
+-    def _release_aborted_request(self, req: Req) -> None:
+-        """Drop the cache-side state an aborted request left behind."""
++    def _release_aborted_request(
++        self,
++        req: Req,
++        *,
++        release_kv: bool = False,
++        checkpoint: bool = False,
++    ) -> None:
++        """Cancel lookup/prefetch, optionally STORE, then close the session."""
+         req.release_mm_inputs_on_abort()
+-        self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
++        abort_prefix_cache_request(
++            req,
++            self.tree_cache,
++            release_kv=release_kv,
++            checkpoint=checkpoint,
++        )
+         if req.session is not None and req.session.streaming:
+             req.session.abort_req()
+ 
+@@ -3815,8 +3825,11 @@ class Scheduler(
+                 req, self.req_to_metadata_buffer_idx_allocator
+             )
+             req.pending_bootstrap = False
+-        self._release_aborted_request(req)
+-        release_kv_cache(req, self.tree_cache, checkpoint=False)
++        self._release_aborted_request(
++            req,
++            release_kv=req.kv.holds_kv or req.kv.holds_mamba,
++            checkpoint=False,
++        )
+ 
+         self.chunked_req = None
+         self._pending_chunked_abort_req = None
+@@ -5691,14 +5704,8 @@ class Scheduler(
+             # This only works for requests that have not started anything.
+             # We still need to send something back to TokenizerManager to clean up the state.
+             req = self.waiting_queue.pop(i)
+-            self._release_aborted_request(req)
+-            self.beam_coordinator.retire_group(req)
+-            # Without the initiator's reason the tokenizer falls back to a
+-            # generic abort message.
+-            self.send_abort_output(
+-                _make_abort_req(req, finished_reason=recv_req.finished_reason), req
+-            )
+-            # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
++            # Decode waiting-queue entries already hold KV, so STORE runs before
++            # the session closes. Other modes close the session immediately.
+             if self.disaggregation_mode == DisaggregationMode.DECODE:
+                 if get_disagg().disaggregation_decode_host_receive_threshold < 1:
+                     discard_kv_cache_backup(req, self.tree_cache, "host_pool")
+@@ -5706,26 +5713,31 @@ class Scheduler(
+                     self.hisparse_coordinator.request_finished(req)
+                 if req.finished_reason is None:
+                     req.finished_reason = FINISH_ABORT()
+-                release_kv_cache(req, self.tree_cache, checkpoint=True)
+-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
++                self._release_aborted_request(req, release_kv=True, checkpoint=True)
++            elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+                 self.release_aborted_prefill_waiting_req(req)
+-
+-            # For mamba radix cache
+-            if req.kv.holds_mamba and self.disaggregation_mode not in (
+-                DisaggregationMode.PREFILL,
+-                DisaggregationMode.DECODE,
+-            ):
+-                release_kv_cache(req, self.tree_cache, checkpoint=False)
++            elif req.kv.holds_mamba:
++                self._release_aborted_request(req, release_kv=True, checkpoint=False)
++            else:
++                self._release_aborted_request(req)
++            self.beam_coordinator.retire_group(req)
++            # Without the initiator's reason the tokenizer falls back to a
++            # generic abort message.
++            self.send_abort_output(
++                _make_abort_req(req, finished_reason=recv_req.finished_reason), req
++            )
+             logger.debug(f"Abort queued request. {req.rid=}")
+ 
+         if self.dllm_config is not None:
+             for req in self.dllm_manager.pop_aborted_reqs(
+                 recv_req.abort_all, recv_req.rid
+             ):
+-                self._release_aborted_request(req)
++                self._release_aborted_request(
++                    req,
++                    release_kv=req.kv.holds_kv or req.kv.holds_mamba,
++                    checkpoint=False,
++                )
+                 self.send_abort_output(_make_abort_req(req), req)
+-                if req.kv.holds_kv or req.kv.holds_mamba:
+-                    release_kv_cache(req, self.tree_cache, checkpoint=False)
+                 logger.debug(f"Abort dLLM queued request. {req.rid=}")
+ 
+         # Delete the requests in the grammar queue
+diff --git a/python/sglang/srt/mem_cache/base_prefix_cache.py b/python/sglang/srt/mem_cache/base_prefix_cache.py
+index cfa94d5677..bffdf32035 100644
+--- a/python/sglang/srt/mem_cache/base_prefix_cache.py
++++ b/python/sglang/srt/mem_cache/base_prefix_cache.py
+@@ -431,12 +431,34 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
+         """
+ 
+     def release_aborted_request(self, handle: CacheRequestHandle) -> None:
+-        """Release attempt state; caches without prefetch state have nothing to drop."""
++        """Release attempt state; caches without prefetch state have nothing to drop.
++
++        Existing backends implement cancel-phase work here (pending lookup /
++        prefetch). New code should override
++        :meth:`cancel_aborted_request_work` / :meth:`finish_request_session`
++        instead; the default cancel path still delegates to this method.
++        """
++
++    def cancel_aborted_request_work(self, handle: CacheRequestHandle) -> None:
++        """Drop pending lookup/prefetch for an aborted attempt.
++
++        Must run before KV finalization or STORE. FlexKV relies on this: an
++        in-flight asynchronous STORE must retain the source-node lock created
++        by its checkpoint path.
++        """
++        self.release_aborted_request(handle)
++
++    def finish_request_session(self, handle: CacheRequestHandle) -> None:
++        """Close backend session state after optional STORE, or immediately if none.
++
++        LMCache must not end the session in the cancel phase because abort paths
++        that still STORE need the session to remain open across insert/STORE.
++        """
+ 
+     def finish(self, handle: CacheRequestHandle, outcome: CacheRequestOutcome) -> None:
+         """Finish an attempt without cancelling successful asynchronous cache work."""
+         if outcome != CacheRequestOutcome.SUCCESS:
+-            self.release_aborted_request(handle)
++            self.cancel_aborted_request_work(handle)
+ 
+     @abstractmethod
+     def reset(self):
+diff --git a/python/sglang/srt/mem_cache/common.py b/python/sglang/srt/mem_cache/common.py
+index b556dad8ab..221dc67b43 100644
+--- a/python/sglang/srt/mem_cache/common.py
++++ b/python/sglang/srt/mem_cache/common.py
+@@ -15,6 +15,7 @@ from sglang.srt.environ import envs
+ from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
+ from sglang.srt.mem_cache.base_prefix_cache import (
+     BasePrefixCache,
++    CacheRequestOutcome,
+     EvictParams,
+     MatchPrefixParams,
+     MatchResult,
+@@ -392,6 +393,29 @@ def discard_kv_cache_backup(
+     req.kv.retraction_backup = None
+ 
+ 
++def abort_prefix_cache_request(
++    req: Req,
++    tree_cache: BasePrefixCache,
++    *,
++    release_kv: bool = False,
++    checkpoint: bool = False,
++) -> None:
++    """Cancel abort-phase work, optionally release KV, then close the session.
++
++    FlexKV must cancel lookup/prefetch before KV finalization so an
++    asynchronous STORE retains its source-node lock. LMCache must close its
++    session after that optional STORE, or immediately when no STORE runs.
++    """
++    handle = req.cache_request_handle
++    tree_cache.finish(handle, CacheRequestOutcome.ABORT)
++    if release_kv and (req.kv.holds_kv or req.kv.holds_mamba):
++        release_kv_cache(req, tree_cache, checkpoint=checkpoint)
++        # release_kv_cache closes the session after its optional STORE,
++        # including the Mamba-only path that has no device-KV row.
++        return
++    tree_cache.finish_request_session(handle)
++
++
+ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool):
+     """Give the request's kv row back; with ``checkpoint`` the tree first keeps
+     what it can key."""
+@@ -407,6 +431,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
+                 req.kv.mamba_pool_idx.unsqueeze(-1)
+             )
+             req.kv.mamba_pool_idx = None
++        # No cache_finished_req path runs, but cache backends may still own a
++        # per-request session opened during lookup.
++        tree_cache.finish_request_session(req.cache_request_handle)
+         return
+     if tree_cache.claim_kv_row(req):
+         # A streaming session detached the kv record to keep the row.
+@@ -437,6 +464,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
+     # c4/c128 state pages; other ReqToTokenPool subclasses are a no-op here.
+     tree_cache.req_to_token_pool.free(req)
+     req.kv.mark_kv_released()
++    # Close backend session state after optional STORE. This is idempotent for
++    # LMCache and a no-op for cache backends without external sessions.
++    tree_cache.finish_request_session(req.cache_request_handle)
+ 
+ 
+ def _release_overallocated_kv_indices(
+diff --git a/python/sglang/srt/mem_cache/storage/flexkv/flexkv_radix_cache.py b/python/sglang/srt/mem_cache/storage/flexkv/flexkv_radix_cache.py
+index b485218c44..e5c2c29746 100644
+--- a/python/sglang/srt/mem_cache/storage/flexkv/flexkv_radix_cache.py
++++ b/python/sglang/srt/mem_cache/storage/flexkv/flexkv_radix_cache.py
+@@ -479,7 +479,12 @@ class FlexKVRadixCache(RadixCache):
+     # ------------------------------------------------------------------
+ 
+     def release_aborted_request(self, handle: CacheRequestHandle) -> None:
+-        """Clean up tracking for an aborted request without invoking FlexKV."""
++        """Cancel-phase cleanup for an aborted request.
++
++        This must run before KV finalization or STORE. Dropping an in-flight
++        STORE registration afterwards would release its source-node lock while
++        the asynchronous store still reads those slots.
++        """
+         self._load_markers.pop(handle, None)
+         with self._node_lock:
+             node = self._inflight_store_nodes.pop(handle, None)
+diff --git a/python/sglang/srt/mem_cache/storage/lmcache/lmcache_unified_radix_cache.py b/python/sglang/srt/mem_cache/storage/lmcache/lmcache_unified_radix_cache.py
+index c502e2e2ec..5ec400b4f2 100644
+--- a/python/sglang/srt/mem_cache/storage/lmcache/lmcache_unified_radix_cache.py
++++ b/python/sglang/srt/mem_cache/storage/lmcache/lmcache_unified_radix_cache.py
+@@ -80,6 +80,9 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
+         self._pending_stores: list[LMCachePendingStore] = []
+         self._pending_store_counts: dict[str, int] = {}
+         self._session_finish_requested: set[str] = set()
++        # Track real MP sessions so terminal cleanup is exactly once and an
++        # abort before LOOKUP never emits a spurious finish_request.
++        self._open_sessions: set[str] = set()
+         self._lmcache_closed = False
+         atexit.register(self.shutdown)
+ 
+@@ -212,6 +215,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
+             local_hit_tokens=min(len(local_tokens), len(key)),
+             cache_salt=self.lmcache_connector.build_cache_salt(cache_salt, extra_key),
+         )
++        self._open_sessions.add(req_id)
+         self._external_flows[req_id] = LMCacheExternalFlow(
+             key=key,
+             lookup=lookup,
+@@ -323,12 +327,16 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
+         return bool(self._external_flows or self._pending_stores)
+ 
+     def release_aborted_request(self, handle: CacheRequestHandle) -> None:
++        """Drop lookup/load state without closing the LMCache session.
++
++        finish_request belongs in finish_request_session so abort paths that
++        still STORE keep the session open across insert/STORE.
++        """
+         rid = handle.rid
+         self.prefetch_loaded_tokens_by_reqid.pop(handle, None)
+         self.prefetch_loaded_storage_start_by_reqid.pop(handle, None)
+         flow = self._external_flows.get(rid)
+         if flow is None:
+-            self._request_session_finish(rid)
+             return
+         flow.cancelled = True
+         # Keep the checkpoint alive until H2D completes.
+@@ -344,13 +352,23 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
+                 # No retrieve will release locks from this completed lookup.
+                 self._retire_loaded_flow(rid)
+             else:
+-                # END_SESSION follows the in-flight lookup and releases its locks.
++                # Session close follows and releases the in-flight lookup locks.
+                 self._external_flows.pop(rid, None)
+         elif flow.load_completed:
+             self._finish_failed_load(flow)
+         else:
+             # Complete the cross-rank load only in check_hicache_events().
+             flow.retire_requested = True
++
++    def finish_request_session(self, handle: CacheRequestHandle) -> None:
++        """End the LMCache session after optional STORE, or immediately if none.
++
++        Idempotent because bootstrap abort can finalize a request twice. A
++        request that never opened a LOOKUP session does not emit END_SESSION.
++        """
++        rid = handle.rid
++        if rid not in self._open_sessions:
++            return
+         self._request_session_finish(rid)
+ 
+     def init_load_back(self, params: InitLoadBackParams) -> tuple[int, NodeId]:
+@@ -420,6 +438,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
+             self._pending_stores.clear()
+             self._pending_store_counts.clear()
+             self._session_finish_requested.clear()
++            self._open_sessions.clear()
+             self.prefetch_loaded_tokens_by_reqid.clear()
+             connector.end_all_sessions()
+         super().reset()
+@@ -963,6 +982,8 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
+ 
+     def _request_session_finish(self, rid: str) -> None:
+         """End the LMCache session after this request's stores have completed."""
++        if rid not in self._open_sessions:
++            return
+         self._session_finish_requested.add(rid)
+         self._finish_session_if_store_idle(rid)
+ 
+@@ -973,4 +994,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
+         ):
+             return
+         self._session_finish_requested.remove(rid)
++        if rid not in self._open_sessions:
++            return
++        self._open_sessions.discard(rid)
+         self.lmcache_connector.finish_request(rid)
+diff --git a/test/registered/unit/mem_cache/test_cache_request_abort_lifecycle.py b/test/registered/unit/mem_cache/test_cache_request_abort_lifecycle.py
+new file mode 100644
+index 0000000000..eaf5e0f835
+--- /dev/null
++++ b/test/registered/unit/mem_cache/test_cache_request_abort_lifecycle.py
+@@ -0,0 +1,389 @@
++"""CPU regressions for two-phase cache-request abort cleanup.
++
++An abort first cancels lookup/prefetch work. KV may then be finalized into
++external storage, after which the backend request session is closed. FlexKV
++needs the first ordering so a store owns its source-node lock; LMCache needs
++the second so ``finish_request`` is not sent across a pending store.
++"""
++
++from __future__ import annotations
++
++import importlib
++import sys
++import threading
++import types
++import unittest
++from unittest import mock
++
++from sglang.srt.mem_cache.base_prefix_cache import (
++    CacheRequestHandle,
++    CacheRequestOutcome,
++)
++from sglang.srt.mem_cache.common import abort_prefix_cache_request, release_kv_cache
++from sglang.test.ci.ci_register import register_cpu_ci
++
++register_cpu_ci(est_time=5, suite="base-a-test-cpu")
++
++
++_LMCACHE_MODULE = "sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache"
++_FLEXKV_MODULE = "sglang.srt.mem_cache.storage.flexkv.flexkv_radix_cache"
++
++
++def _install_lmcache_stubs():
++    modules = {}
++    for name in (
++        "lmcache",
++        "lmcache.integration",
++        "lmcache.integration.sglang",
++        "lmcache.integration.sglang.lmcache_mp_metadata",
++        "lmcache.integration.sglang.unified_lmcache_mp_connector",
++    ):
++        modules[name] = types.ModuleType(name)
++
++    class StubExternalFlow:
++        def __init__(self, *, key=None, lookup=None, total_hit=None):
++            self.key = key
++            self.lookup = lookup
++            self.total_hit = total_hit
++            self.local_hit_tokens = None
++            self.load = None
++            self.cancelled = False
++            self.mamba_value = None
++            self.load_req = None
++            self.retire_requested = False
++            self.load_completed = False
++            self.prefix_published = False
++            self.free_mamba_after_load = False
++
++    metadata = modules["lmcache.integration.sglang.lmcache_mp_metadata"]
++    metadata.LMCacheExternalFlow = StubExternalFlow
++    metadata.LMCachePendingStore = object
++    connector = modules["lmcache.integration.sglang.unified_lmcache_mp_connector"]
++    connector.UnifiedLMCacheMPConnector = object
++    return mock.patch.dict(sys.modules, modules)
++
++
++def _import_under_stubs(module_name, stub_factory):
++    was_imported = module_name in sys.modules
++    with stub_factory():
++        module = importlib.import_module(module_name)
++    if not was_imported:
++        sys.modules.pop(module_name, None)
++    return module
++
++
++LMCacheUnifiedRadixCache = _import_under_stubs(
++    _LMCACHE_MODULE, _install_lmcache_stubs
++).LMCacheUnifiedRadixCache
++
++
++class _FakeConnector:
++    def __init__(self):
++        self.finish_request_calls = []
++
++    def finish_request(self, request_id):
++        self.finish_request_calls.append(request_id)
++
++
++class _FakeFlow:
++    def __init__(self, *, total_hit=None):
++        self.key = None
++        self.lookup = types.SimpleNamespace(request_id="unused", lock_start=0)
++        self.total_hit = total_hit
++        self.local_hit_tokens = None
++        self.load = None
++        self.cancelled = False
++        self.mamba_value = None
++        self.load_req = None
++        self.retire_requested = False
++        self.load_completed = False
++        self.prefix_published = False
++        self.free_mamba_after_load = False
++
++
++def _make_lmcache():
++    cache = object.__new__(LMCacheUnifiedRadixCache)
++    cache._external_flows = {}
++    cache._pending_stores = []
++    cache._pending_store_counts = {}
++    cache._session_finish_requested = set()
++    cache._open_sessions = set()
++    cache.prefetch_loaded_tokens_by_reqid = {}
++    cache.prefetch_loaded_storage_start_by_reqid = {}
++    cache.lmcache_connector = _FakeConnector()
++    cache._retire_loaded_flow = mock.Mock()
++    cache._finish_failed_load = mock.Mock()
++    return cache
++
++
++def _open_lookup(cache, rid, *, total_hit=None):
++    cache._open_sessions.add(rid)
++    cache._external_flows[rid] = _FakeFlow(total_hit=total_hit)
++
++
++class TestLMCacheRequestSession(unittest.TestCase):
++    def test_abort_after_lookup_finishes_session_once(self):
++        cache = _make_lmcache()
++        rid = "rid-abort"
++        handle = CacheRequestHandle(rid=rid, attempt_id=0)
++        _open_lookup(cache, rid)
++
++        cache.finish(handle, CacheRequestOutcome.ABORT)
++        self.assertNotIn(rid, cache._external_flows)
++        self.assertEqual(cache.lmcache_connector.finish_request_calls, [])
++
++        cache.finish_request_session(handle)
++        cache.finish_request_session(handle)
++        self.assertEqual(cache.lmcache_connector.finish_request_calls, [rid])
++        self.assertNotIn(rid, cache._open_sessions)
++
++    def test_abort_before_lookup_does_not_finish_session(self):
++        cache = _make_lmcache()
++        handle = CacheRequestHandle(rid="rid-never-matched", attempt_id=0)
++
++        cache.cancel_aborted_request_work(handle)
++        cache.finish_request_session(handle)
++
++        self.assertEqual(cache.lmcache_connector.finish_request_calls, [])
++
++    def test_finish_waits_for_pending_store(self):
++        cache = _make_lmcache()
++        rid = "rid-pending-store"
++        handle = CacheRequestHandle(rid=rid, attempt_id=0)
++        _open_lookup(cache, rid)
++        cache._pending_store_counts[rid] = 1
++
++        cache.finish_request_session(handle)
++        self.assertEqual(cache.lmcache_connector.finish_request_calls, [])
++        self.assertIn(rid, cache._session_finish_requested)
++
++        cache._pending_store_counts.pop(rid)
++        cache._finish_session_if_store_idle(rid)
++        self.assertEqual(cache.lmcache_connector.finish_request_calls, [rid])
++
++    def test_no_device_kv_release_still_finishes_session(self):
++        cache = _make_lmcache()
++        rid = "rid-mamba-only"
++        handle = CacheRequestHandle(rid=rid, attempt_id=0)
++        _open_lookup(cache, rid)
++
++        import torch
++
++        free = mock.Mock()
++        cache.supports_mamba = lambda: True
++        cache.req_to_token_pool = types.SimpleNamespace(
++            mamba_allocator=types.SimpleNamespace(free=free)
++        )
++        req = types.SimpleNamespace(
++            rid=rid,
++            cache_request_handle=handle,
++            kv=types.SimpleNamespace(
++                holds_kv=False,
++                holds_mamba=True,
++                is_kv_released=True,
++                mamba_pool_idx=torch.tensor([3]),
++            ),
++        )
++
++        release_kv_cache(req, cache, checkpoint=False)
++
++        free.assert_called_once()
++        self.assertIsNone(req.kv.mamba_pool_idx)
++        self.assertEqual(cache.lmcache_connector.finish_request_calls, [rid])
++
++
++class _FakeKv:
++    def __init__(self, *, holds_kv):
++        self.holds_kv = holds_kv
++        self.holds_mamba = False
++        self.is_kv_released = not holds_kv
++        self.cache_protected_len = 0
++        self.kv_allocated_len = 4 if holds_kv else 0
++        self.kv_committed_len = 4 if holds_kv else 0
++
++    def mark_kv_released(self):
++        self.holds_kv = False
++        self.is_kv_released = True
++
++
++class _RecordingCache:
++    def __init__(self):
++        self.ops = []
++        self.req_to_token_pool = types.SimpleNamespace(free=mock.Mock())
++        self.token_to_kv_pool_allocator = types.SimpleNamespace(page_size=1)
++
++    def finish(self, handle, outcome):
++        self.assert_outcome(outcome)
++        self.ops.append("cancel")
++
++    @staticmethod
++    def assert_outcome(outcome):
++        if outcome != CacheRequestOutcome.ABORT:
++            raise AssertionError(f"unexpected cache outcome: {outcome}")
++
++    def finish_request_session(self, handle):
++        self.ops.append("end_session")
++
++    def claim_kv_row(self, req):
++        return False
++
++    def checkpoint(self, req, *, up_to):
++        self.ops.append("store")
++
++    def free_kv_row(self, kv, ranges):
++        pass
++
++    def unlock(self, lock):
++        pass
++
++    def on_release(self, req, *, checkpointed):
++        pass
++
++    def supports_mamba(self):
++        return False
++
++
++def _make_abort_req(*, holds_kv):
++    rid = "rid-helper"
++    kv = _FakeKv(holds_kv=holds_kv)
++    req = types.SimpleNamespace(
++        rid=rid,
++        cache_request_handle=CacheRequestHandle(rid=rid, attempt_id=0),
++        kv=kv,
++        owned_kv_len=lambda: 4 if holds_kv else 0,
++        skip_radix_cache_insert=False,
++        finished=lambda: True,
++        refresh_fill_ids=lambda: None,
++        lock=object(),
++    )
++    return req
++
++
++class TestAbortOrdering(unittest.TestCase):
++    def setUp(self):
++        self._runtime_patch = mock.patch.multiple(
++            "sglang.srt.mem_cache.common",
++            get_spec=lambda: types.SimpleNamespace(speculative_algorithm=None),
++            get_serving=lambda: types.SimpleNamespace(strip_thinking_cache=False),
++        )
++        self._runtime_patch.start()
++        self.addCleanup(self._runtime_patch.stop)
++
++    def test_abort_without_kv_closes_session_after_cancel(self):
++        cache = _RecordingCache()
++        abort_prefix_cache_request(_make_abort_req(holds_kv=False), cache)
++        self.assertEqual(cache.ops, ["cancel", "end_session"])
++
++    def test_abort_with_store_closes_session_last(self):
++        cache = _RecordingCache()
++        abort_prefix_cache_request(
++            _make_abort_req(holds_kv=True), cache, release_kv=True, checkpoint=True
++        )
++        self.assertEqual(cache.ops, ["cancel", "store", "end_session"])
++
++    def test_mamba_only_release_closes_session_once(self):
++        import torch
++
++        cache = _RecordingCache()
++        cache.supports_mamba = lambda: True
++        cache.req_to_token_pool = types.SimpleNamespace(
++            mamba_allocator=types.SimpleNamespace(free=mock.Mock())
++        )
++        req = _make_abort_req(holds_kv=False)
++        req.kv = types.SimpleNamespace(
++            holds_kv=False,
++            holds_mamba=True,
++            is_kv_released=True,
++            mamba_pool_idx=torch.tensor([3]),
++        )
++
++        abort_prefix_cache_request(
++            req, cache, release_kv=True, checkpoint=False
++        )
++
++        self.assertEqual(cache.ops, ["cancel", "end_session"])
++        cache.req_to_token_pool.mamba_allocator.free.assert_called_once()
++        self.assertIsNone(req.kv.mamba_pool_idx)
++
++
++def _install_flexkv_stubs():
++    modules = {}
++    for name in (
++        "flexkv",
++        "flexkv.common",
++        "flexkv.common.request",
++        "flexkv.common.storage",
++        "flexkv.integration",
++        "flexkv.integration.config",
++        "flexkv.kvmanager",
++        "flexkv.server",
++        "flexkv.server.client",
++        "flexkv.transfer",
++        "flexkv.transfer.layerwise",
++        "flexkv.transfer_manager",
++    ):
++        modules[name] = types.ModuleType(name)
++    modules["flexkv.common.request"].KVResponseStatus = object
++    modules["flexkv.common.storage"].KVCacheLayout = object
++    modules["flexkv.common.storage"].KVCacheLayoutType = object
++    modules["flexkv.integration.config"].FlexKVConfig = object
++    modules["flexkv.kvmanager"].KVManager = object
++    modules["flexkv.server.client"].KVTPClient = object
++    modules["flexkv.transfer.layerwise"].build_layerwise_eventfd_socket_path = (
++        lambda *args, **kwargs: ""
++    )
++    modules["flexkv.transfer_manager"].TransferManagerOnRemote = object
++    return mock.patch.dict(sys.modules, modules)
++
++
++class _FakeFlexKVConnector:
++    def __init__(self):
++        self.released = []
++        self.cancelled_prefetch = []
++
++    def release_pending(self, handle):
++        self.released.append(handle)
++
++    def cancel_prefetch(self, handle):
++        self.cancelled_prefetch.append(handle)
++
++
++class TestFlexKVAbortOrdering(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        module = _import_under_stubs(_FLEXKV_MODULE, _install_flexkv_stubs)
++        cls.FlexKVRadixCache = module.FlexKVRadixCache
++
++    def _make_cache(self):
++        cache = object.__new__(self.FlexKVRadixCache)
++        cache._load_markers = {}
++        cache._inflight_store_nodes = {}
++        cache._node_lock = threading.Lock()
++        cache._lock_refs = {}
++        cache.inc_lock_ref = lambda node: cache._lock_refs.__setitem__(
++            id(node), cache._lock_refs.get(id(node), 0) + 1
++        )
++        cache.dec_lock_ref = lambda node, params=None: cache._lock_refs.__setitem__(
++            id(node), cache._lock_refs.get(id(node), 0) - 1
++        )
++        cache.flexkv_connector = _FakeFlexKVConnector()
++        return cache
++
++    def test_cancel_before_store_keeps_new_store_lock(self):
++        cache = self._make_cache()
++        handle = CacheRequestHandle(rid="rid-flexkv", attempt_id=0)
++
++        cache.cancel_aborted_request_work(handle)
++        node = object()
++        cache.inc_lock_ref(node)
++        with cache._node_lock:
++            cache._inflight_store_nodes[handle] = node
++
++        self.assertIs(cache._inflight_store_nodes[handle], node)
++        self.assertEqual(cache._lock_refs[id(node)], 1)
++        self.assertEqual(cache.flexkv_connector.released, [handle])
++        self.assertEqual(cache.flexkv_connector.cancelled_prefetch, [handle])
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.56.0.windows.4
+
