@@ -724,7 +724,7 @@ def main():
         server_args.append("--enable-custom-logit-processor")
     launch = [
         "-m",
-        "elastic_kv",
+        "elastic_kv.launch",
         "--elastic-runtime-profile",
         "minimax-hisparse",
     ]

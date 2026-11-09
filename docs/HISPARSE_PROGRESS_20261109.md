@@ -53,3 +53,16 @@ HiSparse 可在内核里读取 mapped host memory，因此显式 memcpy 字节�
 其余组顺序执行；结果完成前不进入性能表。它通过本机查询检查资源，本地复用同一
 SSH 连接跟进。旧应用定时检查经核实已暂停。
 等待任务的状态文件只是定位信息，接续时必须核实进程、容器和 GPU，不能重复启动。
+
+### 统一入口的 spawn 缺陷
+
+静态组首次恢复启动后，在模型加载前被 SM90 最低能力检查拒绝。根因是
+`python -m elastic_kv` 的入口是包的 `__main__`；Python multiprocessing spawn
+不会重建这种模块，因此 worker 没有执行原有的 SM80 投影适配。这个问题也可能影响
+依赖同一导入入口的其他 worker hooks，CPU 中直接调用安装函数的测试不能覆盖它。
+
+已将实验 runner 改为 `python -m elastic_kv.launch`，包入口也通过 `runpy` 暴露
+实际启动模块。新增测试启动真实 spawn 子进程，以每个进程自身 PID 核对安装行为：
+旧包入口可复现失败，两个修正入口均通过。容器完整 CPU 测试更新为 599 passed、
+3 skipped，另有 186 subtests passed。失败结果保留，后续采用新目录重试；仍须由
+真实模型启动和推理验证这些 hooks，而不能只凭这项 CPU 回归宣称已恢复性能对照。
