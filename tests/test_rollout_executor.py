@@ -445,6 +445,84 @@ class RolloutExecutorTest(unittest.TestCase):
         )
         self.assertEqual(result["summary"]["prefill_headroom_demotions"], 1)
 
+    def test_first_token_releases_prefill_workspace_for_later_admission(self):
+        base = submission()
+        hint = {
+            key: value
+            for key, value in base.hint.items()
+            if key != "deadline_after_ms"
+        }
+        first = RolloutSubmission(
+            request_id="first",
+            planned_arrival_ms=0,
+            submit_at_ms=0,
+            estimated_finish_ms=100,
+            kind=base.kind,
+            prompt_tokens=50,
+            output_tokens=50,
+            hint={**hint, "expected_output_tokens": 50},
+        )
+        second = RolloutSubmission(
+            request_id="second",
+            planned_arrival_ms=0,
+            submit_at_ms=0,
+            estimated_finish_ms=100,
+            kind=base.kind,
+            prompt_tokens=100,
+            output_tokens=50,
+            hint={**hint, "expected_output_tokens": 50},
+        )
+        first_started = threading.Event()
+        second_started = threading.Event()
+
+        def generate(url, spec, timeout, stream):
+            started = time.perf_counter()
+            first_token_callback = spec[rollout_module.FIRST_TOKEN_CALLBACK_KEY]
+            first_token_callback(started + 0.004)
+            if spec["request_id"] == "first":
+                first_started.set()
+                self.assertTrue(second_started.wait(1.0))
+            else:
+                self.assertTrue(first_started.is_set())
+                second_started.set()
+            return {
+                "_started_perf_s": started,
+                "end_to_end_s": 0.02,
+                "output_tokens": 50,
+                "ttft_s": 0.004,
+                "tpot_s": 0.0001,
+            }
+
+        result = execute_rollout(
+            "http://server/generate",
+            [first, second],
+            generator=generate,
+            elastic_kv_config=ElasticKVConfig(
+                memory_budget_bytes=1_400,
+                kv_bytes_per_token=2,
+                sparse_hot_tokens=64,
+                prefill_workspace_bytes_per_token=7,
+            ),
+            poll_interval_ms=1,
+        )
+
+        by_id = {row["request_id"]: row for row in result["requests"]}
+        self.assertEqual(by_id["first"]["runtime_residence"], "resident")
+        self.assertEqual(by_id["second"]["runtime_residence"], "resident")
+        self.assertEqual(
+            result["summary"]["prefill_headroom_demotions"],
+            0,
+        )
+        self.assertEqual(
+            result["summary"]["prefill_workspace_released_early"],
+            2,
+        )
+        self.assertEqual(
+            result["summary"]["prefill_workspace_held_until_completion"],
+            0,
+        )
+        self.assertTrue(by_id["second"]["prefill_workspace_released_early"])
+
     def test_runtime_activation_over_budget_reports_peak_cause(self):
         request = RolloutSubmission(
             request_id="large-activation",

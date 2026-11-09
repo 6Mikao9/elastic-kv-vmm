@@ -331,6 +331,12 @@ and the bounded future reservation. Per-request evidence separates persistent KV
 from `elastic_prefill_peak_bytes` and `elastic_future_effective_peak_bytes`, so a
 dropped arm can be attributed to activation pressure instead of being reported as
 ordinary KV contention.
+The streaming executor now releases a request's activation-workspace charge
+when the server emits its first positive-token event, while its predicted KV
+stays charged through completion. This avoids holding prefill headroom through
+a long decode solely because the executor cannot see SGLang's internal prefill
+boundary. Per-request telemetry records the release delay and the summary counts
+early releases versus requests whose workspace remained charged to completion.
 Future reservations use the peak concurrent demand of anticipated intervals and
 protect deadlines only while waiting behind the current request would consume
 feasible slack. Intervals already backlogged past their planned finish retain a

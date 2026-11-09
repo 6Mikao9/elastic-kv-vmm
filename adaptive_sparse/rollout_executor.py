@@ -21,7 +21,7 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +38,8 @@ from .sglang_future_hook import (
     RATE_ACTION_VERSION,
     FutureHint,
 )
+
+FIRST_TOKEN_CALLBACK_KEY = "_elastic_first_token_callback"
 
 
 class RolloutExecutionError(RuntimeError):
@@ -423,7 +425,15 @@ def _wait_until(target: float, clock: ReplayClock) -> None:
 def _default_generate(url: str, spec: dict[str, object], timeout: float, stream: bool) -> dict[str, object]:
     from benchmarks.client import generate
 
-    return generate(url, spec, timeout, stream)
+    wire_spec = dict(spec)
+    first_token_callback = wire_spec.pop(FIRST_TOKEN_CALLBACK_KEY, None)
+    return generate(
+        url,
+        wire_spec,
+        timeout,
+        stream,
+        first_token_callback=first_token_callback,
+    )
 
 
 def _deadline_target_ms(submission: RolloutSubmission) -> int | None:
@@ -567,22 +577,35 @@ def _efficiency(rows: Sequence[dict[str, object]]) -> dict[str, float]:
 @dataclass(slots=True)
 class _PendingRequest:
     submission: RolloutSubmission
-    future: Any
+    future: Any | None
     dispatch_lateness_ms: float
     capacity_delay_ms: float
     admission: ElasticAdmissionDecision | None
     prefill_tokens_per_s_hint: float | None = None
     decode_tokens_per_s_hint: float | None = None
     decode_feedback_residence: str | None = None
+    prefill_released: threading.Event = field(default_factory=threading.Event)
+    prefill_release_perf_s: float | None = None
+
+    def mark_prefill_released(self, now_s: float) -> None:
+        if self.prefill_released.is_set():
+            return
+        if not math.isfinite(now_s):
+            raise ValueError("first-token clock must be finite")
+        self.prefill_release_perf_s = now_s
+        self.prefill_released.set()
 
     @property
     def hold_bytes(self) -> int:
         if self.admission is None:
             return 0
-        # The executor cannot observe SGLang's exact prefill completion boundary.
-        # Keep each in-flight request's workspace charged until completion; this
-        # is a conservative upper bound when multiple prefills overlap.
-        return _admission_hold_bytes(self.admission)
+        kv_bytes = (
+            self.admission.active_after_bytes
+            - self.admission.active_before_bytes
+        )
+        if self.prefill_released.is_set():
+            return kv_bytes
+        return kv_bytes + self.admission.prefill_workspace_bytes
 
 
 def _duration_ms(
@@ -944,6 +967,31 @@ def _execute_managed_rollout(
                 row["service_time_decode_feedback_residence"] = (
                     item.decode_feedback_residence
                 )
+                release_s = item.prefill_release_perf_s
+                response_finished_s = float(record["_started_perf_s"]) + float(
+                    record["end_to_end_s"]
+                )
+                has_prefill_workspace = bool(
+                    item.admission is not None
+                    and item.admission.prefill_workspace_bytes > 0
+                )
+                row["prefill_workspace_released_early"] = (
+                    None
+                    if not has_prefill_workspace
+                    else (
+                        release_s is not None
+                        and release_s < response_finished_s
+                    )
+                )
+                row["prefill_workspace_release_after_ms"] = (
+                    None
+                    if release_s is None or not has_prefill_workspace
+                    else max(
+                        0.0,
+                        (release_s - float(record["_started_perf_s"]))
+                        * 1000.0,
+                    )
+                )
                 if service_time_estimator is not None:
                     try:
                         service_time_estimator.observe(
@@ -1160,27 +1208,28 @@ def _execute_managed_rollout(
                         ),
                     )
                 queue.remove(member)
+                pending_item = _PendingRequest(
+                    submission=member,
+                    future=None,
+                    dispatch_lateness_ms=dispatch_lateness_ms,
+                    capacity_delay_ms=capacity_delay_ms,
+                    admission=admission,
+                    prefill_tokens_per_s_hint=emitted_feedback.get(
+                        "prefill_tokens_per_s"
+                    ),
+                    decode_tokens_per_s_hint=emitted_feedback.get(
+                        "decode_tokens_per_s"
+                    ),
+                    decode_feedback_residence=_service_time_residence(
+                        emitted_residence
+                    ),
+                )
+                spec[FIRST_TOKEN_CALLBACK_KEY] = pending_item.mark_prefill_released
                 future = pool.submit(
                     synchronized_generate, url, spec, timeout_s, stream
                 )
-                pending.append(
-                    _PendingRequest(
-                        submission=member,
-                        future=future,
-                        dispatch_lateness_ms=dispatch_lateness_ms,
-                        capacity_delay_ms=capacity_delay_ms,
-                        admission=admission,
-                        prefill_tokens_per_s_hint=emitted_feedback.get(
-                            "prefill_tokens_per_s"
-                        ),
-                        decode_tokens_per_s_hint=emitted_feedback.get(
-                            "decode_tokens_per_s"
-                        ),
-                        decode_feedback_residence=_service_time_residence(
-                            emitted_residence
-                        ),
-                    )
-                )
+                pending_item.future = future
+                pending.append(pending_item)
         harvest()
     return rows, failures, scheduler_stats
 
@@ -1305,6 +1354,12 @@ def _finalize_rollout(
         "prefill_headroom_demotions": sum(
             row.get("elastic_admission_reason") == "prefill-headroom-demotion"
             for row in rows
+        ),
+        "prefill_workspace_released_early": sum(
+            row.get("prefill_workspace_released_early") is True for row in rows
+        ),
+        "prefill_workspace_held_until_completion": sum(
+            row.get("prefill_workspace_released_early") is False for row in rows
         ),
         "cohort_count": len(cohorts),
         "batched_cohort_count": sum(

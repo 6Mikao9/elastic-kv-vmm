@@ -849,11 +849,14 @@ KV 与 prefill workspace 共同使峰值越界时记为
 但不含当前请求自己的 prefill workspace；`future_effective_peak_bytes` 才是把
 当前 prefill 也加入后的完整容量判定账本。`future_over_budget` 与
 `prefill_over_budget` 分别保留未来预留和当前 prefill 的归因，
-`future_peak_over_budget` 才汇总两者。执行器在无法观察 SGLang 精确 prefill
-完成边界时，会把每个在途请求的 workspace 保守计到请求结束，避免多个并发
-prefill 漏记。汇总记录
+`future_peak_over_budget` 才汇总两者。执行器在流式客户端收到首个正 token 事件时
+释放该请求的 activation-workspace 预占，而预测 KV 继续计到请求完成；每个请求记录
+`prefill_workspace_release_after_ms` 和是否提前释放。非流式或没有首 token 回调的
+运行仍保守计到结束，避免在无法观察边界时漏记并发 prefill。汇总记录
 `future_reservation_admissions`、`future_reservation_demotions` 与
-`prefill_headroom_demotions`。
+`prefill_headroom_demotions`，并分别统计
+`prefill_workspace_released_early` 与
+`prefill_workspace_held_until_completion`。
 
 启用服务时间反馈后，当前请求时长以及未来请求的重叠区间改用最新 EWMA 重算；
 准入前默认等待 3 个有效完成样本，避免首个噪声样本引发降级。每个请求的

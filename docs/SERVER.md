@@ -176,6 +176,13 @@ also emits `release_clock=perf_counter` and `release_absolute_ms`, so the local
 server does not add HTTP or tokenization delay to the requested release instant;
 cross-host clients require clock calibration before using the absolute field.
 
+The controlled rollout executor's streaming path also updates its own admission
+ledger at the first positive-token event. That request's calibrated prefill
+workspace charge is released while its persistent KV remains charged until
+completion. The CPU path is covered; paired serving runs must still calibrate
+the workspace rate and confirm that first-token timing is a safe proxy for the
+target SGLang prefill boundary.
+
 For active MiniMax KV demotion, `EKV_ADAPTIVE_DEADLINE_GUARD_MS` (default
 `500`) protects requests whose hinted deadline is imminent. Within the same
 guard tier, demotion candidate efficiency is adjusted by hint weight,

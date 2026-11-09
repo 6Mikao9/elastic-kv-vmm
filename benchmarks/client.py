@@ -18,16 +18,15 @@ import hashlib
 import json
 import math
 import os
-from pathlib import Path
 import statistics
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from pathlib import Path
 
 import requests
-
 
 WORKLOADS = {
     "short_serial": (1, [(128, 64)] * 6),
@@ -186,7 +185,9 @@ def validate_response(data):
     return meta
 
 
-def generate(url, spec, timeout, stream=True):
+def generate(url, spec, timeout, stream=True, first_token_callback=None):
+    if first_token_callback is not None and not callable(first_token_callback):
+        raise BenchmarkError("first_token_callback must be callable")
     body = payload_for(spec, stream)
     started = time.perf_counter()
     first_token = None
@@ -196,7 +197,7 @@ def generate(url, spec, timeout, stream=True):
     ids_complete, id_gaps = True, []
     # One independent HTTP session per request avoids shared mutable Session state.
     # Both modes use this same connection policy; connection setup is timed.
-    with requests.Session() as session:
+    with requests.Session() as session:  # noqa: SIM117 - keep response lifetime explicit
         with session.post(url, json=body, stream=stream, timeout=(10, timeout)) as response:
             if response.status_code != 200:
                 raise BenchmarkError(f"generation HTTP status {response.status_code}")
@@ -213,6 +214,8 @@ def generate(url, spec, timeout, stream=True):
                         raise BenchmarkError("stream completion count went backwards")
                     if count and first_token is None:
                         first_token = now
+                        if first_token_callback is not None:
+                            first_token_callback(now)
                     incoming = token_ids_from_response(data, first_chunk=final is None)
                     if incoming is not None:
                         saw_ids = True
@@ -334,7 +337,7 @@ class MemorySampler:
         try:
             while not self.stop.wait(SAMPLE_SECONDS):
                 self.take()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - surface sampler failures to the caller
             self.error = exc
             self.stop.set()
 
@@ -577,7 +580,7 @@ def main():
         correctness["status"] = "complete"
         write_json(correctness_path, correctness)
         return 0
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - preserve completed run evidence
         # Keep completed real records; never replace failed observations with estimates.
         target = performance if performance["status"] != "complete" else correctness
         target["status"] = "failed"
