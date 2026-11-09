@@ -134,6 +134,21 @@ charged because their Top-K hot set is not guaranteed to retain the prefix.
 This is planning and transport evidence; the current radix-disabled SGLang
 runtime does not yet reference another request's resident KV or resolve a
 Top-K hit from it.
+Active-prefix prefill reuse now has a fail-closed execution guard: a rollout that
+turns on the timing model must explicitly prove that the launched SGLang
+instance has radix caching enabled. This prevents the existing radix-disabled
+adapter and smoke runners from consuming planner-only prefix credit as if it
+were a real hit. The guard does not implement shared VMM backing or relax the
+adapter's current radix-cache rejection.
+
+Known-future timing can now consume a measured aggregate decode-throughput
+profile at exact co-batch sizes. The planner divides aggregate throughput by the
+batch size, records the estimate used by each admission, and emits the matching
+per-stream rate in the rollout hint. Missing measurements retain the ordinary
+linear model and are never interpolated. Because an already-admitted request is
+not rewritten when a later request joins its batch, the next step is to collect
+real SGLang co-batch traces and compare predicted with observed TTFT, TPOT and
+makespan before treating the profile as a serving performance claim.
 
 The controller now also tracks the real in-flight set.  A bounded concurrency
 mode turns planned timestamps into earliest admission times, deadline ordering
