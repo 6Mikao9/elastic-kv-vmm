@@ -83,6 +83,8 @@ class ServiceTimeSnapshot:
     host_backed_decode_tokens_per_s: float | None
     resident_decode_samples: int
     host_backed_decode_samples: int
+    prefill_buckets: tuple[tuple[str, int, float, int], ...]
+    decode_buckets: tuple[tuple[str, str, int, float, int], ...]
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -103,6 +105,25 @@ class ServiceTimeSnapshot:
                 "resident": self.resident_decode_samples,
                 "host_backed": self.host_backed_decode_samples,
             },
+            "prefill_buckets": [
+                {
+                    "kind": kind,
+                    "batch_size": batch_size,
+                    "tokens_per_s": rate,
+                    "samples": samples,
+                }
+                for kind, batch_size, rate, samples in self.prefill_buckets
+            ],
+            "decode_buckets": [
+                {
+                    "residence": residence,
+                    "kind": kind,
+                    "batch_size": batch_size,
+                    "tokens_per_s": rate,
+                    "samples": samples,
+                }
+                for residence, kind, batch_size, rate, samples in self.decode_buckets
+            ],
         }
 
 
@@ -159,6 +180,12 @@ class ServiceTimeEstimator:
         self._decode_samples_by_residence = {
             mode: 0 for mode in RESIDENCE_MODES
         }
+        self._prefill_by_bucket: dict[tuple[str, int], float | None] = {}
+        self._prefill_samples_by_bucket: dict[tuple[str, int], int] = {}
+        self._decode_by_bucket: dict[
+            tuple[str, str, int], float | None
+        ] = {}
+        self._decode_samples_by_bucket: dict[tuple[str, str, int], int] = {}
         self._lock = threading.Lock()
 
     @staticmethod
@@ -175,6 +202,9 @@ class ServiceTimeEstimator:
         ttft_s: float,
         tpot_s: float,
         residence: str | None = None,
+        kind: str | None = None,
+        prefill_batch_size: int | None = None,
+        decode_batch_size: int | None = None,
     ) -> ServiceTimeSnapshot:
         """Update service rate, optionally separating the decode placement."""
 
@@ -194,6 +224,19 @@ class ServiceTimeEstimator:
                 raise ValueError(f"{name} must be finite and positive")
         if residence is not None and residence not in RESIDENCE_MODES:
             raise ValueError("residence must be resident or host_backed")
+        kind = _optional_kind(kind)
+        prefill_batch_size = _optional_batch_size(
+            prefill_batch_size, "prefill_batch_size"
+        )
+        decode_batch_size = _optional_batch_size(
+            decode_batch_size, "decode_batch_size"
+        )
+        if (kind is None) != (prefill_batch_size is None):
+            raise ValueError("kind and prefill_batch_size must be supplied together")
+        if decode_batch_size is not None and (residence is None or kind is None):
+            raise ValueError(
+                "decode_batch_size requires residence and kind"
+            )
 
         prefill_sample, prefill_clipped = _clip_rate(prompt_tokens / float(ttft_s))
         decode_sample, decode_clipped = _clip_rate(1.0 / float(tpot_s))
@@ -207,6 +250,22 @@ class ServiceTimeEstimator:
                     self._alpha,
                 )
                 self._decode_samples_by_residence[residence] += 1
+            if kind is not None and prefill_batch_size is not None:
+                key = (kind, prefill_batch_size)
+                self._prefill_by_bucket[key] = _ewma(
+                    self._prefill_by_bucket.get(key), prefill_sample, self._alpha
+                )
+                self._prefill_samples_by_bucket[key] = (
+                    self._prefill_samples_by_bucket.get(key, 0) + 1
+                )
+            if residence is not None and kind is not None and decode_batch_size is not None:
+                key = (residence, kind, decode_batch_size)
+                self._decode_by_bucket[key] = _ewma(
+                    self._decode_by_bucket.get(key), decode_sample, self._alpha
+                )
+                self._decode_samples_by_bucket[key] = (
+                    self._decode_samples_by_bucket.get(key, 0) + 1
+                )
             self._prefill_samples += 1
             self._decode_samples += 1
             self._clipped_prefill_samples += int(prefill_clipped)
@@ -219,11 +278,31 @@ class ServiceTimeEstimator:
         with self._lock:
             self._rejected_samples += 1
 
-    def rates(self, *, residence: str | None = None) -> dict[str, float]:
+    def rates(
+        self,
+        *,
+        residence: str | None = None,
+        kind: str | None = None,
+        prefill_batch_size: int | None = None,
+        decode_batch_size: int | None = None,
+    ) -> dict[str, float]:
         """Return ready feedback without leaking an immature or cross-mode EWMA."""
 
         if residence is not None and residence not in RESIDENCE_MODES:
             raise ValueError("residence must be resident or host_backed")
+        kind = _optional_kind(kind)
+        prefill_batch_size = _optional_batch_size(
+            prefill_batch_size, "prefill_batch_size"
+        )
+        decode_batch_size = _optional_batch_size(
+            decode_batch_size, "decode_batch_size"
+        )
+        if (kind is None) != (prefill_batch_size is None):
+            raise ValueError("kind and prefill_batch_size must be supplied together")
+        if decode_batch_size is not None and (residence is None or kind is None):
+            raise ValueError(
+                "decode_batch_size requires residence and kind"
+            )
         with self._lock:
             result: dict[str, float] = {}
             if self._prefill is not None and (
@@ -243,6 +322,28 @@ class ServiceTimeEstimator:
                     >= self._min_samples
                 ):
                     result["decode_tokens_per_s"] = decode
+            if kind is not None and prefill_batch_size is not None:
+                key = (kind, prefill_batch_size)
+                if key in self._prefill_by_bucket:
+                    result.pop("prefill_tokens_per_s", None)
+                    rate = self._prefill_by_bucket[key]
+                    if (
+                        rate is not None
+                        and self._prefill_samples_by_bucket[key]
+                        >= self._min_samples
+                    ):
+                        result["prefill_tokens_per_s"] = rate
+            if residence is not None and kind is not None and decode_batch_size is not None:
+                key = (residence, kind, decode_batch_size)
+                if key in self._decode_by_bucket:
+                    result.pop("decode_tokens_per_s", None)
+                    rate = self._decode_by_bucket[key]
+                    if (
+                        rate is not None
+                        and self._decode_samples_by_bucket[key]
+                        >= self._min_samples
+                    ):
+                        result["decode_tokens_per_s"] = rate
             return result
 
     def snapshot(self) -> ServiceTimeSnapshot:
@@ -268,6 +369,24 @@ class ServiceTimeEstimator:
             host_backed_decode_samples=self._decode_samples_by_residence[
                 "host_backed"
             ],
+            prefill_buckets=tuple(
+                (kind, batch_size, rate, self._prefill_samples_by_bucket[key])
+                for key, rate in sorted(self._prefill_by_bucket.items())
+                for kind, batch_size in (key,)
+                if rate is not None
+            ),
+            decode_buckets=tuple(
+                (
+                    residence,
+                    kind,
+                    batch_size,
+                    rate,
+                    self._decode_samples_by_bucket[key],
+                )
+                for key, rate in sorted(self._decode_by_bucket.items())
+                for residence, kind, batch_size in (key,)
+                if rate is not None
+            ),
         )
 
 
@@ -282,6 +401,22 @@ def _validated_rate(value: object, name: str) -> float:
             f"{name} must be finite and in [{MIN_SERVICE_RATE}, {MAX_SERVICE_RATE}]"
         )
     return float(value)
+
+
+def _optional_kind(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value or len(value) > 64:
+        raise ValueError("kind must be a short non-empty string")
+    return value
+
+
+def _optional_batch_size(value: object, name: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
 
 
 def _clip_rate(value: float) -> tuple[float, bool]:

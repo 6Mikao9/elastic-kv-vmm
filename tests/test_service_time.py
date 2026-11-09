@@ -167,6 +167,194 @@ class ServiceTimeEstimatorTest(unittest.TestCase):
             {"resident": 1_000.0, "host_backed": 250.0},
         )
 
+    def test_prefill_feedback_is_isolated_by_kind_and_batch_size(self):
+        estimator = ServiceTimeEstimator(alpha=1.0, min_samples=1)
+        samples = (
+            ("chat", 1, 10_000.0),
+            ("chat", 8, 4_000.0),
+            ("tool", 1, 2_000.0),
+        )
+        for kind, batch_size, rate in samples:
+            estimator.observe(
+                prompt_tokens=100,
+                output_tokens=8,
+                ttft_s=100.0 / rate,
+                tpot_s=0.001,
+                kind=kind,
+                prefill_batch_size=batch_size,
+            )
+
+        for kind, batch_size, rate in samples:
+            with self.subTest(kind=kind, batch_size=batch_size):
+                self.assertEqual(
+                    estimator.rates(
+                        kind=kind,
+                        prefill_batch_size=batch_size,
+                    )["prefill_tokens_per_s"],
+                    rate,
+                )
+
+    def test_decode_feedback_is_isolated_by_residence_kind_and_batch(self):
+        estimator = ServiceTimeEstimator(alpha=1.0, min_samples=1)
+        samples = (
+            ("resident", "chat", 1, 1_000.0),
+            ("host_backed", "chat", 1, 250.0),
+            ("resident", "tool", 1, 500.0),
+            ("resident", "chat", 4, 125.0),
+        )
+        for residence, kind, batch_size, rate in samples:
+            estimator.observe(
+                prompt_tokens=100,
+                output_tokens=8,
+                ttft_s=0.01,
+                tpot_s=1.0 / rate,
+                residence=residence,
+                kind=kind,
+                prefill_batch_size=1,
+                decode_batch_size=batch_size,
+            )
+
+        for residence, kind, batch_size, rate in samples:
+            with self.subTest(
+                residence=residence,
+                kind=kind,
+                batch_size=batch_size,
+            ):
+                self.assertEqual(
+                    estimator.rates(
+                        residence=residence,
+                        kind=kind,
+                        prefill_batch_size=1,
+                        decode_batch_size=batch_size,
+                    )["decode_tokens_per_s"],
+                    rate,
+                )
+
+    def test_immature_exact_bucket_withholds_coarse_feedback(self):
+        estimator = ServiceTimeEstimator(alpha=1.0, min_samples=2)
+        estimator.observe(
+            prompt_tokens=1_000,
+            output_tokens=8,
+            ttft_s=0.1,
+            tpot_s=0.001,
+            residence="resident",
+            kind="chat",
+            prefill_batch_size=1,
+            decode_batch_size=2,
+        )
+        estimator.observe(
+            prompt_tokens=200,
+            output_tokens=8,
+            ttft_s=0.1,
+            tpot_s=0.002,
+            residence="resident",
+            kind="chat",
+            prefill_batch_size=2,
+            decode_batch_size=4,
+        )
+
+        self.assertEqual(
+            estimator.rates(
+                residence="resident",
+                kind="chat",
+                prefill_batch_size=1,
+                decode_batch_size=2,
+            ),
+            {},
+        )
+        unseen = estimator.rates(
+            residence="resident",
+            kind="chat",
+            prefill_batch_size=3,
+            decode_batch_size=8,
+        )
+        self.assertEqual(unseen["prefill_tokens_per_s"], 2_000.0)
+        self.assertEqual(unseen["decode_tokens_per_s"], 500.0)
+
+    def test_rejects_partial_or_invalid_service_bucket_arguments(self):
+        estimator = ServiceTimeEstimator()
+        invalid_calls = (
+            (
+                {"kind": "chat"},
+                "kind and prefill_batch_size must be supplied together",
+            ),
+            (
+                {"prefill_batch_size": 1},
+                "kind and prefill_batch_size must be supplied together",
+            ),
+            (
+                {"kind": "chat", "prefill_batch_size": 1, "decode_batch_size": 2},
+                "decode_batch_size requires residence and kind",
+            ),
+            (
+                {"kind": "x" * 65, "prefill_batch_size": 1},
+                "kind must be a short non-empty string",
+            ),
+            (
+                {"kind": "chat", "prefill_batch_size": 0},
+                "prefill_batch_size must be a positive integer",
+            ),
+        )
+        for kwargs, message in invalid_calls:
+            with (
+                self.subTest(kwargs=kwargs),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                estimator.observe(
+                    prompt_tokens=10,
+                    output_tokens=1,
+                    ttft_s=0.01,
+                    tpot_s=0.001,
+                    **kwargs,
+                )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "decode_batch_size requires residence and kind",
+        ):
+            estimator.rates(
+                residence="resident",
+                decode_batch_size=2,
+            )
+
+    def test_snapshot_serializes_service_time_buckets(self):
+        estimator = ServiceTimeEstimator(alpha=1.0, min_samples=1)
+        estimator.observe(
+            prompt_tokens=100,
+            output_tokens=8,
+            ttft_s=0.01,
+            tpot_s=0.001,
+            residence="resident",
+            kind="chat",
+            prefill_batch_size=2,
+            decode_batch_size=4,
+        )
+
+        snapshot = estimator.snapshot().as_dict()
+        self.assertEqual(
+            snapshot["prefill_buckets"],
+            [
+                {
+                    "kind": "chat",
+                    "batch_size": 2,
+                    "tokens_per_s": 10_000.0,
+                    "samples": 1,
+                }
+            ],
+        )
+        self.assertEqual(
+            snapshot["decode_buckets"],
+            [
+                {
+                    "residence": "resident",
+                    "kind": "chat",
+                    "batch_size": 4,
+                    "tokens_per_s": 1_000.0,
+                    "samples": 1,
+                }
+            ],
+        )
+
     def test_rejects_invalid_sample_without_changing_rates(self):
         estimator = ServiceTimeEstimator()
 

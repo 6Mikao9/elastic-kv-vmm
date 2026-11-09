@@ -297,6 +297,212 @@ class RolloutExecutorTest(unittest.TestCase):
             {"resident": 2, "host_backed": 2},
         )
 
+    def test_dispatch_feedback_is_isolated_by_decode_batch_size(self):
+        estimator = ServiceTimeEstimator(alpha=1.0, min_samples=1)
+        for batch_size, tpot_s in ((1, 0.001), (4, 0.004)):
+            estimator.observe(
+                prompt_tokens=32,
+                output_tokens=8,
+                ttft_s=0.01,
+                tpot_s=tpot_s,
+                residence="resident",
+                kind="chat",
+                prefill_batch_size=1,
+                decode_batch_size=batch_size,
+            )
+
+        def shaped(request_id, *, submit_at_ms, decode_batch_size):
+            return RolloutSubmission(
+                request_id=request_id,
+                planned_arrival_ms=submit_at_ms,
+                submit_at_ms=submit_at_ms,
+                estimated_finish_ms=submit_at_ms + 100,
+                kind="chat",
+                prompt_tokens=32,
+                output_tokens=8,
+                hint={
+                    "release_after_ms": 0,
+                    "expected_output_tokens": 8,
+                    "weight": 1.0,
+                    "kind": "chat",
+                    "residence": "resident",
+                },
+                decode_batch_size=decode_batch_size,
+            )
+
+        seen = {}
+
+        def generate(url, spec, timeout, stream):
+            request_id = spec["request_id"]
+            seen[request_id] = spec["future_hint"]["actions"][0]["payload"]
+            return {
+                "_started_perf_s": time.perf_counter(),
+                "end_to_end_s": 0.01,
+                "output_tokens": 8,
+                "ttft_s": 0.01,
+                "tpot_s": 0.002,
+            }
+
+        result = execute_rollout(
+            "http://server/generate",
+            [
+                shaped("a-batch-1", submit_at_ms=0, decode_batch_size=1),
+                shaped("z-batch-4", submit_at_ms=0, decode_batch_size=4),
+            ],
+            generator=generate,
+            max_inflight=1,
+            poll_interval_ms=1,
+            max_submit_lateness_ms=10_000,
+            service_time_estimator=estimator,
+        )
+
+        self.assertEqual(seen["a-batch-1"]["decode_tokens_per_s"], 1_000.0)
+        self.assertEqual(seen["z-batch-4"]["decode_tokens_per_s"], 250.0)
+        buckets = result["summary"]["service_time_estimator"][
+            "decode_buckets"
+        ]
+        self.assertEqual(
+            {row["batch_size"] for row in buckets},
+            {1, 4},
+        )
+
+    def test_dispatch_feedback_is_isolated_by_kind_and_residence(self):
+        estimator = ServiceTimeEstimator(alpha=1.0, min_samples=1)
+        for residence, kind, tpot_s in (
+            ("resident", "chat", 0.001),
+            ("host_backed", "tool", 0.004),
+        ):
+            estimator.observe(
+                prompt_tokens=32,
+                output_tokens=8,
+                ttft_s=0.01,
+                tpot_s=tpot_s,
+                residence=residence,
+                kind=kind,
+                prefill_batch_size=1,
+                decode_batch_size=1,
+            )
+
+        def shaped(request_id, *, kind, residence, submit_at_ms):
+            return RolloutSubmission(
+                request_id=request_id,
+                planned_arrival_ms=submit_at_ms,
+                submit_at_ms=submit_at_ms,
+                estimated_finish_ms=submit_at_ms + 100,
+                kind=kind,
+                prompt_tokens=32,
+                output_tokens=8,
+                hint={
+                    "release_after_ms": 0,
+                    "expected_output_tokens": 8,
+                    "weight": 1.0,
+                    "kind": kind,
+                    "residence": residence,
+                },
+            )
+
+        seen = {}
+
+        def generate(url, spec, timeout, stream):
+            request_id = spec["request_id"]
+            seen[request_id] = spec["future_hint"]["actions"][0]["payload"]
+            return {
+                "_started_perf_s": time.perf_counter(),
+                "end_to_end_s": 0.01,
+                "output_tokens": 8,
+                "ttft_s": 0.01,
+                "tpot_s": 0.002,
+            }
+
+        execute_rollout(
+            "http://server/generate",
+            [
+                shaped(
+                    "a-resident-chat",
+                    kind="chat",
+                    residence="resident",
+                    submit_at_ms=0,
+                ),
+                shaped(
+                    "z-host-tool",
+                    kind="tool",
+                    residence="host_backed",
+                    submit_at_ms=0,
+                ),
+            ],
+            generator=generate,
+            max_inflight=1,
+            poll_interval_ms=1,
+            max_submit_lateness_ms=10_000,
+            service_time_estimator=estimator,
+        )
+
+        self.assertEqual(
+            seen["a-resident-chat"]["decode_tokens_per_s"],
+            1_000.0,
+        )
+        self.assertEqual(seen["z-host-tool"]["decode_tokens_per_s"], 250.0)
+
+    def test_immature_exact_bucket_keeps_planned_static_rates(self):
+        estimator = ServiceTimeEstimator(alpha=1.0, min_samples=3)
+        for _ in range(3):
+            estimator.observe(
+                prompt_tokens=32,
+                output_tokens=8,
+                ttft_s=0.01,
+                tpot_s=0.001,
+                residence="resident",
+                kind="seed",
+                prefill_batch_size=99,
+                decode_batch_size=99,
+            )
+
+        def shaped(request_id, submit_at_ms):
+            return RolloutSubmission(
+                request_id=request_id,
+                planned_arrival_ms=submit_at_ms,
+                submit_at_ms=submit_at_ms,
+                estimated_finish_ms=submit_at_ms + 100,
+                kind="chat",
+                prompt_tokens=32,
+                output_tokens=8,
+                hint={
+                    "release_after_ms": 0,
+                    "expected_output_tokens": 8,
+                    "weight": 1.0,
+                    "kind": "chat",
+                    "residence": "resident",
+                    "prefill_tokens_per_s": 1_234.0,
+                    "decode_tokens_per_s": 5_678.0,
+                },
+            )
+
+        seen = {}
+
+        def generate(url, spec, timeout, stream):
+            request_id = spec["request_id"]
+            seen[request_id] = spec["future_hint"]["actions"][0]["payload"]
+            return {
+                "_started_perf_s": time.perf_counter(),
+                "end_to_end_s": 0.01,
+                "output_tokens": 8,
+                "ttft_s": 0.01,
+                "tpot_s": 0.001,
+            }
+
+        execute_rollout(
+            "http://server/generate",
+            [shaped("a-first", 0), shaped("z-second", 0)],
+            generator=generate,
+            max_inflight=1,
+            poll_interval_ms=1,
+            max_submit_lateness_ms=10_000,
+            service_time_estimator=estimator,
+        )
+
+        self.assertEqual(seen["z-second"]["prefill_tokens_per_s"], 1_234.0)
+        self.assertEqual(seen["z-second"]["decode_tokens_per_s"], 5_678.0)
+
     def test_runtime_budget_demotes_only_the_new_request(self):
         base = submission()
         first = RolloutSubmission(

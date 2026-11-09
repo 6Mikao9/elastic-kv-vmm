@@ -166,6 +166,37 @@ def _service_time_residence(value: object) -> str | None:
     return value if value in ("resident", "host_backed") else None
 
 
+def _submission_service_rates(
+    estimator: ServiceTimeEstimator | None,
+    submission: RolloutSubmission,
+    *,
+    residence: object | None = None,
+) -> dict[str, float]:
+    """Read feedback for one request's actual batch shape and placement."""
+
+    if estimator is None:
+        return {}
+    planned_residence = (
+        FutureHint.from_payload(dict(submission.hint)).residence
+        if residence is None
+        else residence
+    )
+    decode_residence = _service_time_residence(planned_residence)
+    rates = estimator.rates(
+        residence=decode_residence,
+        kind=submission.kind,
+        prefill_batch_size=submission.prefill_batch_size,
+        decode_batch_size=(
+            submission.decode_batch_size
+            if decode_residence is not None
+            else None
+        ),
+    )
+    if decode_residence is None:
+        rates.pop("decode_tokens_per_s", None)
+    return rates
+
+
 def make_kv_hints(
     submission: RolloutSubmission,
     *,
@@ -640,6 +671,7 @@ def _select_due(
     prefill_tokens_per_s: float | None = None,
     decode_tokens_per_s: float | None = None,
     decode_tokens_per_s_by_residence: Mapping[str, float | None] | None = None,
+    service_time_estimator: ServiceTimeEstimator | None = None,
 ) -> RolloutSubmission:
     if policy == "timeline":
         return min(due, key=lambda item: (item.submit_at_ms, item.request_id))
@@ -648,11 +680,22 @@ def _select_due(
 
     def key(item: RolloutSubmission) -> tuple[object, ...]:
         hint = FutureHint.from_payload(dict(item.hint))
-        placement_decode = (
-            None
-            if decode_tokens_per_s_by_residence is None
-            else decode_tokens_per_s_by_residence.get(hint.residence)
+        item_feedback = _submission_service_rates(
+            service_time_estimator,
+            item,
         )
+        if service_time_estimator is not None:
+            item_prefill = item_feedback.get("prefill_tokens_per_s")
+            item_decode = item_feedback.get("decode_tokens_per_s")
+        else:
+            item_prefill = prefill_tokens_per_s
+            item_decode = (
+                decode_tokens_per_s
+                if decode_tokens_per_s_by_residence is None
+                else decode_tokens_per_s_by_residence.get(hint.residence)
+            )
+            if item_decode is None:
+                item_decode = decode_tokens_per_s
         if item.deadline_ms is not None:
             predicted_duration = _duration_ms(
                 item,
@@ -660,12 +703,8 @@ def _select_due(
                 fallback_ms=max(
                     1, item.estimated_finish_ms - item.submit_at_ms
                 ),
-                prefill_tokens_per_s=prefill_tokens_per_s,
-                decode_tokens_per_s=(
-                    placement_decode
-                    if placement_decode is not None
-                    else decode_tokens_per_s
-                ),
+                prefill_tokens_per_s=item_prefill,
+                decode_tokens_per_s=item_decode,
             )
             return (
                 0,
@@ -688,6 +727,7 @@ def _ordered_due_cohorts(
     prefill_tokens_per_s: float | None = None,
     decode_tokens_per_s: float | None = None,
     decode_tokens_per_s_by_residence: Mapping[str, float | None] | None = None,
+    service_time_estimator: ServiceTimeEstimator | None = None,
 ) -> tuple[tuple[RolloutSubmission, ...], ...]:
     """Return atomic cohorts in policy order for this scheduling pass."""
 
@@ -702,6 +742,7 @@ def _ordered_due_cohorts(
             decode_tokens_per_s_by_residence=(
                 decode_tokens_per_s_by_residence
             ),
+            service_time_estimator=service_time_estimator,
         )
         cohort = _cohort_from_queue(head, queue)
         cohort_ids = {item.request_id for item in cohort}
@@ -723,6 +764,7 @@ def _admit_managed_cohort(
     prefill_tokens_per_s: float | None,
     decode_tokens_per_s: float | None,
     decode_tokens_per_s_by_residence: Mapping[str, float | None],
+    service_time_estimator: ServiceTimeEstimator | None = None,
 ) -> tuple[
     dict[str, ElasticAdmissionDecision | None],
     list[RolloutSubmission],
@@ -738,22 +780,43 @@ def _admit_managed_cohort(
     admissions: dict[str, ElasticAdmissionDecision | None] = {}
     deferred: list[RolloutSubmission] = []
     deadline_forced = False
+    submission_rate_resolver = None
+    if service_time_estimator is not None:
+        def resolve_submission_rates(future, residence):
+            return _submission_service_rates(
+                service_time_estimator,
+                future,
+                residence=residence,
+            )
+
+        submission_rate_resolver = resolve_submission_rates
     for member in cohort:
         admission = None
         if config is not None:
-            planned_residence = FutureHint.from_payload(
-                dict(member.hint)
-            ).residence
+            planned_residence = FutureHint.from_payload(dict(member.hint)).residence
+            item_feedback = _submission_service_rates(
+                service_time_estimator,
+                member,
+            )
+            if service_time_estimator is not None:
+                item_prefill = item_feedback.get("prefill_tokens_per_s")
+                item_decode = item_feedback.get("decode_tokens_per_s")
+            else:
+                item_prefill = prefill_tokens_per_s
+                item_decode = decode_tokens_per_s_by_residence.get(
+                    planned_residence
+                )
+                if item_decode is None:
+                    item_decode = decode_tokens_per_s
             admission = decide_elastic_admission(
                 member,
                 active_bytes=provisional_bytes,
                 config=config,
                 future_submissions=other_queue,
                 now_ms=now_ms,
-                prefill_tokens_per_s=prefill_tokens_per_s,
-                decode_tokens_per_s=decode_tokens_per_s_by_residence.get(
-                    planned_residence
-                ),
+                prefill_tokens_per_s=item_prefill,
+                decode_tokens_per_s=item_decode,
+                submission_rate_resolver=submission_rate_resolver,
             )
             if admission.defer_for_budget:
                 hint = FutureHint.from_payload(dict(member.hint))
@@ -764,8 +827,8 @@ def _admit_managed_cohort(
                         1,
                         member.estimated_finish_ms - member.submit_at_ms,
                     ),
-                    prefill_tokens_per_s=prefill_tokens_per_s,
-                    decode_tokens_per_s=decode_tokens_per_s,
+                    prefill_tokens_per_s=item_prefill,
+                    decode_tokens_per_s=item_decode,
                 )
                 forced = bool(
                     allow_deadline_overcommit
@@ -1006,6 +1069,11 @@ def _execute_managed_rollout(
                                     dict(item.submission.hint)
                                 ).residence
                             ),
+                            kind=item.submission.kind,
+                            prefill_batch_size=(
+                                item.submission.prefill_batch_size
+                            ),
+                            decode_batch_size=item.submission.decode_batch_size,
                         )
                     except (TypeError, ValueError):
                         service_time_estimator.record_rejected_sample()
@@ -1040,34 +1108,11 @@ def _execute_managed_rollout(
                 clock.sleep(poll_interval_s)
                 continue
 
-            feedback_rates = (
-                {}
-                if service_time_estimator is None
-                else service_time_estimator.rates()
-            )
-            decode_by_residence = (
-                {}
-                if service_time_estimator is None
-                else {
-                    residence: service_time_estimator.rates(
-                        residence=residence
-                    ).get("decode_tokens_per_s")
-                    for residence in ("resident", "host_backed")
-                }
-            )
             cohorts = _ordered_due_cohorts(
                 due,
                 queue,
                 queue_policy,
-                prefill_tokens_per_s=feedback_rates.get(
-                    "prefill_tokens_per_s"
-                ),
-                decode_tokens_per_s=(
-                    None
-                    if service_time_estimator is not None
-                    else feedback_rates.get("decode_tokens_per_s")
-                ),
-                decode_tokens_per_s_by_residence=decode_by_residence,
+                service_time_estimator=service_time_estimator,
             )
             capacity = worker_count if max_inflight is None else max_inflight
             active_bytes = sum(item.hold_bytes for item in pending)
@@ -1095,13 +1140,10 @@ def _execute_managed_rollout(
                     now_ms=now_ms,
                     config=elastic_kv_config,
                     allow_deadline_overcommit=allow_deadline_overcommit,
-                    prefill_tokens_per_s=feedback_rates.get(
-                        "prefill_tokens_per_s"
-                    ),
-                    decode_tokens_per_s=feedback_rates.get(
-                        "decode_tokens_per_s"
-                    ),
-                    decode_tokens_per_s_by_residence=decode_by_residence,
+                    prefill_tokens_per_s=None,
+                    decode_tokens_per_s=None,
+                    decode_tokens_per_s_by_residence={},
+                    service_time_estimator=service_time_estimator,
                 )
                 if deferred and not cohort_deadline_forced:
                     scheduler_stats["budget_blocked_groups"] += 1
@@ -1162,18 +1204,10 @@ def _execute_managed_rollout(
                     if admission is not None
                     else FutureHint.from_payload(dict(member.hint)).residence
                 )
-                emitted_feedback = (
-                    {}
-                    if service_time_estimator is None
-                    else (
-                        service_time_estimator.rates(residence=emitted_residence)
-                        if _service_time_residence(emitted_residence) is not None
-                        else {
-                            key: value
-                            for key, value in service_time_estimator.rates().items()
-                            if key == "prefill_tokens_per_s"
-                        }
-                    )
+                emitted_feedback = _submission_service_rates(
+                    service_time_estimator,
+                    member,
+                    residence=emitted_residence,
                 )
                 if emit_hints:
                     dispatch_clock_s = clock.now()

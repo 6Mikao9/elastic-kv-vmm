@@ -313,6 +313,48 @@ class ElasticAdmissionTest(unittest.TestCase):
         self.assertEqual(calibrated.future_reserved_requests, 1)
         self.assertEqual(calibrated.service_time_calibrated_future_requests, 1)
 
+    def test_future_rate_resolver_uses_the_future_request_shape(self):
+        current = submission(
+            "background",
+            kind="chat",
+            weight=1.0,
+            estimated_finish_ms=100,
+        )
+        urgent = submission(
+            "urgent",
+            kind="tool",
+            weight=2.0,
+            submit_at_ms=20,
+            estimated_finish_ms=120,
+        )
+        config = ElasticKVConfig(
+            memory_budget_bytes=700,
+            kv_bytes_per_token=2,
+            sparse_hot_tokens=64,
+            lookahead_ms=200,
+        )
+        resolved = []
+
+        def resolve(future, residence):
+            resolved.append((future.request_id, residence))
+            return {
+                "prefill_tokens_per_s": 2_000.0,
+                "decode_tokens_per_s": 500.0,
+            }
+
+        decision = decide_elastic_admission(
+            current,
+            active_bytes=0,
+            config=config,
+            future_submissions=(current, urgent),
+            now_ms=0,
+            submission_rate_resolver=resolve,
+        )
+
+        self.assertEqual(resolved, [("urgent", "resident")])
+        self.assertEqual(decision.service_time_calibrated_future_requests, 1)
+        self.assertEqual(decision.future_reserved_requests, 1)
+
     def test_future_prefill_only_pressure_gets_prefill_reason(self):
         current = submission("current", prompt=1, output=199, weight=1.0)
         urgent = submission("urgent", weight=2.0, submit_at_ms=20)
@@ -598,24 +640,24 @@ class ElasticAdmissionTest(unittest.TestCase):
 
     def test_invalid_active_bytes_are_rejected(self):
         for value in (-1, 1.5, True):
-            with self.subTest(value=value):
-                with self.assertRaisesRegex(ValueError, "active_bytes"):
-                    decide_elastic_admission(
-                        submission("bad"), active_bytes=value, config=self.config
-                    )
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ValueError, "active_bytes"
+            ):
+                decide_elastic_admission(
+                    submission("bad"), active_bytes=value, config=self.config
+                )
 
     def test_invalid_prefill_workspace_rate_is_rejected(self):
         for value in (-1, 1.5, True):
-            with self.subTest(value=value):
-                with self.assertRaisesRegex(
-                    ValueError, "prefill_workspace_bytes_per_token"
-                ):
-                    ElasticKVConfig(
-                        memory_budget_bytes=1_000,
-                        kv_bytes_per_token=2,
-                        sparse_hot_tokens=64,
-                        prefill_workspace_bytes_per_token=value,
-                    )
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ValueError, "prefill_workspace_bytes_per_token"
+            ):
+                ElasticKVConfig(
+                    memory_budget_bytes=1_000,
+                    kv_bytes_per_token=2,
+                    sparse_hot_tokens=64,
+                    prefill_workspace_bytes_per_token=value,
+                )
 
     def test_kind_profile_changes_hot_set_workspace_and_auto_threshold(self):
         config = ElasticKVConfig(

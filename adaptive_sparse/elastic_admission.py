@@ -9,7 +9,7 @@ only new requests when active KV would cross the configured budget.
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 
 from .future_plan import (
@@ -257,6 +257,9 @@ def _future_reservation(
     current_duration_ms: float,
     prefill_tokens_per_s: float | None,
     decode_tokens_per_s: float | None,
+    submission_rate_resolver: (
+        Callable[[RolloutSubmission, str], Mapping[str, float]] | None
+    ),
 ) -> tuple[int, int, int, int]:
     """Reserve bounded capacity for more urgent requests that can overlap now.
 
@@ -300,14 +303,21 @@ def _future_reservation(
         if not has_deadline and not has_higher_weight:
             continue
         placement, _ = _preferred_residence(future, config)
+        if submission_rate_resolver is None:
+            future_prefill_rate = prefill_tokens_per_s
+            future_decode_rate = decode_tokens_per_s
+        else:
+            future_rates = submission_rate_resolver(future, placement)
+            future_prefill_rate = future_rates.get("prefill_tokens_per_s")
+            future_decode_rate = future_rates.get("decode_tokens_per_s")
         predicted_duration_ms = _predicted_duration_ms(
             future,
             future_hint,
             fallback_ms=max(
                 1, future.estimated_finish_ms - future.submit_at_ms
             ),
-            prefill_tokens_per_s=prefill_tokens_per_s,
-            decode_tokens_per_s=decode_tokens_per_s,
+            prefill_tokens_per_s=future_prefill_rate,
+            decode_tokens_per_s=future_decode_rate,
             config=config,
             residence=placement,
         )
@@ -320,8 +330,8 @@ def _future_reservation(
         if (
             future_hint.prefill_tokens_per_s is not None
             or future_hint.decode_tokens_per_s is not None
-            or prefill_tokens_per_s is not None
-            or decode_tokens_per_s is not None
+            or future_prefill_rate is not None
+            or future_decode_rate is not None
             or profile.prefill_tokens_per_ms is not None
             or profile_residence_rate is not None
         ):
@@ -413,6 +423,9 @@ def decide_elastic_admission(
     now_ms: float | None = None,
     prefill_tokens_per_s: float | None = None,
     decode_tokens_per_s: float | None = None,
+    submission_rate_resolver: (
+        Callable[[RolloutSubmission, str], Mapping[str, float]] | None
+    ) = None,
 ) -> ElasticAdmissionDecision:
     """Choose a mode and report whether admission should wait for capacity.
 
@@ -423,7 +436,7 @@ def decide_elastic_admission(
     """
 
     if isinstance(active_bytes, bool) or not isinstance(active_bytes, int):
-        raise ValueError("active_bytes must be an integer")
+        raise ValueError("active_bytes must be an integer")  # noqa: TRY004
     if active_bytes < 0:
         raise ValueError("active_bytes must be nonnegative")
     queued = tuple(future_submissions)
@@ -432,7 +445,7 @@ def decide_elastic_admission(
             raise ValueError("now_ms is required when future reservations are enabled")
         now_ms = 0.0
     if isinstance(now_ms, bool) or not isinstance(now_ms, (int, float)):
-        raise ValueError("now_ms must be finite")
+        raise ValueError("now_ms must be finite")  # noqa: TRY004
     now_ms = float(now_ms)
     if not math.isfinite(now_ms) or now_ms < 0:
         raise ValueError("now_ms must be finite and nonnegative")
@@ -485,6 +498,7 @@ def decide_elastic_admission(
         current_duration_ms=current_duration_ms,
         prefill_tokens_per_s=prefill_tokens_per_s,
         decode_tokens_per_s=decode_tokens_per_s,
+        submission_rate_resolver=submission_rate_resolver,
     )
     future_bytes = future_kv_bytes + future_prefill_bytes
 
