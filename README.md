@@ -272,6 +272,11 @@ records the `decode_batch_size` used by its timing model, and the emitted decode
 rate hint uses the same value. Durations fixed at an earlier admission are not
 retroactively rewritten when another request joins the batch, so this remains a
 policy model rather than a full serving simulator.
+When the future hook is enabled, it also observes native
+`get_next_batch_to_run()` results and records the real decode batch-size
+histogram, the latest batch and a bounded per-request history of observed sizes.
+This exposes where the admission-time model diverges from SGLang's changing
+occupancy; it is diagnostic evidence and does not rewrite an active plan.
 The matching `prefill_batch_profiles` records aggregate prefill tokens per
 millisecond at exact cohort sizes. The `batched` known-future policy may hold
 ready work for `batch_window_ms` only when these profiles predict both no worse

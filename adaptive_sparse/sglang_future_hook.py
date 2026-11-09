@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 import os
 import time
+from collections import OrderedDict
 from collections.abc import Iterable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -40,6 +41,7 @@ HARD_RELEASE_GATE_ENV = "EKV_HARD_RELEASE_GATE"
 POLICIES = ("off", "deadline")
 _STATS_INTERVAL_S = 0.25
 _DEFAULT_COHORT_WAIT_TIMEOUT_MS = 1000.0
+_MAX_DECODE_REQUEST_TRACES = 4096
 
 _installed = False
 _last_stats_publish = 0.0
@@ -55,6 +57,10 @@ _stats = {
     "fallback_exception": 0,
     "telemetry_errors": 0,
     "prefill_batches": 0,
+    "decode_batches": 0,
+    "decode_requests_observed": 0,
+    "decode_mixed_batches": 0,
+    "decode_request_trace_evictions": 0,
     "cohort_batches": 0,
     "complete_cohort_batches": 0,
     "partial_cohort_batches": 0,
@@ -72,6 +78,9 @@ _stats = {
 }
 _last_cohort_batch: dict[str, object] | None = None
 _complete_cohort_ids: set[str] = set()
+_last_decode_batch: dict[str, object] | None = None
+_decode_batch_sizes: dict[int, int] = {}
+_decode_batch_sizes_by_request: OrderedDict[str, dict[int, int]] = OrderedDict()
 _last_held_cohorts: list[dict[str, object]] = []
 _last_held_releases: list[dict[str, object]] = []
 _cohort_first_seen_s: dict[str, float] = {}
@@ -653,6 +662,67 @@ def observe_prefill_batch(batch: Any) -> None:
         }
 
 
+def observe_decode_batch(result: Any) -> None:
+    """Record the actual occupancy of one SGLang decode scheduling batch."""
+
+    global _last_decode_batch
+    batch = _prefill_batch(result)
+    if batch is None:
+        return
+
+    # Mixed chunked-prefill keeps its running decode rows in ``decoding_reqs``
+    # while the batch-wide forward mode remains EXTEND. Counting only
+    # ``forward_mode.is_decode()`` would silently hide those decode occupants.
+    decoding_reqs = getattr(batch, "decoding_reqs", None)
+    forward_mode = getattr(batch, "forward_mode", None)
+    is_decode = getattr(forward_mode, "is_decode", None)
+    decode_mode = callable(is_decode) and is_decode()
+    if decoding_reqs is not None:
+        requests = tuple(decoding_reqs or ())
+        mixed = bool(requests) and not decode_mode
+    elif decode_mode:
+        requests = tuple(getattr(batch, "reqs", None) or ())
+        mixed = False
+    else:
+        return
+    if not requests:
+        return
+
+    size = len(requests)
+    _stats["decode_batches"] += 1
+    _stats["decode_requests_observed"] += size
+    if mixed:
+        _stats["decode_mixed_batches"] += 1
+    _decode_batch_sizes[size] = _decode_batch_sizes.get(size, 0) + 1
+    request_ids: list[str] = []
+    cohort_ids: set[str] = set()
+    for request in requests:
+        request_id = str(getattr(request, "request_id", "<missing>"))
+        request_ids.append(request_id)
+        by_size = _decode_batch_sizes_by_request.get(request_id)
+        if by_size is None:
+            while len(_decode_batch_sizes_by_request) >= _MAX_DECODE_REQUEST_TRACES:
+                _decode_batch_sizes_by_request.popitem(last=False)
+                _stats["decode_request_trace_evictions"] += 1
+            by_size = {}
+            _decode_batch_sizes_by_request[request_id] = by_size
+        by_size[size] = by_size.get(size, 0) + 1
+        _decode_batch_sizes_by_request.move_to_end(request_id)
+        try:
+            hint = _extract_hint(request)
+        except (AttributeError, TypeError, ValueError):
+            hint = None
+        if hint is not None and hint.cohort_id is not None:
+            cohort_ids.add(hint.cohort_id)
+
+    _last_decode_batch = {
+        "batch_size": size,
+        "request_ids": sorted(request_ids),
+        "cohort_ids": sorted(cohort_ids),
+        "mixed_prefill_decode": mixed,
+    }
+
+
 def planned_cohort_sizes(submissions: Iterable[Any]) -> dict[str, int]:
     """Return and validate the cohort membership of an executable plan."""
 
@@ -905,6 +975,16 @@ def snapshot_stats() -> dict[str, object]:
     snapshot: dict[str, object] = dict(_stats)
     snapshot["last_cohort_batch"] = _last_cohort_batch
     snapshot["complete_cohort_ids"] = sorted(_complete_cohort_ids)
+    snapshot["last_decode_batch"] = _last_decode_batch
+    snapshot["decode_batch_size_histogram"] = {
+        str(size): count for size, count in sorted(_decode_batch_sizes.items())
+    }
+    snapshot["decode_batch_sizes_by_request"] = {
+        request_id: {
+            str(size): count for size, count in sorted(by_size.items())
+        }
+        for request_id, by_size in sorted(_decode_batch_sizes_by_request.items())
+    }
     snapshot["last_held_cohorts"] = list(_last_held_cohorts)
     snapshot["last_held_releases"] = list(_last_held_releases)
     snapshot["stats_identity"] = dict(_stats_identity)
@@ -1109,4 +1189,18 @@ def install() -> None:
 
             elastic_get_new_batch_prefill._elastic_cohort_observer = True
             Scheduler.get_new_batch_prefill = elastic_get_new_batch_prefill
+    if Scheduler is not None and hasattr(Scheduler, "get_next_batch_to_run"):
+        original_next_batch = Scheduler.get_next_batch_to_run
+        if not getattr(original_next_batch, "_elastic_decode_observer", False):
+
+            @wraps(original_next_batch)
+            def elastic_get_next_batch_to_run(self, *args, **kwargs):
+                _capture_stats_identity(self)
+                result = original_next_batch(self, *args, **kwargs)
+                observe_decode_batch(result)
+                _publish_stats()
+                return result
+
+            elastic_get_next_batch_to_run._elastic_decode_observer = True
+            Scheduler.get_next_batch_to_run = elastic_get_next_batch_to_run
     _installed = True

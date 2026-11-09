@@ -388,8 +388,11 @@ backing 的引用、写保护和生命周期实现通过真实测试。
 这个模型只影响 admission 时可见的 co-batch 数，以及 deadline urgency 和 future
 contention 的估计。已经开始的请求不会在后续请求加入 batch 时回溯改写 finish time。
 因此它足以让“不同 batch size 会改变计划”进入离线规划，但还不能声称完整复现 SGLang
-动态 batching；后者需要从真实服务器采集 profile，并让 executor 记录实际 co-batch
-大小后做 paired replay。
+动态 batching。scheduler hook 现在额外包装 `get_next_batch_to_run()`，只统计真实
+decode batch，写出 batch-size histogram、最后一个 decode batch 以及每个请求经历过的
+batch size 分布；逐请求 trace 有界保留最近 4096 个请求。这个证据用于 paired replay
+和诊断静态 admission 假设何时失效，当前不会反向改写已经下发的计划或估计 finish
+time。
 
 ### 4.1.3 已实现：已知未来 cohort 的保守等待策略
 

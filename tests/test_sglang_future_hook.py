@@ -12,6 +12,7 @@ from adaptive_sparse.future_residency import decide_resident_claim
 from adaptive_sparse.sglang_future_hook import (
     apply_to_waiting_queue,
     cohort_completion_evidence,
+    observe_decode_batch,
     observe_prefill_batch,
     order_requests,
     planned_cohort_sizes,
@@ -43,8 +44,11 @@ class SGLangFutureHookTest(unittest.TestCase):
         hook._cohort_arrival_complete.clear()
         hook._cohort_timed_out.clear()
         hook._complete_cohort_ids.clear()
+        hook._decode_batch_sizes.clear()
+        hook._decode_batch_sizes_by_request.clear()
         hook._stats_identity.clear()
         hook._last_cohort_batch = None
+        hook._last_decode_batch = None
         hook._last_held_cohorts = []
         hook._last_held_releases = []
         hook._hard_release_gate = False
@@ -136,6 +140,128 @@ class SGLangFutureHookTest(unittest.TestCase):
                     SimpleNamespace(cohort_id="batch-0", prefill_batch_size=3),
                 ]
             )
+
+    def test_decode_observer_tracks_dynamic_batch_occupancy(self):
+        first = request("first", 10, 1.0, {})
+        second = request("second", 10, 1.0, {})
+
+        class DecodeMode:
+            def is_decode(self):
+                return True
+
+        before = snapshot_stats()
+        observe_decode_batch(
+            SimpleNamespace(
+                batch_to_run=SimpleNamespace(
+                    reqs=[first], forward_mode=DecodeMode()
+                )
+            )
+        )
+        observe_decode_batch(
+            SimpleNamespace(
+                batch_to_run=SimpleNamespace(
+                    reqs=[first, second], forward_mode=DecodeMode()
+                )
+            )
+        )
+        after = snapshot_stats()
+
+        self.assertEqual(
+            after["decode_batches"] - before["decode_batches"], 2
+        )
+        self.assertEqual(
+            after["decode_requests_observed"]
+            - before["decode_requests_observed"],
+            3,
+        )
+        self.assertEqual(after["last_decode_batch"]["batch_size"], 2)
+        self.assertEqual(
+            after["decode_batch_sizes_by_request"]["first"],
+            {"1": 1, "2": 1},
+        )
+        self.assertEqual(
+            after["decode_batch_sizes_by_request"]["second"], {"2": 1}
+        )
+
+    def test_decode_observer_ignores_prefill_batches(self):
+        item = request("prefill", 10, 1.0, {})
+
+        class PrefillMode:
+            def is_decode(self):
+                return False
+
+        before = snapshot_stats()["decode_batches"]
+        observe_decode_batch(
+            SimpleNamespace(
+                batch_to_run=SimpleNamespace(
+                    reqs=[item], forward_mode=PrefillMode()
+                )
+            )
+        )
+        self.assertEqual(snapshot_stats()["decode_batches"], before)
+
+    def test_decode_observer_counts_running_rows_in_mixed_batch(self):
+        prefill = request("prefill", 10, 1.0, {})
+        first = request("first", 10, 1.0, {})
+        second = request("second", 10, 1.0, {})
+
+        class ExtendMode:
+            def is_decode(self):
+                return False
+
+        before = snapshot_stats()
+        observe_decode_batch(
+            SimpleNamespace(
+                batch_to_run=SimpleNamespace(
+                    reqs=[prefill, first, second],
+                    decoding_reqs=[first, second],
+                    forward_mode=ExtendMode(),
+                )
+            )
+        )
+        after = snapshot_stats()
+
+        self.assertEqual(after["decode_batches"] - before["decode_batches"], 1)
+        self.assertEqual(
+            after["decode_requests_observed"]
+            - before["decode_requests_observed"],
+            2,
+        )
+        self.assertEqual(
+            after["decode_mixed_batches"] - before["decode_mixed_batches"], 1
+        )
+        self.assertEqual(after["last_decode_batch"]["batch_size"], 2)
+        self.assertEqual(
+            after["last_decode_batch"]["request_ids"], ["first", "second"]
+        )
+        self.assertTrue(after["last_decode_batch"]["mixed_prefill_decode"])
+
+    def test_decode_request_trace_is_bounded_to_recent_requests(self):
+        class DecodeMode:
+            def is_decode(self):
+                return True
+
+        old_limit = hook._MAX_DECODE_REQUEST_TRACES
+        hook._MAX_DECODE_REQUEST_TRACES = 2
+        try:
+            first = request("first", 10, 1.0, {})
+            second = request("second", 10, 1.0, {})
+            third = request("third", 10, 1.0, {})
+            observe_decode_batch(
+                SimpleNamespace(reqs=[first, second], forward_mode=DecodeMode())
+            )
+            observe_decode_batch(
+                SimpleNamespace(reqs=[first], forward_mode=DecodeMode())
+            )
+            observe_decode_batch(
+                SimpleNamespace(reqs=[third], forward_mode=DecodeMode())
+            )
+        finally:
+            hook._MAX_DECODE_REQUEST_TRACES = old_limit
+
+        self.assertEqual(
+            list(hook._decode_batch_sizes_by_request), ["first", "third"]
+        )
 
     def test_absolute_deadline_orders_without_scheduler_receive_time(self):
         long = request(
@@ -926,6 +1052,53 @@ class SGLangFutureHookTest(unittest.TestCase):
             1,
         )
         self.assertTrue(after["last_cohort_batch"]["complete"])
+
+    def test_installer_observes_dynamic_decode_batch_composition(self):
+        class SchedulePolicy:
+            def calc_priority(self, waiting_queue, *args, **kwargs):
+                return None
+
+        class DecodeMode:
+            def is_decode(self):
+                return True
+
+        first = request("first", 10, 1.0, {})
+        second = request("second", 10, 1.0, {})
+
+        class Scheduler:
+            def get_next_batch_to_run(self, *args, **kwargs):
+                return SimpleNamespace(
+                    batch_to_run=SimpleNamespace(
+                        reqs=[first, second], forward_mode=DecodeMode()
+                    ),
+                    running_batch=object(),
+                )
+
+        modules = {
+            "sglang": SimpleNamespace(__path__=[]),
+            "sglang.srt": SimpleNamespace(__path__=[]),
+            "sglang.srt.managers": SimpleNamespace(__path__=[]),
+            "sglang.srt.managers.kv_hints": SimpleNamespace(),
+            "sglang.srt.managers.schedule_policy": SimpleNamespace(
+                SchedulePolicy=SchedulePolicy
+            ),
+            "sglang.srt.managers.scheduler": SimpleNamespace(
+                Scheduler=Scheduler
+            ),
+        }
+        before = snapshot_stats()
+        with patch.dict(sys.modules, modules), patch.dict(
+            "os.environ", {"EKV_FUTURE_POLICY": "deadline"}
+        ):
+            hook._installed = False
+            hook.install()
+            plan = Scheduler().get_next_batch_to_run()
+        hook._installed = False
+
+        self.assertEqual(len(plan.batch_to_run.reqs), 2)
+        after = snapshot_stats()
+        self.assertEqual(after["decode_batches"] - before["decode_batches"], 1)
+        self.assertEqual(after["last_decode_batch"]["batch_size"], 2)
 
     def test_installer_accepts_new_scheduler_plan_and_restores_held_cohort(self):
         class SchedulePolicy:
