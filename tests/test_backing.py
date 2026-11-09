@@ -4,7 +4,8 @@ import gc
 import os
 import tempfile
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -18,13 +19,22 @@ from elastic_kv.global_broker import GlobalAdmissionBroker
 
 
 class _FakeLibrary:
-    def __init__(self, reserved_units=2, *, partial_failure=False, close_failure=False):
+    def __init__(
+        self,
+        reserved_units=2,
+        *,
+        partial_failure=False,
+        rollback_on_failure=False,
+        close_failure=False,
+    ):
         self.mapped = 0
         self.calls = []
         self.reserved_units = reserved_units
         self.partial_failure = partial_failure
+        self.rollback_on_failure = rollback_on_failure
         self.close_failure = close_failure
         self.failure = None
+        self.poisoned = False
 
     def ev_create(self, *_):
         return 1
@@ -43,9 +53,11 @@ class _FakeLibrary:
 
     def ev_ensure(self, _, _ids, count):
         if self.partial_failure:
-            self.mapped += max(0, count - 1)
             self.calls.append(("ensure-partial", count))
             self.failure = b"injected partial map failure"
+            if not self.rollback_on_failure:
+                self.mapped += max(0, count - 1)
+                self.poisoned = True
             return 1
         self.mapped += count
         self.calls.append(("ensure", count))
@@ -53,9 +65,11 @@ class _FakeLibrary:
 
     def ev_precommit(self, _, _ids, count):
         if self.partial_failure:
-            self.mapped += max(0, count - 1)
             self.calls.append(("precommit-partial", count))
             self.failure = b"injected partial map failure"
+            if not self.rollback_on_failure:
+                self.mapped += max(0, count - 1)
+                self.poisoned = True
             return 1
         self.mapped += count
         self.calls.append(("precommit", count))
@@ -65,6 +79,9 @@ class _FakeLibrary:
         self.mapped -= count
         self.calls.append(("drop", count))
         return 0
+
+    def ev_poisoned(self, _):
+        return int(self.poisoned)
 
     def ev_close(self, _):
         if self.close_failure:
@@ -88,6 +105,26 @@ class GlobalBrokerBackingTest(unittest.TestCase):
                 RuntimeError, "elastic-kv-build-vmm"
             ):
                 _load_library("missing-libelastic-vmm.so")
+        _load_library.cache_clear()
+
+    def test_outdated_native_library_requests_a_rebuild(self):
+        _load_library.cache_clear()
+        names = (
+            "ev_create",
+            "ev_ensure",
+            "ev_precommit",
+            "ev_drop",
+            "ev_base",
+            "ev_backed",
+            "ev_reserved",
+            "ev_granularity",
+            "ev_close",
+            "ev_error",
+        )
+        library = SimpleNamespace(**{name: Mock() for name in names})
+        with patch("elastic_kv.backing.ct.CDLL", return_value=library):
+            with self.assertRaisesRegex(RuntimeError, "ABI is outdated"):
+                _load_library("old-libelastic-vmm.so")
         _load_library.cache_clear()
 
     def test_fair_broker_environment_requires_a_broker_path(self):
@@ -189,6 +226,42 @@ class GlobalBrokerBackingTest(unittest.TestCase):
                 self.assertEqual(observer.available_bytes(), 2 * chunk)
             finally:
                 first.close()
+                observer.close()
+
+    def test_clean_native_rollback_releases_lease_and_allows_retry(self):
+        chunk = 1 << 20
+        with tempfile.TemporaryDirectory() as temporary:
+            path = os.path.join(temporary, "gpu0.sqlite")
+            environment = {
+                "EKV_GLOBAL_BROKER_PATH": path,
+                "EKV_GLOBAL_BROKER_MIB": "2",
+            }
+            library = _FakeLibrary(
+                2 * chunk, partial_failure=True, rollback_on_failure=True
+            )
+            with patch.dict(os.environ, environment, clear=False), patch(
+                "elastic_kv.backing._load_library", return_value=library
+            ):
+                backing = Backing(2 * chunk, chunk, 0, library="rollback.so")
+            observer = GlobalAdmissionBroker(
+                path, 2 * chunk, owner_id="observer", heartbeat_seconds=None
+            )
+            try:
+                with self.assertRaisesRegex(RuntimeError, "partial map failure"):
+                    backing.ensure([0, 1])
+                self.assertEqual(backing.mapped_chunks, frozenset())
+                self.assertFalse(backing._poisoned)
+                self.assertEqual(observer.available_bytes(), 2 * chunk)
+                self.assertEqual(
+                    backing.metrics["global_broker_released_chunks"], 2
+                )
+
+                library.partial_failure = False
+                self.assertEqual(backing.ensure([0, 1]), 2)
+                self.assertEqual(backing.mapped_chunks, {0, 1})
+                self.assertEqual(observer.available_bytes(), 0)
+            finally:
+                backing.close()
                 observer.close()
 
     def test_temporary_claim_blocks_same_backing_growth_until_released(self):

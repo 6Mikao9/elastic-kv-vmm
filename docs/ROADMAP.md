@@ -20,8 +20,11 @@ changing the attention addressing model:
    ids. A temporary prefill capacity claim now shares the same atomic broker
    budget as VMM leases before batch selection and is released at the successful
    forward boundary; observe mode records would-admit without mutation. Exact
-   hard partitions, true activation ownership and transactional OOM recovery
-   remain open.
+   hard partitions, true activation ownership and request-level
+   cross-component OOM recovery remain open. A VMM mapping batch now rolls back
+   newly mapped chunks, releases only the corresponding broker leases when the
+   native layer proves a clean rollback, and poisons the backing on an uncertain
+   rollback or zeroing-fence failure.
    Scheduler and idle telemetry now expose a read-only `budget_ownership`
    snapshot that names the physical broker as authoritative, marks request
    growth reservations as predictive and non-additive, and attributes VMM

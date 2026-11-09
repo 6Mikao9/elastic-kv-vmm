@@ -193,7 +193,9 @@ PyTorch allocator cache、Graph private pool 和 activation workspace 仍然由�
 
 - 正常 close：先确认 native backing 全部释放，再删除 broker owner 和租约。
 - native close 失败：保留租约；对象再次 close 或垃圾回收时可以重试。
-- partial map 失败：保留整批租约；`Backing` 变为 poisoned，不能继续执行读写。
+- partial map 失败：native backing 若确认已完整撤销本批新映射，则释放本批
+  broker 租约并允许后续重试；若撤销或 zeroing fence 的结果不确定，则保留租约，
+  `Backing` 变为 poisoned 并按 fail-stop 处理。
 - fair-share yield：保留租约不变，只记录短期 demand 并拒绝本次新增长。
 - demand 超时：竞争 tenant 退出当前公平轮次；若请求仍在重试，下一次拒绝会
   重新续期。

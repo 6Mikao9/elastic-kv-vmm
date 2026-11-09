@@ -227,6 +227,7 @@ public:
         }
         return committed * chunk_bytes_;
     }
+    bool poisoned() const { return poisoned_; }
 
 private:
     CUdeviceptr address(uint64_t id) const { return base_ + id * chunk_bytes_; }
@@ -348,6 +349,9 @@ uint64_t ev_backed(void* handle) { return call(kInvalid, [&] { return require(ha
 uint64_t ev_reserved(void* handle) { return call(kInvalid, [&] { return require(handle).reserved(); }); }
 uint64_t ev_granularity(void* handle) {
     return call(kInvalid, [&] { return require(handle).granularity(); });
+}
+int ev_poisoned(void* handle) {
+    return call(-1, [&] { return require(handle).poisoned() ? 1 : 0; });
 }
 
 const char* ev_error() { return last_error.c_str(); }

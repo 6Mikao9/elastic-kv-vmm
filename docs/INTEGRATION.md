@@ -70,8 +70,11 @@ budget through the native `available_size()` query, allowing `PrefillAdder` to
 reduce a batch before VMM commit. Already mapped free ranges and precommitted
 chunks remain available under pressure instead of being lost to a coarse
 chunks-to-tokens calculation. The prefill headroom remains an estimate, and
-transactional allocation failure and exact activation ownership remain separate
-work. An optional [cross-process broker](../elastic_kv/global_broker.py) now
+exact activation ownership and request-level cross-component OOM recovery
+remain separate work. VMM mapping itself is transactional per backing: a clean
+native rollback releases the failed batch's broker leases and remains
+retryable, while an uncertain rollback or initialization fence poisons the
+backing. An optional [cross-process broker](../elastic_kv/global_broker.py) now
 leases aggregate VMM chunks before mapping and exposes its remaining bytes to
 dense V5 admission. Its optional explicit-tenant `observe`/`enforce` modes add
 weighted soft shares and short demand records; `off` remains first-come. Its

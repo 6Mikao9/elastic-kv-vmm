@@ -33,10 +33,18 @@ def _load_library(path):
         fn = getattr(lib, name)
         fn.argtypes = [ct.c_void_p, ct.POINTER(ct.c_uint64), ct.c_size_t]
         fn.restype = ct.c_int
-    for name in ("ev_base", "ev_backed", "ev_reserved", "ev_granularity"):
-        fn = getattr(lib, name)
-        fn.argtypes = [ct.c_void_p]
-        fn.restype = ct.c_uint64
+    try:
+        for name in ("ev_base", "ev_backed", "ev_reserved", "ev_granularity"):
+            fn = getattr(lib, name)
+            fn.argtypes = [ct.c_void_p]
+            fn.restype = ct.c_uint64
+        lib.ev_poisoned.argtypes = [ct.c_void_p]
+        lib.ev_poisoned.restype = ct.c_int
+    except AttributeError as exc:
+        raise RuntimeError(
+            "CUDA VMM library ABI is outdated; rebuild libelastic_vmm.so "
+            "with elastic-kv-build-vmm"
+        ) from exc
     lib.ev_close.argtypes = [ct.c_void_p]
     lib.ev_close.restype = ct.c_int
     lib.ev_error.argtypes = []
@@ -245,11 +253,25 @@ class Backing:
             raise ValueError("chunk index outside reserved range")
         return ids
 
-    def _batch(self, name, indices):
+    def _batch(self, name, indices, *, release_on_clean_failure=False):
         ids = (ct.c_uint64 * len(indices))(*sorted(indices))
         if getattr(self._lib, name)(self._handle, ids, len(indices)):
-            self._poisoned = True
-            raise RuntimeError(self._error())
+            error = self._error()
+            try:
+                poisoned = self._lib.ev_poisoned(self._handle)
+            except Exception:
+                poisoned = -1
+            if poisoned != 0:
+                self._poisoned = True
+            elif release_on_clean_failure:
+                try:
+                    self._release_broker(indices)
+                except Exception as rollback_error:
+                    self._poisoned = True
+                    raise RuntimeError(
+                        f"{error}; broker lease rollback failed: {rollback_error}"
+                    ) from rollback_error
+            raise RuntimeError(error)
 
     @property
     def mapped_chunks(self):
@@ -445,9 +467,9 @@ class Backing:
             return 0
         start = time.perf_counter_ns()
         self._reserve_broker(pending)
-        # A failed batch may have mapped a prefix. Keep every lease until a
-        # successful close proves that no native mapping remains.
-        self._batch("ev_ensure", pending)
+        # _batch releases this batch's leases only when the native layer reports
+        # a clean rollback. An uncertain native state remains fail-stop.
+        self._batch("ev_ensure", pending, release_on_clean_failure=True)
         self._mapped.update(pending)
         self._precommitted.clear()
         self._metrics["ensure_ns"] += time.perf_counter_ns() - start
@@ -471,8 +493,9 @@ class Backing:
             return 0
         start = time.perf_counter_ns()
         self._reserve_broker(pending)
-        # As with ensure(), an error can follow a partial native mapping.
-        self._batch("ev_precommit", pending)
+        # As with ensure(), a clean native rollback is retryable; an uncertain
+        # rollback poisons the native backing and keeps its leases fail-closed.
+        self._batch("ev_precommit", pending, release_on_clean_failure=True)
         self._mapped.update(pending)
         self._precommitted.update(pending)
         self._metrics["precommit_ns"] += time.perf_counter_ns() - start
