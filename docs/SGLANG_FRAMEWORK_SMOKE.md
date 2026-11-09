@@ -156,3 +156,19 @@ deadline guard，以及执行器的 cohort 元数据校验。在 5090 宿主机�
 它没有证明 GPU 上实际形成了目标 cohort，也没有产生 TTFT、TPOT、吞吐或显存收益。
 GPU0/1/3 当时整卡为 2 MiB、0%，GPU2 仍为 NVML `Unknown Error`，宿主 CUDA
 runtime 尚未恢复，因此真实 paired serving 继续留给可用加速器窗口。
+
+## 2026-11-09 rollout 控制面收敛复核
+
+提交 `68c88b158407c48d989f1163b1eec3f3ff3ca37c` 把 managed rollout 的到期请求
+优先级从“每选择一个 cohort 都重扫并重新解析”改为“每请求计分一次、每轮排序一次”，
+同时用索引构造 interleaved cohort，并在派发后一次移出队列。公开仓库的精确提交以
+Git bundle 克隆到 5090 宿主，保留 `.git` provenance；`lmsysorg/sglang:latest`
+（SGLang 0.5.17，镜像 ID
+`sha256:1cc022f1ddc29b84449b588a872c0e9cab2fc1268a36ef5449fe6956ef774f2a`）
+在 `--network none`、不授予 GPU、源码只读挂载的容器中运行完整测试，结果为
+**587 passed, 2 skipped，589 tests**。日志 SHA256 为
+`c1d70bb509bf18b2681bc82967c0d4265d585a39f434e2c640ec2c6bf77e258d`。
+
+同轮 CPU 微基准在 1,024 个同时 ready、各自为单请求 cohort 的人造压力下，把
+优先级排序从 2.354 s 降到 4.869 ms；1,024 请求组成 128 个 cohort 时，索引构造从
+2.256 ms 降到 0.135 ms。这些是控制面路径的对照，不是 TTFT、TPOT 或吞吐收益。

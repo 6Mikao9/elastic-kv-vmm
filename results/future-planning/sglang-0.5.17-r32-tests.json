@@ -1,17 +1,20 @@
 {
-  "commit": "3c1920b7a371862bb670d84d5f8f27402de24d30",
+  "commit": "68c88b158407c48d989f1163b1eec3f3ff3ca37c",
   "image": "lmsysorg/sglang:latest",
+  "image_id": "sha256:1cc022f1ddc29b84449b588a872c0e9cab2fc1268a36ef5449fe6956ef774f2a",
   "sglang_version": "0.5.17",
   "network": "none",
   "gpu_attached": false,
   "source_mount": "read-only",
+  "source": "/home/liuyuntao/experiments/elastic-kv-vmm-5090-20261109-r11-control-plane-bundle",
+  "log": "/home/liuyuntao/experiments/elastic-kv-vmm-r11-control-plane-results-bundle-final/tests.log",
   "tests": {
-    "passed": 487,
+    "ran": 589,
+    "passed": 587,
     "skipped": 2,
-    "failed": 0,
-    "subtests_passed": 157
+    "failed": 0
   },
-  "log_sha256": "8cb3f3920df1e23b3cbeab5e41d530e9078629b2f45f899129577f15cd3a708a",
+  "log_sha256": "c1d70bb509bf18b2681bc82967c0d4265d585a39f434e2c640ec2c6bf77e258d",
   "claim": "SGLang 0.5.17 source/API compatibility and CPU policy validation only",
   "not_measured": [
     "actual serving cohort formation",

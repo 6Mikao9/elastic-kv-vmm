@@ -72,11 +72,23 @@
   },
   "local_cpu_revalidation": {
     "date": "2026-11-09",
-    "tests_ran": 587,
-    "tests_passed": 583,
+    "tests_ran": 589,
+    "tests_passed": 585,
     "tests_skipped": 4,
     "tests_failed": 0,
     "scope": "Python 3.12 local CPU suite; CUDA and real SGLang serving remain skipped"
+  },
+  "remote_sglang_api_revalidation": {
+    "commit": "68c88b158407c48d989f1163b1eec3f3ff3ca37c",
+    "image_id": "sha256:1cc022f1ddc29b84449b588a872c0e9cab2fc1268a36ef5449fe6956ef774f2a",
+    "sglang_version": "0.5.17",
+    "tests_ran": 589,
+    "tests_passed": 587,
+    "tests_skipped": 2,
+    "tests_failed": 0,
+    "network": "none",
+    "gpu_requested": false,
+    "log_sha256": "c1d70bb509bf18b2681bc82967c0d4265d585a39f434e2c640ec2c6bf77e258d"
   },
   "not_claimed": [
     "GPU throughput or latency improvement",
