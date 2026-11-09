@@ -269,8 +269,14 @@ prefill model; missing decode measurements retain the per-request linear model.
 `max_batch_requests` caps the cohort and must not exceed
 `max_active_requests`. Every admission records `prefill_batch_size` and a
 `cohort_id`, and the executor rejects a cohort whose members disagree on start
-time, prefill size or decode size. This is deterministic policy-model evidence;
-the profile values still need calibration against real SGLang co-batch traces.
+time, prefill size or decode size. The executor treats each cohort as one
+dispatch group: it reserves worker and in-flight capacity for every member,
+checks their budget together, installs one client-side release barrier, and
+fails the run when observed generator-entry skew exceeds the configured
+tolerance. The result records cohort membership and actual start skew. This is
+still client-dispatch evidence, not proof that SGLang placed every member in
+one server-side prefill batch; profile values and the server-side batch gate
+need calibration against real co-batch traces.
 `search_exact` distinguishes a completed search from a capped incumbent. Use
 `online` to evaluate each immediate action by completing the deployable
 `future` heuristic from that branch, then commit only the first action. Its

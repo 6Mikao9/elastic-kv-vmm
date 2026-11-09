@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import socket
 import subprocess
@@ -184,15 +185,29 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--forbid-deadline-overcommit", action="store_true")
     parser.add_argument("--poll-interval-ms", type=float, default=10.0)
+    parser.add_argument("--cohort-barrier-timeout-s", type=float, default=5.0)
+    parser.add_argument("--max-cohort-start-skew-ms", type=float, default=100.0)
     args = parser.parse_args(argv)
     if not args.model_path.is_dir():
         parser.error("--model-path must be an existing directory")
     if args.plan is not None and args.workload is not None:
         parser.error("--plan and --workload are mutually exclusive")
+    timing_values = (
+        args.start_tolerance_ms,
+        args.request_timeout_s,
+        args.residency_evidence_timeout_s,
+        args.poll_interval_ms,
+        args.cohort_barrier_timeout_s,
+        args.max_cohort_start_skew_ms,
+    )
+    if any(not math.isfinite(value) for value in timing_values):
+        parser.error("timing values must be finite")
     if (
         args.start_tolerance_ms < 0
         or args.request_timeout_s <= 0
         or args.residency_evidence_timeout_s < 0
+        or args.cohort_barrier_timeout_s <= 0
+        or args.max_cohort_start_skew_ms < 0
     ):
         parser.error("request timeout must be positive; timing tolerances non-negative")
     if args.max_parallel is not None and args.max_parallel < 1:
@@ -390,6 +405,8 @@ def main(argv: list[str] | None = None) -> int:
                             if args.service_time_feedback
                             else None
                         ),
+                        cohort_barrier_timeout_s=args.cohort_barrier_timeout_s,
+                        max_cohort_start_skew_ms=args.max_cohort_start_skew_ms,
                     )
                 else:
                     with ThreadPoolExecutor(max_workers=3) as pool:
@@ -547,7 +564,7 @@ def main(argv: list[str] | None = None) -> int:
         result_path.write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
         print(json.dumps({"status": result["status"], "checks": checks, "stats": hook_stats}))
         return 0 if result["status"] == "passed" else 1
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - top-level CLI reports failures
         print(f"future scheduler smoke failed: {type(exc).__name__}: {exc}; log={log_path}", file=sys.stderr)
         return 1
     finally:

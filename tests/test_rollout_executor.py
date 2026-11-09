@@ -58,6 +58,18 @@ def submission(deadline_after_ms=100):
     )
 
 
+def without_deadline(item):
+    return replace(
+        item,
+        deadline_ms=None,
+        hint={
+            key: value
+            for key, value in item.hint.items()
+            if key != "deadline_after_ms"
+        },
+    )
+
+
 class RolloutExecutorTest(unittest.TestCase):
     def test_checked_in_known_future_plan_matches_executor_schema(self):
         path = (
@@ -903,6 +915,190 @@ class RolloutExecutorTest(unittest.TestCase):
                 generator=lambda *args: self.fail("request should not be sent"),
             )
 
+    def test_cohort_members_enter_default_executor_together(self):
+        base = submission()
+        cohort = [
+            without_deadline(replace(
+                base,
+                request_id=request_id,
+                planned_arrival_ms=0,
+                submit_at_ms=0,
+                prefill_batch_size=2,
+                cohort_id="batch-0",
+            ))
+            for request_id in ("first", "second")
+        ]
+        starts = {}
+        lock = threading.Lock()
+
+        def generate(url, spec, timeout, stream):
+            started = time.perf_counter()
+            with lock:
+                starts[spec["request_id"]] = started
+            return {
+                "_started_perf_s": started,
+                "end_to_end_s": 0.001,
+                "output_tokens": 8,
+                "ttft_s": 0.0005,
+                "tpot_s": 0.0001,
+            }
+
+        result = execute_rollout(
+            "http://server/generate",
+            cohort,
+            max_parallel=2,
+            generator=generate,
+            cohort_barrier_timeout_s=1.0,
+        )
+
+        self.assertEqual(set(starts), {"first", "second"})
+        self.assertLess(abs(starts["first"] - starts["second"]), 0.05)
+        self.assertEqual(result["summary"]["batched_cohort_count"], 1)
+        self.assertEqual(result["summary"]["batched_request_count"], 2)
+        self.assertTrue(
+            all(row["cohort_start_skew_ok"] for row in result["requests"])
+        )
+
+    def test_managed_executor_admits_cohort_as_one_inflight_group(self):
+        base = submission()
+        singleton = without_deadline(replace(
+            base,
+            request_id="singleton",
+            planned_arrival_ms=0,
+            submit_at_ms=0,
+        ))
+        cohort = [
+            without_deadline(replace(
+                base,
+                request_id=request_id,
+                planned_arrival_ms=20,
+                submit_at_ms=20,
+                estimated_finish_ms=50,
+                prefill_batch_size=2,
+                cohort_id="batch-0",
+            ))
+            for request_id in ("cohort-first", "cohort-second")
+        ]
+        singleton_started = threading.Event()
+        release_singleton = threading.Event()
+        cohort_started = threading.Event()
+
+        def generate(url, spec, timeout, stream):
+            started = time.perf_counter()
+            if spec["request_id"] == "singleton":
+                singleton_started.set()
+                release_singleton.wait(timeout=2.0)
+            else:
+                cohort_started.set()
+            return {
+                "_started_perf_s": started,
+                "end_to_end_s": 0.001,
+                "output_tokens": 8,
+                "ttft_s": 0.0005,
+                "tpot_s": 0.0001,
+            }
+
+        outcome = {}
+
+        def run():
+            try:
+                outcome["result"] = execute_rollout(
+                    "http://server/generate",
+                    [singleton, *cohort],
+                    max_inflight=2,
+                    max_parallel=2,
+                    max_submit_lateness_ms=1_000,
+                    generator=generate,
+                    poll_interval_ms=1,
+                    cohort_barrier_timeout_s=1.0,
+                )
+            except Exception as exc:  # noqa: BLE001 - re-raised below
+                outcome["error"] = exc
+
+        worker = threading.Thread(target=run)
+        worker.start()
+        self.assertTrue(singleton_started.wait(timeout=1.0))
+        self.assertFalse(cohort_started.wait(timeout=0.05))
+        release_singleton.set()
+        worker.join(timeout=3.0)
+        self.assertFalse(worker.is_alive())
+        if "error" in outcome:
+            raise outcome["error"]
+        self.assertTrue(cohort_started.is_set())
+        self.assertEqual(
+            outcome["result"]["summary"]["batched_request_count"], 2
+        )
+
+    def test_rejects_parallelism_smaller_than_cohort(self):
+        base = submission()
+        cohort = [
+            without_deadline(replace(
+                base,
+                request_id=f"member-{index}",
+                planned_arrival_ms=0,
+                submit_at_ms=0,
+                prefill_batch_size=2,
+                cohort_id="batch-0",
+            ))
+            for index in range(2)
+        ]
+        for kwargs, message in (
+            ({"max_parallel": 1}, "max_parallel must be at least"),
+            ({"max_inflight": 1}, "max_inflight must be at least"),
+        ):
+            with (
+                self.subTest(kwargs=kwargs),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                execute_rollout(
+                    "http://server/generate",
+                    cohort,
+                    generator=lambda *args: self.fail("request should not be sent"),
+                    **kwargs,
+                )
+
+    def test_rejects_cohort_start_skew_above_tolerance(self):
+        base = submission()
+        cohort = [
+            without_deadline(replace(
+                base,
+                request_id=request_id,
+                planned_arrival_ms=0,
+                submit_at_ms=0,
+                prefill_batch_size=2,
+                cohort_id="batch-0",
+            ))
+            for request_id in ("first", "second")
+        ]
+
+        def generate(url, spec, timeout, stream):
+            offset = 0.0 if spec["request_id"] == "first" else 0.01
+            return {
+                "_started_perf_s": time.perf_counter() + offset,
+                "end_to_end_s": 0.001,
+                "output_tokens": 8,
+                "ttft_s": 0.0005,
+                "tpot_s": 0.0001,
+            }
+
+        with self.assertRaisesRegex(RolloutExecutionError, "cohort start skew"):
+            execute_rollout(
+                "http://server/generate",
+                cohort,
+                max_parallel=2,
+                generator=generate,
+                max_cohort_start_skew_ms=1.0,
+            )
+
+    def test_rejects_nonfinite_timing_parameters_before_dispatch(self):
+        with self.assertRaisesRegex(ValueError, "timing parameters must be finite"):
+            execute_rollout(
+                "http://server/generate",
+                [submission()],
+                max_cohort_start_skew_ms=float("nan"),
+                generator=lambda *args: self.fail("request should not be sent"),
+            )
+
     def test_rejects_invalid_decode_batch_size(self):
         with self.assertRaisesRegex(
             RolloutExecutionError, "decode batch size must be positive"
@@ -1080,17 +1276,19 @@ class RolloutExecutorTest(unittest.TestCase):
                 "tpot_s": 0.002,
             }
 
-        with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaisesRegex(RolloutExecutionError, "evidence incomplete"):
-                execute_rollout(
-                    "http://server/generate",
-                    [submission()],
-                    clock=ReplayClock(clock.now, clock.sleep),
-                    generator=generate,
-                    residency_stats_dir=directory,
-                    require_residency_evidence=True,
-                    residency_evidence_timeout_s=0.2,
-                )
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            self.assertRaisesRegex(RolloutExecutionError, "evidence incomplete"),
+        ):
+            execute_rollout(
+                "http://server/generate",
+                [submission()],
+                clock=ReplayClock(clock.now, clock.sleep),
+                generator=generate,
+                residency_stats_dir=directory,
+                require_residency_evidence=True,
+                residency_evidence_timeout_s=0.2,
+            )
 
     def test_optional_partial_residency_evidence_is_marked_incomplete(self):
         clock = FakeClock()

@@ -412,6 +412,21 @@ cohort 的 placement 联合求解，可以在字节预算内选择 resident、Hi
 受控 rollout 的提交时刻与 hint，不会绕过原生容量检查。真实收益仍需在同一模型、
 同一硬件上采集 batch-size-specific prefill/decode 曲线后配对验证。
 
+执行器现在把 cohort 作为原子调度单位，而不是逐成员选择后碰巧并发发送。选择任一
+成员会把整个 cohort 展开；只有 worker 与 `max_inflight` 都能同时容纳全部成员时才
+开始提交。准入预算也按成员顺序累积，避免只检查第一条请求后让其兄弟绕过预算。
+所有成员共用同一个客户端 barrier，越过 barrier 后才进入 HTTP generator。结果记录
+`cohort_member_count`、`cohort_actual_start_skew_ms`、`cohort_start_skew_ok`，并
+在实测启动偏差超过 `--max-cohort-start-skew-ms` 时让整轮实验失败；受管与非受管
+执行路径使用相同语义。
+
+这条证据只证明客户端在接近同一时刻启动各个独立 HTTP 请求，不证明 SGLang 的服务端
+scheduler 已把它们放入同一个 prefill batch。当前 transport 尚未把 cohort ID 变成
+服务端 admission gate，网络、tokenization 和调度 tick 仍可能拆开请求。下一步必须在
+SGLang scheduler 记录真实 batch 成员，或等待完整 cohort 后再调用原生
+`PrefillAdder`；在此之前，`prefill_batch_profiles` 不能引用客户端 skew 作为同批吞吐
+已验证的依据。
+
 ### 4.2 受控 rollout 的可执行计划
 
 `plan_rollout()` 把离线策略结果转换成 orchestrator 可执行的动作。每个 action

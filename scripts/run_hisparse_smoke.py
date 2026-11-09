@@ -17,8 +17,8 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from benchmarks.client import digest_ids, prompt_ids, write_json
 from adaptive_sparse.future_plan import POLICIES
+from benchmarks.client import digest_ids, prompt_ids, write_json
 from scripts.run_case import HOST, PORT, ROOT, leader_exit, on_sigterm, stop_server
 
 
@@ -401,6 +401,8 @@ def main():
     parser.add_argument("--future-elastic-residency-budget", action="store_true")
     parser.add_argument("--future-forbid-deadline-overcommit", action="store_true")
     parser.add_argument("--future-poll-interval-ms", type=float, default=10.0)
+    parser.add_argument("--future-cohort-barrier-timeout-s", type=float, default=5.0)
+    parser.add_argument("--future-max-cohort-start-skew-ms", type=float, default=100.0)
     args = parser.parse_args()
     validate_server_endpoint(parser, host=args.host, port=args.port)
     base_url = server_base_url(args.host, args.port)
@@ -408,7 +410,22 @@ def main():
         parser.error("require a local MiniMax snapshot and TP >= 4")
     if args.future_plan is not None and args.future_workload is not None:
         parser.error("future plan and workload are mutually exclusive")
-    if args.future_start_tolerance_ms < 0 or args.future_request_timeout_s <= 0:
+    future_timing_values = (
+        args.future_start_tolerance_ms,
+        args.future_request_timeout_s,
+        args.future_residency_evidence_timeout_s,
+        args.future_poll_interval_ms,
+        args.future_cohort_barrier_timeout_s,
+        args.future_max_cohort_start_skew_ms,
+    )
+    if any(not math.isfinite(value) for value in future_timing_values):
+        parser.error("future timing values must be finite")
+    if (
+        args.future_start_tolerance_ms < 0
+        or args.future_request_timeout_s <= 0
+        or args.future_cohort_barrier_timeout_s <= 0
+        or args.future_max_cohort_start_skew_ms < 0
+    ):
         parser.error("future timing tolerance must be nonnegative and timeout positive")
     if args.future_residency_evidence_timeout_s < 0:
         parser.error("future residency evidence timeout must be nonnegative")
@@ -906,6 +923,12 @@ def main():
                             if args.future_service_time_feedback
                             else None
                         ),
+                        cohort_barrier_timeout_s=(
+                            args.future_cohort_barrier_timeout_s
+                        ),
+                        max_cohort_start_skew_ms=(
+                            args.future_max_cohort_start_skew_ms
+                        ),
                     )
                     sampler.take()
             finally:
@@ -1021,9 +1044,18 @@ def main():
                 if ((args.adaptive_force_demote_step and item["demotions"] < 1)
                         or (args.adaptive_force_promote_step and item["promotions"] < 1)):
                     raise RuntimeError("forced migration did not execute")
-            if args.logical_shadow and any(item["demotions"] or item["promotions"] for item in results["adaptive"]):
-                if any(item.get("migration_checked_tokens", 0) <= 0 for item in results["logical_shadow"]):
-                    raise RuntimeError("missing complete migration KV validation")
+            if (
+                args.logical_shadow
+                and any(
+                    item["demotions"] or item["promotions"]
+                    for item in results["adaptive"]
+                )
+                and any(
+                    item.get("migration_checked_tokens", 0) <= 0
+                    for item in results["logical_shadow"]
+                )
+            ):
+                raise RuntimeError("missing complete migration KV validation")
         if args.sm80_bf16_projections:
             step = "allocator_telemetry_validation"
             deadline = time.monotonic() + 60

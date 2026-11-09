@@ -17,11 +17,13 @@ from __future__ import annotations
 
 import json
 import math
+import threading
 import time
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any
 
 from .elastic_admission import (
     ElasticAdmissionDecision,
@@ -39,6 +41,85 @@ from .sglang_future_hook import (
 
 class RolloutExecutionError(RuntimeError):
     """A live plan violated a transport, timing, or evidence invariant."""
+
+
+def _execution_groups(
+    submissions: Sequence[RolloutSubmission],
+) -> tuple[tuple[RolloutSubmission, ...], ...]:
+    """Return chronological atomic submission groups for execution."""
+
+    groups: list[tuple[RolloutSubmission, ...]] = []
+    emitted_cohorts: set[str] = set()
+    for item in submissions:
+        if item.cohort_id is None:
+            groups.append((item,))
+            continue
+        if item.cohort_id in emitted_cohorts:
+            continue
+        emitted_cohorts.add(item.cohort_id)
+        groups.append(
+            tuple(
+                candidate
+                for candidate in submissions
+                if candidate.cohort_id == item.cohort_id
+            )
+        )
+    groups.sort(
+        key=lambda group: (
+            group[0].submit_at_ms,
+            min(item.request_id for item in group),
+        )
+    )
+    return tuple(groups)
+
+
+def _cohort_from_queue(
+    head: RolloutSubmission,
+    queue: Sequence[RolloutSubmission],
+) -> tuple[RolloutSubmission, ...]:
+    """Return all still-queued members of ``head``'s atomic cohort."""
+
+    if head.cohort_id is None:
+        return (head,)
+    return tuple(item for item in queue if item.cohort_id == head.cohort_id)
+
+
+def _admission_hold_bytes(admission: ElasticAdmissionDecision) -> int:
+    """Return the conservative in-flight charge used by managed admission."""
+
+    return (
+        admission.active_after_bytes
+        - admission.active_before_bytes
+        + admission.prefill_workspace_bytes
+    )
+
+
+def _barrier_generate(
+    cohort_id: str | None,
+    barrier: threading.Barrier | None,
+    timeout_s: float,
+    generate: Callable[[str, dict[str, object], float, bool], dict[str, object]],
+) -> Callable[[str, dict[str, object], float, bool], dict[str, object]]:
+    """Release all cohort workers into ``generate`` together."""
+
+    if barrier is None:
+        return generate
+
+    def synchronized(
+        url: str,
+        spec: dict[str, object],
+        timeout: float,
+        stream: bool,
+    ) -> dict[str, object]:
+        try:
+            barrier.wait(timeout=timeout_s)
+        except threading.BrokenBarrierError as exc:
+            raise RolloutExecutionError(
+                f"cohort {cohort_id}: dispatch barrier failed"
+            ) from exc
+        return generate(url, spec, timeout, stream)
+
+    return synchronized
 
 
 def _ceil_milliseconds(value: float) -> int:
@@ -468,11 +549,7 @@ class _PendingRequest:
         # The executor cannot observe SGLang's exact prefill completion boundary.
         # Keep each in-flight request's workspace charged until completion; this
         # is a conservative upper bound when multiple prefills overlap.
-        return (
-            self.admission.active_after_bytes
-            - self.admission.active_before_bytes
-            + self.admission.prefill_workspace_bytes
-        )
+        return _admission_hold_bytes(self.admission)
 
 
 def _duration_ms(
@@ -606,6 +683,9 @@ def _measure_result(
         ),
         "prompt_tokens": submission.prompt_tokens,
         "output_tokens": int(record["output_tokens"]),
+        "cohort_id": submission.cohort_id,
+        "prefill_batch_size": submission.prefill_batch_size,
+        "decode_batch_size": submission.decode_batch_size,
         "ttft_s": record["ttft_s"],
         "tpot_s": record["tpot_s"],
         "end_to_end_s": float(record["end_to_end_s"]),
@@ -666,6 +746,7 @@ def _execute_managed_rollout(
     generate: Callable[[str, dict[str, object], float, bool], dict[str, object]],
     poll_interval_s: float,
     service_time_estimator: ServiceTimeEstimator | None = None,
+    cohort_barrier_timeout_s: float = 5.0,
 ) -> tuple[list[dict[str, object]], list[str]]:
     """Dispatch through an observed in-flight set and aggregate byte budget."""
 
@@ -731,7 +812,7 @@ def _execute_managed_rollout(
                     except (TypeError, ValueError):
                         service_time_estimator.record_rejected_sample()
                 rows.append(row)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - worker failures are evidence
                 failures.append(
                     f"{item.submission.request_id}: {type(exc).__name__}: {exc}"
                 )
@@ -782,80 +863,104 @@ def _execute_managed_rollout(
                 ),
                 decode_tokens_per_s_by_residence=decode_by_residence,
             )
-            planned_residence = FutureHint.from_payload(
-                dict(submission.hint)
-            ).residence
+            cohort = _cohort_from_queue(submission, queue)
+            capacity = worker_count if max_inflight is None else max_inflight
+            if len(pending) + len(cohort) > capacity:
+                clock.sleep(poll_interval_s)
+                continue
+            cohort_ids = {item.request_id for item in cohort}
+            other_queue = tuple(
+                item for item in queue if item.request_id not in cohort_ids
+            )
             active_bytes = sum(item.hold_bytes for item in pending)
-            admission = None
-            if elastic_kv_config is not None:
-                admission = decide_elastic_admission(
-                    submission,
-                    active_bytes=active_bytes,
-                    config=elastic_kv_config,
-                    future_submissions=queue,
-                    now_ms=now_ms,
-                    prefill_tokens_per_s=feedback_rates.get(
-                        "prefill_tokens_per_s"
-                    ),
-                    decode_tokens_per_s=decode_by_residence.get(
-                        planned_residence
-                    ),
-                )
-                if admission.defer_for_budget:
-                    submission_hint = FutureHint.from_payload(
-                        dict(submission.hint)
-                    )
-                    predicted_duration = _duration_ms(
-                        submission,
-                        submission_hint,
-                        fallback_ms=max(
-                            1,
-                            submission.estimated_finish_ms
-                            - submission.submit_at_ms,
-                        ),
+            provisional_bytes = active_bytes
+            admissions: dict[str, ElasticAdmissionDecision | None] = {}
+            deferred: list[RolloutSubmission] = []
+            cohort_deadline_forced = False
+            for member in cohort:
+                admission = None
+                if elastic_kv_config is not None:
+                    planned_residence = FutureHint.from_payload(
+                        dict(member.hint)
+                    ).residence
+                    admission = decide_elastic_admission(
+                        member,
+                        active_bytes=provisional_bytes,
+                        config=elastic_kv_config,
+                        future_submissions=other_queue,
+                        now_ms=now_ms,
                         prefill_tokens_per_s=feedback_rates.get(
                             "prefill_tokens_per_s"
                         ),
-                        decode_tokens_per_s=feedback_rates.get(
-                            "decode_tokens_per_s"
+                        decode_tokens_per_s=decode_by_residence.get(
+                            planned_residence
                         ),
                     )
-                    deadline_forced = bool(
-                        allow_deadline_overcommit
-                        and submission.deadline_ms is not None
-                        and now_ms + predicted_duration > submission.deadline_ms
-                    )
-                    if pending and not deadline_forced:
-                        clock.sleep(poll_interval_s)
-                        continue
-                    if not pending and not deadline_forced:
-                        raise RolloutExecutionError(
-                            f"{submission.request_id}: bounded KV hot set plus "
-                            "prefill workspace exceeds the total elastic budget"
+                    if admission.defer_for_budget:
+                        member_hint = FutureHint.from_payload(dict(member.hint))
+                        predicted_duration = _duration_ms(
+                            member,
+                            member_hint,
+                            fallback_ms=max(
+                                1,
+                                member.estimated_finish_ms - member.submit_at_ms,
+                            ),
+                            prefill_tokens_per_s=feedback_rates.get(
+                                "prefill_tokens_per_s"
+                            ),
+                            decode_tokens_per_s=feedback_rates.get(
+                                "decode_tokens_per_s"
+                            ),
                         )
+                        forced = bool(
+                            allow_deadline_overcommit
+                            and member.deadline_ms is not None
+                            and now_ms + predicted_duration > member.deadline_ms
+                        )
+                        cohort_deadline_forced = cohort_deadline_forced or forced
+                        if not forced:
+                            deferred.append(member)
+                    provisional_bytes += _admission_hold_bytes(admission)
+                admissions[member.request_id] = admission
+            if deferred and not cohort_deadline_forced:
+                if pending:
+                    clock.sleep(poll_interval_s)
+                    continue
+                raise RolloutExecutionError(
+                    f"{deferred[0].request_id}: bounded KV hot set plus "
+                    "prefill workspace exceeds the total elastic budget"
+                )
 
             dispatch_ms = (clock.now() - origin) * 1000.0
-            dispatch_lateness_ms = dispatch_ms - submission.submit_at_ms
+            dispatch_lateness_ms = dispatch_ms - cohort[0].submit_at_ms
             capacity_delay_ms = max(0.0, dispatch_lateness_ms)
-            spec: dict[str, object] = {
-                "request_id": submission.request_id,
-                "input_tokens": submission.prompt_tokens,
-                "requested_output_tokens": submission.output_tokens,
-                "kind": submission.kind,
-            }
-            if emit_hints:
+            dispatch_barrier = (
+                threading.Barrier(len(cohort)) if len(cohort) > 1 else None
+            )
+            synchronized_generate = _barrier_generate(
+                cohort[0].cohort_id,
+                dispatch_barrier,
+                cohort_barrier_timeout_s,
+                generate,
+            )
+            for member in cohort:
+                admission = admissions[member.request_id]
+                spec: dict[str, object] = {
+                    "request_id": member.request_id,
+                    "input_tokens": member.prompt_tokens,
+                    "requested_output_tokens": member.output_tokens,
+                    "kind": member.kind,
+                }
                 emitted_residence = (
                     admission.chosen_residence
                     if admission is not None
-                    else FutureHint.from_payload(dict(submission.hint)).residence
+                    else FutureHint.from_payload(dict(member.hint)).residence
                 )
                 emitted_feedback = (
                     {}
                     if service_time_estimator is None
                     else (
-                        service_time_estimator.rates(
-                            residence=emitted_residence
-                        )
+                        service_time_estimator.rates(residence=emitted_residence)
                         if _service_time_residence(emitted_residence) is not None
                         else {
                             key: value
@@ -864,54 +969,57 @@ def _execute_managed_rollout(
                         }
                     )
                 )
-                dispatch_clock_s = clock.now()
-                deadline_after_ms = (
-                    None
-                    if submission.deadline_ms is None
-                    else max(0, submission.deadline_ms - dispatch_ms)
-                )
-                spec["future_hint"] = make_kv_hints(
-                    submission,
-                    deadline_after_ms=(
+                if emit_hints:
+                    dispatch_clock_s = clock.now()
+                    deadline_after_ms = (
                         None
-                        if deadline_after_ms is None
-                        else _ceil_milliseconds(deadline_after_ms)
-                    ),
-                    clock_now_s=dispatch_clock_s,
-                    residence_override=(
-                        None
-                        if admission is None
-                        or admission.chosen_residence
-                        == FutureHint.from_payload(dict(submission.hint)).residence
-                        else admission.chosen_residence
-                    ),
-                    prefill_tokens_per_s=emitted_feedback.get(
-                        "prefill_tokens_per_s"
-                    ),
-                    decode_tokens_per_s=emitted_feedback.get(
-                        "decode_tokens_per_s"
-                    ),
+                        if member.deadline_ms is None
+                        else max(0, member.deadline_ms - dispatch_ms)
+                    )
+                    spec["future_hint"] = make_kv_hints(
+                        member,
+                        deadline_after_ms=(
+                            None
+                            if deadline_after_ms is None
+                            else _ceil_milliseconds(deadline_after_ms)
+                        ),
+                        clock_now_s=dispatch_clock_s,
+                        residence_override=(
+                            None
+                            if admission is None
+                            or admission.chosen_residence
+                            == FutureHint.from_payload(dict(member.hint)).residence
+                            else admission.chosen_residence
+                        ),
+                        prefill_tokens_per_s=emitted_feedback.get(
+                            "prefill_tokens_per_s"
+                        ),
+                        decode_tokens_per_s=emitted_feedback.get(
+                            "decode_tokens_per_s"
+                        ),
+                    )
+                queue.remove(member)
+                future = pool.submit(
+                    synchronized_generate, url, spec, timeout_s, stream
                 )
-            queue.remove(submission)
-            future = pool.submit(generate, url, spec, timeout_s, stream)
-            pending.append(
-                _PendingRequest(
-                    submission=submission,
-                    future=future,
-                    dispatch_lateness_ms=dispatch_lateness_ms,
-                    capacity_delay_ms=capacity_delay_ms,
-                    admission=admission,
-                    prefill_tokens_per_s_hint=emitted_feedback.get(
-                        "prefill_tokens_per_s"
-                    ),
-                    decode_tokens_per_s_hint=emitted_feedback.get(
-                        "decode_tokens_per_s"
-                    ),
-                    decode_feedback_residence=_service_time_residence(
-                        emitted_residence
-                    ),
+                pending.append(
+                    _PendingRequest(
+                        submission=member,
+                        future=future,
+                        dispatch_lateness_ms=dispatch_lateness_ms,
+                        capacity_delay_ms=capacity_delay_ms,
+                        admission=admission,
+                        prefill_tokens_per_s_hint=emitted_feedback.get(
+                            "prefill_tokens_per_s"
+                        ),
+                        decode_tokens_per_s_hint=emitted_feedback.get(
+                            "decode_tokens_per_s"
+                        ),
+                        decode_feedback_residence=_service_time_residence(
+                            emitted_residence
+                        ),
+                    )
                 )
-            )
         harvest()
     return rows, failures
 
@@ -924,6 +1032,7 @@ def _finalize_rollout(
     residency_stats_dir: str | Path | None,
     require_residency_evidence: bool,
     residency_evidence_timeout_s: float,
+    max_cohort_start_skew_ms: float,
 ) -> dict[str, object]:
     rows.sort(key=lambda row: (int(row["actual_submit_ms"]), str(row["request_id"])))
     residency: dict[str, object] | None = None
@@ -973,6 +1082,29 @@ def _finalize_rollout(
                 row["residency_rank_count"] = evidence.get("rank_count")
 
     deadline_rows = [row for row in rows if row["deadline_target_ms"] is not None]
+    cohorts: dict[str, list[dict[str, object]]] = {}
+    for row in rows:
+        cohort_id = row.get("cohort_id")
+        if isinstance(cohort_id, str):
+            cohorts.setdefault(cohort_id, []).append(row)
+    violations: list[str] = []
+    max_observed_skew_ms = 0.0
+    for cohort_id, members in cohorts.items():
+        starts = [float(row["actual_submit_ms"]) for row in members]
+        skew_ms = max(starts) - min(starts)
+        max_observed_skew_ms = max(max_observed_skew_ms, skew_ms)
+        violated = len(members) > 1 and skew_ms > max_cohort_start_skew_ms
+        if violated:
+            violations.append(
+                f"{cohort_id}: actual cohort start skew {skew_ms:.1f} ms "
+                f"exceeds {max_cohort_start_skew_ms:.1f} ms"
+            )
+        for row in members:
+            row["cohort_member_count"] = len(members)
+            row["cohort_actual_start_skew_ms"] = skew_ms
+            row["cohort_start_skew_ok"] = not violated
+    if violations:
+        raise RolloutExecutionError("; ".join(violations))
     summary = {
         "request_count": len(rows),
         "completed": len(rows) == len(submissions),
@@ -1010,6 +1142,15 @@ def _finalize_rollout(
             row.get("elastic_admission_reason") == "prefill-headroom-demotion"
             for row in rows
         ),
+        "cohort_count": len(cohorts),
+        "batched_cohort_count": sum(
+            len(members) > 1 for members in cohorts.values()
+        ),
+        "batched_request_count": sum(
+            len(members) for members in cohorts.values() if len(members) > 1
+        ),
+        "max_cohort_actual_start_skew_ms": max_observed_skew_ms,
+        "cohort_start_skew_violations": 0,
         "efficiency": _efficiency(rows),
     }
     return {
@@ -1039,27 +1180,58 @@ def execute_rollout(
     allow_deadline_overcommit: bool = True,
     poll_interval_ms: float = 10.0,
     service_time_estimator: ServiceTimeEstimator | None = None,
+    cohort_barrier_timeout_s: float = 5.0,
+    max_cohort_start_skew_ms: float = 100.0,
 ) -> dict[str, object]:
     """Run every planned request and return measured, JSON-safe evidence."""
 
-    if timeout_s <= 0 or max_submit_lateness_ms < 0 or residency_evidence_timeout_s < 0:
+    timing_values = (
+        timeout_s,
+        max_submit_lateness_ms,
+        residency_evidence_timeout_s,
+        cohort_barrier_timeout_s,
+        max_cohort_start_skew_ms,
+        poll_interval_ms,
+    )
+    if any(not math.isfinite(value) for value in timing_values):
+        raise ValueError("timing parameters must be finite")
+    if (
+        timeout_s <= 0
+        or max_submit_lateness_ms < 0
+        or residency_evidence_timeout_s < 0
+        or cohort_barrier_timeout_s <= 0
+        or max_cohort_start_skew_ms < 0
+    ):
         raise ValueError(
-            "request timeout must be positive; timing tolerances must be nonnegative"
+            "request and barrier timeouts must be positive; timing tolerances "
+            "must be nonnegative"
         )
     submissions = validate_submissions(
         rollout.submissions if isinstance(rollout, RolloutPlan) else rollout
     )
     replay_clock = clock or ReplayClock()
     generate = generator or _default_generate
-    worker_count = len(submissions) if max_parallel is None else max_parallel
+    execution_groups = _execution_groups(submissions)
+    max_cohort_size = max(len(group) for group in execution_groups)
+    worker_count = (
+        len(submissions) if max_parallel is None else max_parallel
+    )
     if worker_count < 1:
         raise ValueError("max_parallel must be positive")
+    if worker_count < max_cohort_size:
+        raise ValueError(
+            "max_parallel must be at least the largest cohort size"
+        )
     if max_inflight is not None and (
         isinstance(max_inflight, bool)
         or not isinstance(max_inflight, int)
         or max_inflight < 1
     ):
         raise ValueError("max_inflight must be a positive integer")
+    if max_inflight is not None and max_inflight < max_cohort_size:
+        raise ValueError(
+            "max_inflight must be at least the largest cohort size"
+        )
     if queue_policy not in ("timeline", "deadline"):
         raise ValueError("queue_policy must be timeline or deadline")
     if poll_interval_ms <= 0 or not math.isfinite(poll_interval_ms):
@@ -1087,6 +1259,7 @@ def execute_rollout(
             generate=generate,
             poll_interval_s=poll_interval_ms / 1000.0,
             service_time_estimator=service_time_estimator,
+            cohort_barrier_timeout_s=cohort_barrier_timeout_s,
         )
         if failures:
             raise RolloutExecutionError("; ".join(failures))
@@ -1097,6 +1270,7 @@ def execute_rollout(
             residency_stats_dir=residency_stats_dir,
             require_residency_evidence=require_residency_evidence,
             residency_evidence_timeout_s=residency_evidence_timeout_s,
+            max_cohort_start_skew_ms=max_cohort_start_skew_ms,
         )
         if service_time_estimator is not None:
             result["summary"]["service_time_estimator"] = (
@@ -1106,170 +1280,82 @@ def execute_rollout(
     origin = replay_clock.now()
     pending = []
     with ThreadPoolExecutor(max_workers=worker_count) as pool:
-        for submission in submissions:
-            _wait_until(origin + submission.submit_at_ms / 1000.0, replay_clock)
+        for group in execution_groups:
+            head = group[0]
+            _wait_until(origin + head.submit_at_ms / 1000.0, replay_clock)
             dispatch_s = replay_clock.now() - origin
-            dispatch_lateness_ms = dispatch_s * 1000.0 - submission.submit_at_ms
+            dispatch_lateness_ms = dispatch_s * 1000.0 - head.submit_at_ms
             if dispatch_lateness_ms > max_submit_lateness_ms:
                 raise RolloutExecutionError(
-                    f"{submission.request_id}: dispatch late by {dispatch_lateness_ms:.1f} ms"
+                    f"{head.request_id}: dispatch late by {dispatch_lateness_ms:.1f} ms"
                 )
-            spec: dict[str, object] = {
-                "request_id": submission.request_id,
-                "input_tokens": submission.prompt_tokens,
-                "requested_output_tokens": submission.output_tokens,
-                "kind": submission.kind,
-            }
-            if emit_hints:
-                dispatch_clock_s = replay_clock.now()
-                deadline_after_ms = (
-                    None
-                    if submission.deadline_ms is None
-                    else max(0, submission.deadline_ms - dispatch_s * 1000.0)
-                )
-                spec["future_hint"] = make_kv_hints(
-                    submission,
-                    deadline_after_ms=(
+            dispatch_barrier = (
+                threading.Barrier(len(group)) if len(group) > 1 else None
+            )
+            synchronized_generate = _barrier_generate(
+                head.cohort_id,
+                dispatch_barrier,
+                cohort_barrier_timeout_s,
+                generate,
+            )
+            for submission in group:
+                spec: dict[str, object] = {
+                    "request_id": submission.request_id,
+                    "input_tokens": submission.prompt_tokens,
+                    "requested_output_tokens": submission.output_tokens,
+                    "kind": submission.kind,
+                }
+                if emit_hints:
+                    dispatch_clock_s = replay_clock.now()
+                    deadline_after_ms = (
                         None
-                        if deadline_after_ms is None
-                        else _ceil_milliseconds(deadline_after_ms)
-                    ),
-                    clock_now_s=dispatch_clock_s,
+                        if submission.deadline_ms is None
+                        else max(0, submission.deadline_ms - dispatch_s * 1000.0)
+                    )
+                    spec["future_hint"] = make_kv_hints(
+                        submission,
+                        deadline_after_ms=(
+                            None
+                            if deadline_after_ms is None
+                            else _ceil_milliseconds(deadline_after_ms)
+                        ),
+                        clock_now_s=dispatch_clock_s,
+                    )
+                future = pool.submit(
+                    synchronized_generate, url, spec, timeout_s, stream
                 )
-            future = pool.submit(generate, url, spec, timeout_s, stream)
-            pending.append((submission, dispatch_lateness_ms, future))
+                pending.append((submission, dispatch_lateness_ms, future))
 
         rows: list[dict[str, object]] = []
         failures: list[str] = []
         for submission, dispatch_lateness_ms, future in pending:
             try:
                 record = future.result()
-            except Exception as exc:
-                failures.append(f"{submission.request_id}: {type(exc).__name__}: {exc}")
-                continue
-            for key in ("_started_perf_s", "end_to_end_s", "output_tokens", "ttft_s", "tpot_s"):
-                if key not in record:
-                    failures.append(f"{submission.request_id}: result lacks {key}")
-                    break
-            else:
-                if int(record["output_tokens"]) != submission.output_tokens:
-                    failures.append(
-                        f"{submission.request_id}: output token count differs from plan"
-                    )
-                    continue
-                actual_submit_ms = (float(record["_started_perf_s"]) - origin) * 1000.0
-                submit_lateness_ms = actual_submit_ms - submission.submit_at_ms
-                if submit_lateness_ms > max_submit_lateness_ms:
-                    failures.append(
-                        f"{submission.request_id}: actual submit late by {submit_lateness_ms:.1f} ms"
-                    )
-                    continue
-                actual_finish_ms = actual_submit_ms + float(record["end_to_end_s"]) * 1000.0
-                deadline_target_ms = _deadline_target_ms(submission)
-                if deadline_target_ms is not None:
-                    planned_deadline_hit = submission.estimated_finish_ms <= deadline_target_ms
-                    actual_deadline_hit = actual_finish_ms <= deadline_target_ms
-                else:
-                    planned_deadline_hit = actual_deadline_hit = None
                 rows.append(
-                    {
-                        "request_id": submission.request_id,
-                        "kind": submission.kind,
-                        "planned_arrival_ms": submission.planned_arrival_ms,
-                        "planned_submit_ms": submission.submit_at_ms,
-                        "planned_finish_ms": submission.estimated_finish_ms,
-                        "actual_submit_ms": actual_submit_ms,
-                        "actual_finish_ms": actual_finish_ms,
-                        "submit_lateness_ms": submit_lateness_ms,
-                        "dispatch_lateness_ms": dispatch_lateness_ms,
-                        "finish_error_ms": actual_finish_ms - submission.estimated_finish_ms,
-                        "deadline_target_ms": deadline_target_ms,
-                        "planned_deadline_hit": planned_deadline_hit,
-                        "actual_deadline_hit": actual_deadline_hit,
-                        "planned_residence": FutureHint.from_payload(
-                            submission.hint
-                        ).residence,
-                        "prompt_tokens": submission.prompt_tokens,
-                        "output_tokens": int(record["output_tokens"]),
-                        "ttft_s": record["ttft_s"],
-                        "tpot_s": record["tpot_s"],
-                        "end_to_end_s": float(record["end_to_end_s"]),
-                    }
+                    _measure_result(
+                        submission,
+                        record,
+                        origin=origin,
+                        dispatch_lateness_ms=dispatch_lateness_ms,
+                        capacity_delay_ms=0.0,
+                        admission=None,
+                        max_submit_lateness_ms=max_submit_lateness_ms,
+                        strict_submit_timing=True,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - worker failures are evidence
+                failures.append(
+                    f"{submission.request_id}: {type(exc).__name__}: {exc}"
                 )
 
     if failures:
         raise RolloutExecutionError("; ".join(failures))
-    rows.sort(key=lambda row: (int(row["actual_submit_ms"]), str(row["request_id"])))
-
-    residency: dict[str, object] | None = None
-    if residency_stats_dir is not None:
-        request_ids = {str(row["request_id"]) for row in rows}
-        evidence_deadline = replay_clock.now() + residency_evidence_timeout_s
-        while True:
-            residency = collect_residency_evidence(residency_stats_dir)
-            if _residency_evidence_ready(
-                residency,
-                request_ids,
-            ):
-                break
-            remaining = evidence_deadline - replay_clock.now()
-            if remaining <= 0:
-                break
-            replay_clock.sleep(min(0.05, remaining))
-        assert residency is not None
-        if require_residency_evidence and not _residency_evidence_ready(
-            residency,
-            request_ids,
-        ):
-            raise RolloutExecutionError(
-                "residency evidence incomplete: "
-                f"{residency.get('reason', 'missing request or TP-rank decision')}"
-            )
-        if residency.get("available"):
-            decisions = _residency_request_rows(residency)
-            for row in rows:
-                evidence = decisions.get(row["request_id"])
-                if not isinstance(evidence, Mapping):
-                    if require_residency_evidence:
-                        raise RolloutExecutionError(
-                            f"{row['request_id']}: missing per-request residency evidence"
-                        )
-                    row["actual_residence"] = None
-                    row["residency_match"] = None
-                    continue
-                if not evidence.get("all_ranks_agree"):
-                    if evidence.get("actual_residence") == "conflict":
-                        raise RolloutExecutionError(
-                            f"{row['request_id']}: TP ranks disagree on residency"
-                        )
-                    row["actual_residence"] = None
-                    row["residency_match"] = None
-                    row["residency_incomplete"] = True
-                    continue
-                actual = evidence.get("actual_residence")
-                row["actual_residence"] = actual
-                row["residency_match"] = actual == row["planned_residence"]
-                row["residency_rank_count"] = evidence.get("rank_count")
-
-    deadline_rows = [row for row in rows if row["deadline_target_ms"] is not None]
-    summary = {
-        "request_count": len(rows),
-        "completed": len(rows) == len(submissions),
-        "max_submit_lateness_ms": max(float(row["submit_lateness_ms"]) for row in rows),
-        "max_abs_finish_error_ms": max(abs(float(row["finish_error_ms"])) for row in rows),
-        "deadline_count": len(deadline_rows),
-        "deadline_hits": sum(row["actual_deadline_hit"] is True for row in deadline_rows),
-        "deadline_misses": sum(row["actual_deadline_hit"] is False for row in deadline_rows),
-        "scheduled_misses": sum(
-            row["planned_deadline_hit"] is False for row in deadline_rows
-        ),
-        "residency_mismatches": sum(
-            row.get("residency_match") is False for row in rows
-        ),
-        "efficiency": _efficiency(rows),
-    }
-    return {
-        "requests": rows,
-        "summary": summary,
-        "residency_evidence": residency,
-    }
+    return _finalize_rollout(
+        rows,
+        submissions,
+        clock=replay_clock,
+        residency_stats_dir=residency_stats_dir,
+        require_residency_evidence=require_residency_evidence,
+        residency_evidence_timeout_s=residency_evidence_timeout_s,
+        max_cohort_start_skew_ms=max_cohort_start_skew_ms,
+    )
