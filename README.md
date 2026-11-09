@@ -235,6 +235,16 @@ dispatch, and records planned versus actual latency and residency. This keeps
 transport and tokenization delay from becoming extra deadline slack; cross-host
 clocks require a separate calibration protocol. A matching unhinted control arm
 can be run with `--no-hints` for paired real-serving measurements.
+Setting `preannounce_lead_ms` in the executor submits known future work before
+its planned arrival and sends `release_after_ms` plus a host-local
+`perf_counter` release timestamp. With
+`EKV_HARD_RELEASE_GATE=1` (also exposed by the launcher), SGLang can inspect the
+request in its waiting queue for future-prefill, prefix and predictive-VMM
+decisions while the hook withholds it immediately before native `PrefillAdder`.
+The request is restored to its original queue position at release; all native
+admission checks still run. The gate defaults off, and smoke runners fail closed
+unless their telemetry observes a hold without gate errors. See the
+[server options](docs/SERVER.md) and [controlled rollout smoke](docs/FUTURE_SCHEDULER_SMOKE.md).
 The offline comparison also includes a bounded `oracle` policy. It searches
 request order, resident/HiSparse placement and intentional idle transitions;
 identical request signatures are collapsed, and the better of the deployable

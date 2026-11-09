@@ -188,6 +188,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--poll-interval-ms", type=float, default=10.0)
     parser.add_argument("--cohort-barrier-timeout-s", type=float, default=5.0)
     parser.add_argument("--max-cohort-start-skew-ms", type=float, default=100.0)
+    parser.add_argument(
+        "--preannounce-lead-ms",
+        type=int,
+        default=0,
+        help="submit planned requests early and hard-gate their prefill",
+    )
     args = parser.parse_args(argv)
     if not args.model_path.is_dir():
         parser.error("--model-path must be an existing directory")
@@ -217,6 +223,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--max-inflight must be positive")
     if args.poll_interval_ms <= 0:
         parser.error("--poll-interval-ms must be positive")
+    if not 0 <= args.preannounce_lead_ms <= 60_000:
+        parser.error("--preannounce-lead-ms must be between 0 and 60000")
     if args.require_residency_evidence and args.residency_stats_dir is None:
         parser.error("--require-residency-evidence needs --residency-stats-dir")
     if args.plan is None and args.workload is None:
@@ -236,6 +244,13 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--service-time-feedback requires --plan or --workload")
     if args.service_time_feedback and args.no_hints:
         parser.error("--service-time-feedback requires emitted future hints")
+    if args.preannounce_lead_ms:
+        if args.plan is None and args.workload is None:
+            parser.error("--preannounce-lead-ms requires --plan or --workload")
+        if args.no_hints:
+            parser.error("--preannounce-lead-ms requires emitted future hints")
+        if args.future_policy == "off":
+            parser.error("--preannounce-lead-ms requires --future-policy deadline")
     if not 0 < args.service_time_ewma_alpha <= 1:
         parser.error("--service-time-ewma-alpha must be in (0, 1]")
     if (args.plan is not None or args.workload is not None) and not args.no_hints and args.future_policy == "off":
@@ -313,6 +328,9 @@ def main(argv: list[str] | None = None) -> int:
         EKV_STATS_PATH=str(vmm_stats_path),
         PYTHONUNBUFFERED="1",
     )
+    env.pop("EKV_HARD_RELEASE_GATE", None)
+    if args.preannounce_lead_ms:
+        env["EKV_HARD_RELEASE_GATE"] = "1"
     server_command = [
         sys.executable,
         "-m",
@@ -353,6 +371,8 @@ def main(argv: list[str] | None = None) -> int:
     ]
     if args.disable_cuda_graph:
         server_command.append("--disable-cuda-graph")
+    if args.preannounce_lead_ms:
+        server_command.append("--elastic-hard-release-gate")
     server = None
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as address:
@@ -408,6 +428,7 @@ def main(argv: list[str] | None = None) -> int:
                         ),
                         cohort_barrier_timeout_s=args.cohort_barrier_timeout_s,
                         max_cohort_start_skew_ms=args.max_cohort_start_skew_ms,
+                        preannounce_lead_ms=args.preannounce_lead_ms,
                     )
                 else:
                     with ThreadPoolExecutor(max_workers=3) as pool:
@@ -458,6 +479,13 @@ def main(argv: list[str] | None = None) -> int:
                         ),
                     }
                 )
+                if args.preannounce_lead_ms:
+                    checks["preannounce_gate_observed"] = bool(
+                        hook_stats
+                        and hook_stats.get("hard_release_gate_ticks", 0) > 0
+                        and hook_stats.get("hard_release_gate_holds", 0) > 0
+                        and hook_stats.get("hard_release_gate_errors", 0) == 0
+                    )
             if args.require_residency_evidence:
                 checks["residency_evidence"] = bool(
                     planned_result["residency_evidence"]
@@ -490,6 +518,7 @@ def main(argv: list[str] | None = None) -> int:
                 "max_inflight": args.max_inflight,
                 "queue_policy": args.queue_policy,
                 "elastic_residency_budget": args.elastic_residency_budget,
+                "preannounce_lead_ms": args.preannounce_lead_ms,
             }
             result_path.write_text(
                 json.dumps(result, indent=2, sort_keys=True), encoding="utf-8"

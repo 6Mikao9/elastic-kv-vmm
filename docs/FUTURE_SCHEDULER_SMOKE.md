@@ -77,13 +77,21 @@ an already emitted plan. Each run is still isolated in a fresh output directory:
 bash scripts/container_future_smoke.sh \
   2 /path/to/model results/future-planning/future-hints \
   --workload benchmarks/workloads/known-future-rollout.json \
-  --planning-policy future --future-policy deadline
+  --planning-policy future --future-policy deadline \
+  --preannounce-lead-ms 250
 
 bash scripts/container_future_smoke.sh \
   2 /path/to/model results/future-planning/fifo-no-hints \
   --workload benchmarks/workloads/known-future-rollout.json \
   --planning-policy fifo --future-policy off --no-hints
 ```
+
+With a positive `--preannounce-lead-ms`, the executor submits known future work
+before its planned arrival and stamps the remaining lead into
+`release_after_ms`. The runner enables the server's hard release gate and fails
+unless telemetry shows gate ticks and at least one held request with no gate
+errors. The gate preserves the original absolute deadline and restores a
+released request to its prior waiting-queue position.
 
 `results.json` separates planned and actual submit/finish times, records deadline
 hit/miss against the original absolute deadline, and reports throughput over the
@@ -106,9 +114,10 @@ and the pre/post-admission byte ledger are preserved in `results.json`.
 
 ## Limits
 
-- `release_after_ms` is currently a soft ordering preference. It is not a hard
-  admission gate; safely skipping a waiting request requires a scheduler-level
-  change that preserves every native `PrefillAdder` check.
+- `release_after_ms` remains a soft ordering preference by default. With the
+  opt-in hard release gate, preannounced requests are withheld only before the
+  native `PrefillAdder`; all of its token, request-slot, radix, grammar, LoRA and
+  memory checks still determine the final prefill batch.
 - The hook computes remaining slack from SGLang's scheduler receive time and
   never crosses the engine's native priority tier.
 - SGLang 0.5.2 and 0.5.17 use the guarded compatibility transport described in

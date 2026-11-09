@@ -14,7 +14,12 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
-from .sglang_future_hook import _extract_hint, _prompt_tokens, _request_age_ms
+from .sglang_future_hook import (
+    _extract_hint,
+    _prompt_tokens,
+    _request_age_ms,
+    release_remaining_ms,
+)
 
 PREFILL_RESERVATION_MODES = ("off", "dry_run", "enforce")
 
@@ -49,7 +54,9 @@ class FuturePrefillConfig:
         if self.sparse_hot_tokens < 1:
             raise ValueError("sparse_hot_tokens must be positive")
         if not isinstance(self.kind_activation_bytes_per_token, tuple):
-            raise ValueError("kind activation overrides must be a tuple of pairs")
+            raise ValueError(  # noqa: TRY004 - preserve the public validation type
+                "kind activation overrides must be a tuple of pairs"
+            )
         seen = set()
         for kind, value in self.kind_activation_bytes_per_token:
             if not isinstance(kind, str) or not kind or len(kind) > 64:
@@ -137,7 +144,9 @@ class FuturePrefillPlan:
         if lead_ms is None:
             return self.kv_bytes
         if isinstance(lead_ms, bool):
-            raise ValueError("prewarm lead must be a finite nonnegative number")
+            raise ValueError(  # noqa: TRY004 - preserve the public validation type
+                "prewarm lead must be a finite nonnegative number"
+            )
         try:
             lead = float(lead_ms)
         except (TypeError, ValueError) as exc:
@@ -369,7 +378,9 @@ def plan_future_prefill(
                 missing += 1
                 continue
             age_ms = _request_age_ms(request, now_s)
-            release_in_ms = hint.release_after_ms - age_ms
+            release_in_ms = release_remaining_ms(
+                hint, now_s=now_s, age_ms=age_ms
+            )
             if release_in_ms > config.horizon_ms:
                 deferred += 1
                 continue

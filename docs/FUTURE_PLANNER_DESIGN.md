@@ -64,6 +64,8 @@ Mamba 和 paged allocator 约束仍由原生 `PrefillAdder` 决定。规划器�
   "action_version": "2",
   "payload": {
     "release_after_ms": 250,
+    "release_clock": "perf_counter",
+    "release_absolute_ms": 9123456050,
     "deadline_after_ms": 1800,
     "deadline_clock": "perf_counter",
     "deadline_absolute_ms": 9123456800,
@@ -171,8 +173,9 @@ MVP 不求解任意加权优化问题，而是使用可解释的字典序，避�
 打分：
 
 1. 保留 SGLang 已有的硬 priority 语义和 FCFS 平局规则；
-2. 未到 `release_at` 的请求放到已释放请求之后；这是软排序提示，不是硬准入
-   门槛，`PrefillAdder` 的遍历仍可能尝试后面的未释放请求；
+2. 未到 `release_at` 的请求放到已释放请求之后；默认这是软排序提示，
+   `PrefillAdder` 的遍历仍可能尝试后面的未释放请求。显式开启 hard release
+   gate 后，未释放请求会在原生 `PrefillAdder` 之前被临时移出并在到期后恢复；
 3. 已释放请求中优先 `latest_start` 更早者：
 
    ```text
@@ -457,9 +460,14 @@ radix、grammar、LoRA 与显存容量。因此这里不会通过模拟或 monke
 
 `plan_rollout()` 把离线策略结果转换成 orchestrator 可执行的动作。每个 action
 包含原始与计划到达时间、预计完成时间、请求类型，以及可直接放入
-`elastic.future` payload 的字段。控制器在 `submit_at_ms` 才实际提交请求；
+`elastic.future` payload 的字段。默认控制器在 `submit_at_ms` 才实际提交请求；
 hint 使用 `release_after_ms=0`，并把绝对 deadline 换算成相对 scheduler
-接收时刻的 `deadline_after_ms`。
+接收时刻的 `deadline_after_ms`。设置 `preannounce_lead_ms > 0` 后，控制器会
+提前提交已知未来请求，并在运行时覆盖 hint 的 `release_after_ms`。运行时还会
+写入同源 `perf_counter` 的 `release_clock/release_absolute_ms`，避免网络与
+tokenization 延迟把实际释放时刻整体推后；跨主机客户端必须先校准时钟。服务端只有
+显式开启 hard release gate 时才会把请求暂缓在原生 `PrefillAdder` 之前；关闭
+该门控时，预公告请求仍按软排序语义参与原生调度。
 
 ```bash
 python3 scripts/future_plan_compare.py \
@@ -479,8 +487,9 @@ python3 scripts/future_plan_compare.py \
 绝对字段并分别验证两者的一致性。
 
 执行器在发出任何 HTTP 请求之前拒绝以下不一致：重复 ID、到达时间晚于提交时间、
-预估完成早于提交、hint 的 `kind` 或输出长度与 submission 不同、控制器填充了
-非零 `release_after_ms`、相对 deadline 与原始绝对 deadline 不一致，以及
+预估完成早于提交、hint 的 `kind` 或输出长度与 submission 不同、静态计划自行
+填充了非零 `release_after_ms`（该字段由运行时预公告路径生成）、相对 deadline
+与原始绝对 deadline 不一致，以及
 `max_parallel=0`。实际请求启动超过允许抖动、响应 token 数不足或 TP rank 对同一
 请求的驻留结论不一致，都会使整轮实验失败。应用 deadline miss 则作为结果保留，
 不会伪装成传输失败。
@@ -582,8 +591,9 @@ workload 生成，但服务端执行原生排队。两次运行必须写到不�
 
 当有限 horizon 内的高价值请求即将到来、当前长 prefill 会让它错过硬期限，而
 短暂空转能保住期限时，`future` 策略允许 idle 到该请求到达。这里控制的是
-orchestrator 的真实提交时刻；runtime hook 中的 `release_after_ms` 仍只是软排序
-提示，不能被误写成 `PrefillAdder` 的硬准入门槛。
+orchestrator 的真实提交时刻；runtime hook 中的 `release_after_ms` 默认只是软
+排序提示。显式开启 hard release gate 后，它才是 `PrefillAdder` 之前的硬门控，
+而 token、slot、radix、grammar、LoRA 和显存准入仍由原生 scheduler 在释放后执行。
 
 仓库内合成样例只用于回归 harness。该七请求 trace 中 FIFO 记录 3 个 deadline
 miss，`future` 的加权完成时间为 757.682 ms、makespan 为 1,988 ms；`online`

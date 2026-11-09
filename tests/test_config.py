@@ -37,6 +37,7 @@ class ElasticConfigTest(unittest.TestCase):
                 "EKV_FUTURE_POLICY": "deadline",
                 "EKV_FUTURE_ORDERING_HORIZON_MS": "2000",
                 "EKV_COHORT_WAIT_TIMEOUT_MS": "1250",
+                "EKV_HARD_RELEASE_GATE": "1",
                 "EKV_FUTURE_STATS_PATH": "/tmp/future.json",
                 "EKV_GLOBAL_BROKER_PATH": "/tmp/gpu0-broker.sqlite",
                 "EKV_GLOBAL_BROKER_MIB": "6144",
@@ -67,6 +68,7 @@ class ElasticConfigTest(unittest.TestCase):
         self.assertEqual(config.future_policy, "deadline")
         self.assertEqual(config.future_ordering_horizon_ms, 2000)
         self.assertEqual(config.cohort_wait_timeout_ms, 1250)
+        self.assertTrue(config.hard_release_gate)
         self.assertEqual(config.future_stats_path, "/tmp/future.json")
         self.assertEqual(config.global_broker_path, "/tmp/gpu0-broker.sqlite")
         self.assertEqual(config.global_broker_mib, 6144)
@@ -100,6 +102,8 @@ class ElasticConfigTest(unittest.TestCase):
             ElasticConfig(future_policy="predict-everything")
         with self.assertRaisesRegex(ValueError, "between 0 and 60000"):
             ElasticConfig(cohort_wait_timeout_ms=60_001)
+        with self.assertRaisesRegex(ValueError, "hard release gating requires"):
+            ElasticConfig(hard_release_gate=True)
 
     def test_precommit_budget_is_validated(self):
         with self.assertRaisesRegex(ValueError, "between 0 and 4"):
@@ -237,6 +241,7 @@ class ElasticConfigTest(unittest.TestCase):
                 "1500",
                 "--elastic-cohort-wait-timeout-ms",
                 "1750",
+                "--elastic-hard-release-gate",
                 "--elastic-future-stats-path",
                 "/tmp/future.json",
                 "--elastic-global-broker-path",
@@ -277,6 +282,7 @@ class ElasticConfigTest(unittest.TestCase):
                 config.request_affine_mode,
                 config.future_ordering_horizon_ms,
                 config.cohort_wait_timeout_ms,
+                config.hard_release_gate,
                 config.future_stats_path,
                 config.prefill_headroom_scoped,
                 config.allow_overlap_schedule,
@@ -305,6 +311,7 @@ class ElasticConfigTest(unittest.TestCase):
                 "dry_run",
                 1500,
                 1750,
+                True,
                 "/tmp/future.json",
                 True,
                 True,

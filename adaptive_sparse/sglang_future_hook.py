@@ -36,6 +36,7 @@ POLICY_ENV = "EKV_FUTURE_POLICY"
 STATS_PATH_ENV = "EKV_FUTURE_STATS_PATH"
 HORIZON_ENV = "EKV_FUTURE_ORDERING_HORIZON_MS"
 COHORT_WAIT_TIMEOUT_ENV = "EKV_COHORT_WAIT_TIMEOUT_MS"
+HARD_RELEASE_GATE_ENV = "EKV_HARD_RELEASE_GATE"
 POLICIES = ("off", "deadline")
 _STATS_INTERVAL_S = 0.25
 _DEFAULT_COHORT_WAIT_TIMEOUT_MS = 1000.0
@@ -64,13 +65,19 @@ _stats = {
     "cohort_gate_timeouts": 0,
     "cohort_metadata_conflicts": 0,
     "cohort_gate_errors": 0,
+    "hard_release_gate_ticks": 0,
+    "hard_release_gate_holds": 0,
+    "hard_release_members_held": 0,
+    "hard_release_gate_errors": 0,
 }
 _last_cohort_batch: dict[str, object] | None = None
 _last_held_cohorts: list[dict[str, object]] = []
+_last_held_releases: list[dict[str, object]] = []
 _cohort_first_seen_s: dict[str, float] = {}
 _cohort_arrival_complete: set[str] = set()
 _cohort_timed_out: dict[str, tuple[int, tuple[int, ...]]] = {}
 _stats_identity: dict[str, int] = {}
+_hard_release_gate = False
 
 
 @dataclass(slots=True)
@@ -87,6 +94,8 @@ _active_prefill_gate: ContextVar[_PrefillGateFrame | None] = ContextVar(
 @dataclass(frozen=True, slots=True)
 class FutureHint:
     release_after_ms: int = 0
+    release_clock: str | None = None
+    release_absolute_ms: int | None = None
     deadline_after_ms: int | None = None
     deadline_clock: str | None = None
     deadline_absolute_ms: int | None = None
@@ -107,6 +116,8 @@ class FutureHint:
             raise ValueError("elastic.future payload must be an object")  # noqa: TRY004
         allowed = {
             "release_after_ms",
+            "release_clock",
+            "release_absolute_ms",
             "deadline_after_ms",
             "deadline_clock",
             "deadline_absolute_ms",
@@ -125,6 +136,20 @@ class FutureHint:
         if unknown:
             raise ValueError("elastic.future payload has unknown keys")
         release = _bounded_int(payload.get("release_after_ms", 0), "release_after_ms")
+        release_clock = payload.get("release_clock")
+        release_absolute_raw = payload.get("release_absolute_ms")
+        if (release_clock is None) != (release_absolute_raw is None):
+            raise ValueError(
+                "release_clock and release_absolute_ms must be supplied together"
+            )
+        if release_clock is not None:
+            if release_clock != "perf_counter":
+                raise ValueError("unsupported release_clock")
+            release_absolute = _bounded_int64(
+                release_absolute_raw, "release_absolute_ms"
+            )
+        else:
+            release_absolute = None
         deadline_raw = payload.get("deadline_after_ms")
         deadline = None if deadline_raw is None else _bounded_int(deadline_raw, "deadline_after_ms")
         if deadline is not None and deadline < release:
@@ -145,6 +170,11 @@ class FutureHint:
             deadline_absolute = _bounded_int64(
                 deadline_absolute_raw, "deadline_absolute_ms"
             )
+            if (
+                release_absolute is not None
+                and deadline_absolute < release_absolute
+            ):
+                raise ValueError("absolute deadline precedes absolute release")
         else:
             deadline_absolute = None
         expected_raw = payload.get("expected_output_tokens")
@@ -201,20 +231,22 @@ class FutureHint:
                 "cohort_id must be a short non-empty string and requires cohort_size >= 2"
             )
         return cls(
-            release,
-            deadline,
-            deadline_clock,
-            deadline_absolute,
-            expected,
-            weight,
-            kind,
-            residence,
-            prefix_group,
-            shared_prefix_tokens,
-            prefill_tokens_per_s,
-            decode_tokens_per_s,
-            cohort_id,
-            cohort_size,
+            release_after_ms=release,
+            release_clock=release_clock,
+            release_absolute_ms=release_absolute,
+            deadline_after_ms=deadline,
+            deadline_clock=deadline_clock,
+            deadline_absolute_ms=deadline_absolute,
+            expected_output_tokens=expected,
+            weight=weight,
+            kind=kind,
+            residence=residence,
+            prefix_group=prefix_group,
+            shared_prefix_tokens=shared_prefix_tokens,
+            prefill_tokens_per_s=prefill_tokens_per_s,
+            decode_tokens_per_s=decode_tokens_per_s,
+            cohort_id=cohort_id,
+            cohort_size=cohort_size,
         )
 
 
@@ -308,6 +340,22 @@ def deadline_remaining_ms(
     return max(0, math.ceil(hint.deadline_after_ms - age_ms))
 
 
+def release_remaining_ms(
+    hint: FutureHint,
+    *,
+    now_s: float | None = None,
+    age_ms: float | None = None,
+) -> float:
+    """Resolve release time against the dispatch clock when available."""
+    if hint.release_clock == "perf_counter":
+        if now_s is None or not math.isfinite(now_s):
+            raise ValueError("absolute release requires a finite perf_counter time")
+        return hint.release_absolute_ms - now_s * 1000.0
+    if age_ms is None or not math.isfinite(age_ms):
+        raise ValueError("relative release requires request age")
+    return hint.release_after_ms - age_ms
+
+
 def _prompt_tokens(request: Any) -> int:
     ids = getattr(request, "origin_input_ids", None)
     if ids is None:
@@ -370,7 +418,8 @@ def order_requests(
             ):
                 raise
             age_ms = 0.0
-        if horizon_ms is not None and hint.release_after_ms - age_ms > horizon_ms:
+        release_in_ms = release_remaining_ms(hint, now_s=now_s, age_ms=age_ms)
+        if horizon_ms is not None and release_in_ms > horizon_ms:
             _stats["fallback_horizon"] += 1
             return queue
         decorated_hints.append((hint, age_ms))
@@ -379,7 +428,8 @@ def order_requests(
     for native_order, (request, (hint, age_ms)) in enumerate(
         zip(queue, decorated_hints)
     ):
-        released = age_ms >= hint.release_after_ms
+        release_in_ms = release_remaining_ms(hint, now_s=now_s, age_ms=age_ms)
+        released = release_in_ms <= 0
         request_prefill_rate = (
             hint.prefill_tokens_per_s or prefill_tokens_per_s
         )
@@ -415,7 +465,7 @@ def order_requests(
                 -hint.weight,
                 residency_rank,
                 estimated_request_ms,
-                hint.release_after_ms,
+                release_in_ms,
                 native_order,
                 request,
             )
@@ -474,9 +524,14 @@ def apply_to_waiting_queue(
         )
         planned_hints = [_extract_hint(request) for request in planned]
         if all(hint is not None for hint in planned_hints):
+            clock_now = time.perf_counter() if now_s is None else now_s
             released = sum(
-                _request_age_ms(request, time.perf_counter() if now_s is None else now_s)
-                >= hint.release_after_ms
+                release_remaining_ms(
+                    hint,
+                    now_s=clock_now,
+                    age_ms=_request_age_ms(request, clock_now),
+                )
+                <= 0
                 for request, hint in zip(planned, planned_hints)
             )
             _stats["released_requests"] = released
@@ -496,6 +551,60 @@ def apply_to_waiting_queue(
         return
     waiting_queue[:] = planned
     _publish_stats()
+
+
+def withhold_unreleased_requests(
+    waiting_queue: list[Any],
+    *,
+    now_s: float | None = None,
+) -> list[Any]:
+    """Hold preannounced hints outside native prefill until their release time."""
+
+    global _last_held_releases
+    if not waiting_queue:
+        _last_held_releases = []
+        return []
+    now = time.perf_counter() if now_s is None else now_s
+    if not math.isfinite(now):
+        raise ValueError("hard release clock must be finite")
+
+    held_members: list[Any] = []
+    held_records: list[dict[str, object]] = []
+    for request in waiting_queue:
+        try:
+            hint = _extract_hint(request)
+            if hint is None:
+                continue
+            age_ms = _request_age_ms(request, now)
+        except (AttributeError, TypeError, ValueError):
+            _stats["hard_release_gate_errors"] += 1
+            continue
+        remaining_ms = release_remaining_ms(hint, now_s=now, age_ms=age_ms)
+        if remaining_ms <= 0:
+            continue
+        held_members.append(request)
+        held_records.append(
+            {
+                "request_id": str(
+                    getattr(request, "request_id", "<missing>")
+                ),
+                "release_after_ms": hint.release_after_ms,
+                "age_ms": round(age_ms, 3),
+                "remaining_ms": round(remaining_ms, 3),
+            }
+        )
+
+    _stats["hard_release_gate_ticks"] += 1
+    _last_held_releases = held_records
+    if not held_members:
+        return []
+    _stats["hard_release_gate_holds"] += 1
+    _stats["hard_release_members_held"] += len(held_members)
+    held_ids = {id(member) for member in held_members}
+    waiting_queue[:] = [
+        member for member in waiting_queue if id(member) not in held_ids
+    ]
+    return held_members
 
 
 def observe_prefill_batch(batch: Any) -> None:
@@ -669,19 +778,27 @@ def withhold_incomplete_cohorts(
     return held_members
 
 
-def _gate_active_prefill_queue(waiting_queue: list[Any]) -> None:
+def _gate_active_prefill_queue(
+    waiting_queue: list[Any], *, now_s: float | None = None
+) -> None:
     """Apply the arrival gate after SGLang has published grammar-ready work."""
 
     frame = _active_prefill_gate.get()
     if frame is None or frame.ordered_queue is not None:
         return
     frame.ordered_queue = list(waiting_queue)
+    held: list[Any] = []
+    if _hard_release_gate:
+        try:
+            held.extend(withhold_unreleased_requests(waiting_queue, now_s=now_s))
+        except (AttributeError, TypeError, ValueError, OSError):
+            _stats["hard_release_gate_errors"] += 1
     try:
-        frame.held = withhold_incomplete_cohorts(waiting_queue)
+        held.extend(withhold_incomplete_cohorts(waiting_queue))
     except (AttributeError, TypeError, ValueError, OSError):
         # A malformed optional gate must not suppress native prefill.
         _stats["cohort_gate_errors"] += 1
-        frame.held = []
+    frame.held = held
 
 
 def _restore_prefill_queue(
@@ -710,6 +827,7 @@ def snapshot_stats() -> dict[str, object]:
     snapshot: dict[str, object] = dict(_stats)
     snapshot["last_cohort_batch"] = _last_cohort_batch
     snapshot["last_held_cohorts"] = list(_last_held_cohorts)
+    snapshot["last_held_releases"] = list(_last_held_releases)
     snapshot["stats_identity"] = dict(_stats_identity)
     return snapshot
 
@@ -794,6 +912,7 @@ def load_stats(path: str | Path) -> dict[str, object]:
         "fallback_invalid_hint",
         "telemetry_errors",
         "cohort_gate_errors",
+        "hard_release_gate_errors",
     ):
         result[name] = sum(int(document.get(name, 0)) for document in documents)
     result["shard_count"] = len(paths)
@@ -831,14 +950,19 @@ def _publish_stats(*, force: bool = False, now_s: float | None = None) -> None:
 
 def install() -> None:
     """Install the opt-in hook after native priority calculation."""
-    global _installed
+    global _hard_release_gate, _installed
     if _installed:
         return
     policy = os.environ.get(POLICY_ENV, "off")
     if policy not in POLICIES:
         raise ValueError(f"unknown {POLICY_ENV}")
     if policy == "off":
+        _hard_release_gate = False
         return
+    hard_release = os.environ.get(HARD_RELEASE_GATE_ENV, "0").strip().lower()
+    if hard_release not in ("0", "1", "false", "true", "no", "yes", "off", "on"):
+        raise ValueError(f"unknown {HARD_RELEASE_GATE_ENV}")
+    _hard_release_gate = hard_release in ("1", "true", "yes", "on")
     horizon_raw = os.environ.get(HORIZON_ENV)
     horizon_ms = None if horizon_raw in (None, "") else int(horizon_raw)
     if horizon_ms is not None and horizon_ms < 0:

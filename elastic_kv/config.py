@@ -28,6 +28,7 @@ DEFAULT_FUTURE_POLICY = "off"
 DEFAULT_PRECOMMIT_CHUNKS = 0
 DEFAULT_FUTURE_ORDERING_HORIZON_MS = 0
 DEFAULT_COHORT_WAIT_TIMEOUT_MS = 1000
+DEFAULT_HARD_RELEASE_GATE = False
 DEFAULT_GLOBAL_BROKER_STALE_SECONDS = 120
 GLOBAL_BROKER_FAIR_MODES = ("off", "observe", "enforce")
 GLOBAL_BROKER_PREFILL_MODES = ("off", "observe", "enforce")
@@ -92,6 +93,7 @@ class ElasticConfig:
     future_policy: str = DEFAULT_FUTURE_POLICY
     future_ordering_horizon_ms: int = DEFAULT_FUTURE_ORDERING_HORIZON_MS
     cohort_wait_timeout_ms: int = DEFAULT_COHORT_WAIT_TIMEOUT_MS
+    hard_release_gate: bool = DEFAULT_HARD_RELEASE_GATE
     stats_path: str | None = None
     future_stats_path: str | None = None
     prefill_headroom_scoped: bool = False
@@ -156,6 +158,8 @@ class ElasticConfig:
             raise ValueError("request-affine placement requires elastic mode v5")
         if self.future_policy not in FUTURE_POLICIES:
             raise ValueError(f"unknown future policy: {self.future_policy!r}")
+        if self.hard_release_gate and self.future_policy == "off":
+            raise ValueError("hard release gating requires future policy deadline")
         if self.future_ordering_horizon_ms < 0:
             raise ValueError("future_ordering_horizon_ms must be nonnegative")
         if not 0 <= self.cohort_wait_timeout_ms <= 60_000:
@@ -311,6 +315,10 @@ class ElasticConfig:
                 ),
                 minimum=0,
             ),
+            hard_release_gate=_boolean(
+                "EKV_HARD_RELEASE_GATE",
+                env.get("EKV_HARD_RELEASE_GATE", "0"),
+            ),
             stats_path=env.get("EKV_STATS_PATH") or None,
             future_stats_path=env.get("EKV_FUTURE_STATS_PATH") or None,
             prefill_headroom_scoped=_boolean(
@@ -392,6 +400,7 @@ class ElasticConfig:
         future_policy: str | None = None,
         future_ordering_horizon_ms: int | None = None,
         cohort_wait_timeout_ms: int | None = None,
+        hard_release_gate: bool | None = None,
         stats_path: str | None = None,
         future_stats_path: str | None = None,
         prefill_headroom_scoped: bool | None = None,
@@ -429,6 +438,7 @@ class ElasticConfig:
                 ("future_policy", future_policy),
                 ("future_ordering_horizon_ms", future_ordering_horizon_ms),
                 ("cohort_wait_timeout_ms", cohort_wait_timeout_ms),
+                ("hard_release_gate", hard_release_gate),
                 ("stats_path", stats_path),
                 ("future_stats_path", future_stats_path),
                 ("prefill_headroom_scoped", prefill_headroom_scoped),
@@ -478,6 +488,7 @@ class ElasticConfig:
                 self.future_ordering_horizon_ms
             ),
             "EKV_COHORT_WAIT_TIMEOUT_MS": str(self.cohort_wait_timeout_ms),
+            "EKV_HARD_RELEASE_GATE": "1" if self.hard_release_gate else "0",
             "EKV_PREFILL_HEADROOM_SCOPED": (
                 "1" if self.prefill_headroom_scoped else "0"
             ),
@@ -546,6 +557,7 @@ class ElasticConfig:
             "future_policy": self.future_policy,
             "future_ordering_horizon_ms": self.future_ordering_horizon_ms,
             "cohort_wait_timeout_ms": self.cohort_wait_timeout_ms,
+            "hard_release_gate": self.hard_release_gate,
             "stats_path": self.stats_path,
             "future_stats_path": self.future_stats_path,
             "prefill_headroom_scoped": self.prefill_headroom_scoped,

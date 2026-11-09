@@ -1,6 +1,8 @@
 import json
+import math
 import os
 import sys
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -13,6 +15,7 @@ from adaptive_sparse.sglang_future_hook import (
     order_requests,
     snapshot_stats,
     withhold_incomplete_cohorts,
+    withhold_unreleased_requests,
 )
 
 
@@ -39,6 +42,8 @@ class SGLangFutureHookTest(unittest.TestCase):
         hook._cohort_timed_out.clear()
         hook._stats_identity.clear()
         hook._last_held_cohorts = []
+        hook._last_held_releases = []
+        hook._hard_release_gate = False
 
     def test_absolute_deadline_uses_dispatch_clock_not_request_age(self):
         hint = hook.FutureHint.from_payload(
@@ -438,6 +443,72 @@ class SGLangFutureHookTest(unittest.TestCase):
         ordered = order_requests([future, ready], now_s=1.1)
         self.assertEqual([item.request_id for item in ordered], ["ready", "future"])
 
+    def test_hard_release_gate_holds_only_until_release_time(self):
+        ready = request("ready", 10, 1.0, {})
+        future = request("future", 10, 1.0, {"release_after_ms": 200})
+        queue = [future, ready]
+        before = snapshot_stats()["hard_release_members_held"]
+
+        held = withhold_unreleased_requests(queue, now_s=1.1)
+
+        self.assertEqual(held, [future])
+        self.assertEqual(queue, [ready])
+        self.assertEqual(
+            snapshot_stats()["hard_release_members_held"] - before,
+            1,
+        )
+        self.assertEqual(
+            snapshot_stats()["last_held_releases"][0]["remaining_ms"],
+            100.0,
+        )
+        self.assertEqual(withhold_unreleased_requests(queue, now_s=1.2), [])
+        self.assertEqual(queue, [ready])
+
+    def test_absolute_release_uses_dispatch_clock(self):
+        future = request(
+            "future",
+            10,
+            1.0,
+            {
+                "release_after_ms": 200,
+                "release_clock": "perf_counter",
+                "release_absolute_ms": 1_150,
+            },
+        )
+        queue = [future]
+
+        self.assertEqual(withhold_unreleased_requests(queue, now_s=1.1), [future])
+        self.assertEqual(
+            snapshot_stats()["last_held_releases"][0]["remaining_ms"],
+            50.0,
+        )
+        self.assertEqual(withhold_unreleased_requests(queue, now_s=1.15), [])
+
+    def test_release_clock_requires_absolute_timestamp(self):
+        with self.assertRaisesRegex(
+            ValueError, "release_clock and release_absolute_ms"
+        ):
+            hook.FutureHint.from_payload(
+                {"release_after_ms": 100, "release_clock": "perf_counter"}
+            )
+
+    def test_hard_release_gate_restores_preannounced_queue_order(self):
+        ready = request("ready", 10, 1.0, {})
+        future = request("future", 10, 1.0, {"release_after_ms": 200})
+        queue = [future, ready]
+        hook._hard_release_gate = True
+        frame = hook._PrefillGateFrame()
+        token = hook._active_prefill_gate.set(frame)
+        try:
+            hook._gate_active_prefill_queue(queue, now_s=1.1)
+        finally:
+            hook._active_prefill_gate.reset(token)
+
+        self.assertEqual(queue, [ready])
+        self.assertEqual(frame.held, [future])
+        hook._restore_prefill_queue(queue, frame=frame)
+        self.assertEqual(queue, [future, ready])
+
     def test_unreleased_tier_preserves_exact_native_order(self):
         first = request("first", 1000, 1.0, {"release_after_ms": 2000})
         second = request("second", 10, 1.0, {"release_after_ms": 3000})
@@ -833,6 +904,67 @@ class SGLangFutureHookTest(unittest.TestCase):
         )
         self.assertEqual(
             [item.request_id for item in scheduler.waiting_queue], ["partial"]
+        )
+
+    def test_installer_hard_gates_preannounced_request_before_native_prefill(self):
+        class SchedulePolicy:
+            def calc_priority(self, waiting_queue, *args, **kwargs):
+                return None
+
+        release_at_ms = math.ceil(time.perf_counter() * 1000.0) + 60_000
+        future = request(
+            "future",
+            10,
+            1.0,
+            {
+                "release_after_ms": 60_000,
+                "release_clock": "perf_counter",
+                "release_absolute_ms": release_at_ms,
+            },
+        )
+        ready = request("ready", 10, 1.0, {})
+
+        class Scheduler:
+            def __init__(self):
+                self.waiting_queue = [future, ready]
+                self.native_queue = None
+                self.policy = SchedulePolicy()
+
+            def get_new_batch_prefill(self, *args, **kwargs):
+                self.policy.calc_priority(self.waiting_queue)
+                self.native_queue = list(self.waiting_queue)
+                self.waiting_queue.remove(ready)
+                return SimpleNamespace(reqs=[ready])
+
+        modules = {
+            "sglang": SimpleNamespace(__path__=[]),
+            "sglang.srt": SimpleNamespace(__path__=[]),
+            "sglang.srt.managers": SimpleNamespace(__path__=[]),
+            "sglang.srt.managers.kv_hints": SimpleNamespace(),
+            "sglang.srt.managers.schedule_policy": SimpleNamespace(
+                SchedulePolicy=SchedulePolicy
+            ),
+            "sglang.srt.managers.scheduler": SimpleNamespace(Scheduler=Scheduler),
+        }
+        before = snapshot_stats()["hard_release_members_held"]
+        with patch.dict(sys.modules, modules), patch.dict(
+            "os.environ",
+            {
+                "EKV_FUTURE_POLICY": "deadline",
+                hook.HARD_RELEASE_GATE_ENV: "1",
+            },
+        ):
+            hook._installed = False
+            hook.install()
+            scheduler = Scheduler()
+            scheduler.get_new_batch_prefill()
+        hook._installed = False
+
+        self.assertEqual(scheduler.native_queue, [ready])
+        self.assertEqual(scheduler.waiting_queue, [future])
+        self.assertEqual(
+            snapshot_stats()["hard_release_members_held"] - before,
+            1,
         )
 
     def test_gate_sees_grammar_request_added_before_policy(self):

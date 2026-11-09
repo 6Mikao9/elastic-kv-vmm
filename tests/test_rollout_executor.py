@@ -113,6 +113,16 @@ class RolloutExecutorTest(unittest.TestCase):
         self.assertEqual(
             adjusted["actions"][0]["payload"]["deadline_absolute_ms"], 10017
         )
+        preannounced = make_kv_hints(
+            submission(deadline_after_ms=500), release_after_ms=250
+        )
+        self.assertEqual(
+            preannounced["actions"][0]["payload"]["release_after_ms"], 250
+        )
+        self.assertEqual(
+            preannounced["actions"][0]["payload"]["release_clock"],
+            "perf_counter",
+        )
         demoted = make_kv_hints(submission(), residence_override="host_backed")
         self.assertEqual(demoted["actions"][0]["payload"]["residence"], "host_backed")
 
@@ -746,6 +756,97 @@ class RolloutExecutorTest(unittest.TestCase):
         ]
         self.assertEqual(absolute_deadline, 10050)
         self.assertEqual(seen[0][3], True)
+
+    def test_managed_executor_preannounces_without_moving_deadline(self):
+        clock = FakeClock()
+        seen = []
+        preannounced = replace(
+            submission(deadline_after_ms=40),
+            submit_at_ms=100,
+            estimated_finish_ms=160,
+            deadline_ms=140,
+        )
+
+        def generate(url, spec, timeout, stream):
+            seen.append(spec)
+            return {
+                "_started_perf_s": clock.now(),
+                "end_to_end_s": 0.02,
+                "output_tokens": 8,
+                "ttft_s": 0.005,
+                "tpot_s": 0.002,
+            }
+
+        result = execute_rollout(
+            "http://server/generate",
+            [preannounced],
+            max_inflight=1,
+            poll_interval_ms=1,
+            clock=ReplayClock(clock.now, clock.sleep),
+            generator=generate,
+            preannounce_lead_ms=100,
+        )
+
+        payload = seen[0]["future_hint"]["actions"][0]["payload"]
+        self.assertEqual(payload["release_after_ms"], 100)
+        self.assertEqual(payload["release_clock"], "perf_counter")
+        self.assertEqual(payload["release_absolute_ms"], 10100)
+        self.assertEqual(payload["deadline_after_ms"], 140)
+        self.assertEqual(payload["deadline_absolute_ms"], 10140)
+        self.assertEqual(result["requests"][0]["actual_submit_ms"], 0.0)
+        self.assertEqual(
+            result["requests"][0]["preannounce_lead_actual_ms"], 100.0
+        )
+        self.assertEqual(result["summary"]["preannounce_lead_ms"], 100)
+        self.assertEqual(
+            result["summary"]["max_actual_preannounce_lead_ms"], 100.0
+        )
+
+    def test_default_executor_preannounces_without_moving_deadline(self):
+        clock = FakeClock()
+        seen = []
+        preannounced = replace(
+            submission(deadline_after_ms=40),
+            submit_at_ms=100,
+            estimated_finish_ms=160,
+            deadline_ms=140,
+        )
+
+        def generate(url, spec, timeout, stream):
+            seen.append(spec)
+            return {
+                "_started_perf_s": clock.now(),
+                "end_to_end_s": 0.02,
+                "output_tokens": 8,
+                "ttft_s": 0.005,
+                "tpot_s": 0.002,
+            }
+
+        result = execute_rollout(
+            "http://server/generate",
+            [preannounced],
+            clock=ReplayClock(clock.now, clock.sleep),
+            generator=generate,
+            preannounce_lead_ms=100,
+        )
+
+        payload = seen[0]["future_hint"]["actions"][0]["payload"]
+        self.assertEqual(payload["release_after_ms"], 100)
+        self.assertEqual(payload["release_clock"], "perf_counter")
+        self.assertEqual(payload["release_absolute_ms"], 10100)
+        self.assertEqual(payload["deadline_after_ms"], 140)
+        self.assertEqual(payload["deadline_absolute_ms"], 10140)
+        self.assertEqual(result["summary"]["preannounce_lead_ms"], 100)
+
+    def test_preannouncement_requires_hints(self):
+        with self.assertRaisesRegex(ValueError, "requires emitted future hints"):
+            execute_rollout(
+                "http://server/generate",
+                [submission()],
+                emit_hints=False,
+                preannounce_lead_ms=100,
+                generator=lambda *args: self.fail("request should not be sent"),
+            )
 
     def test_throughput_includes_planned_initial_idle(self):
         clock = FakeClock()

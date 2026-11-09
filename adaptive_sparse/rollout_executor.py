@@ -129,6 +129,15 @@ def _ceil_milliseconds(value: float) -> int:
     return math.ceil(value - 1e-7)
 
 
+def _announce_time_ms(
+    submission: RolloutSubmission,
+    preannounce_lead_ms: int,
+) -> int:
+    """Return the monotonic execution deadline for a preannounced request."""
+
+    return max(0, submission.submit_at_ms - preannounce_lead_ms)
+
+
 @dataclass(frozen=True, slots=True)
 class ReplayClock:
     """Injectable monotonic clock used by both live and fake-clock tests."""
@@ -159,6 +168,7 @@ def make_kv_hints(
     submission: RolloutSubmission,
     *,
     deadline_after_ms: int | None = None,
+    release_after_ms: int | None = None,
     residence_override: str | None = None,
     clock_now_s: float | None = None,
     prefill_tokens_per_s: float | None = None,
@@ -167,6 +177,9 @@ def make_kv_hints(
     """Wrap a planner payload in the SGLang versioned hint envelope."""
 
     payload = _future_payload(submission.hint)
+    dispatch_clock_s = time.perf_counter() if clock_now_s is None else clock_now_s
+    if not math.isfinite(dispatch_clock_s) or dispatch_clock_s < 0:
+        raise RolloutExecutionError("dispatch clock must be finite and nonnegative")
     if submission.deadline_ms is not None:
         remaining_ms = (
             max(0, submission.deadline_ms - submission.submit_at_ms)
@@ -174,12 +187,23 @@ def make_kv_hints(
             else deadline_after_ms
         )
         payload["deadline_after_ms"] = remaining_ms
-        dispatch_clock_s = time.perf_counter() if clock_now_s is None else clock_now_s
-        if not math.isfinite(dispatch_clock_s) or dispatch_clock_s < 0:
-            raise RolloutExecutionError("dispatch clock must be finite and nonnegative")
         payload["deadline_clock"] = "perf_counter"
         payload["deadline_absolute_ms"] = (
             _ceil_milliseconds(dispatch_clock_s * 1000.0 + remaining_ms)
+        )
+    if release_after_ms is not None:
+        if (
+            isinstance(release_after_ms, bool)
+            or not isinstance(release_after_ms, int)
+            or not 0 <= release_after_ms <= 86_400_000
+        ):
+            raise RolloutExecutionError(
+                "runtime release_after_ms must be a nonnegative integer"
+            )
+        payload["release_after_ms"] = release_after_ms
+        payload["release_clock"] = "perf_counter"
+        payload["release_absolute_ms"] = _ceil_milliseconds(
+            dispatch_clock_s * 1000.0 + release_after_ms
         )
     if residence_override is not None:
         if residence_override not in ("resident", "host_backed"):
@@ -778,6 +802,9 @@ def _measure_result(
         "planned_submit_ms": submission.submit_at_ms,
         "planned_finish_ms": submission.estimated_finish_ms,
         "actual_submit_ms": actual_submit_ms,
+        "preannounce_lead_actual_ms": max(
+            0.0, submission.submit_at_ms - actual_submit_ms
+        ),
         "actual_finish_ms": actual_finish_ms,
         "submit_lateness_ms": submit_lateness_ms,
         "dispatch_lateness_ms": dispatch_lateness_ms,
@@ -856,6 +883,7 @@ def _execute_managed_rollout(
     poll_interval_s: float,
     service_time_estimator: ServiceTimeEstimator | None = None,
     cohort_barrier_timeout_s: float = 5.0,
+    preannounce_lead_ms: int = 0,
 ) -> tuple[
     list[dict[str, object]],
     list[str],
@@ -946,9 +974,16 @@ def _execute_managed_rollout(
             if not queue:
                 clock.sleep(poll_interval_s)
                 continue
-            due = [item for item in queue if item.submit_at_ms <= now_ms]
+            due = [
+                item
+                for item in queue
+                if _announce_time_ms(item, preannounce_lead_ms) <= now_ms
+            ]
             if not due:
-                next_ms = min(item.submit_at_ms for item in queue)
+                next_ms = min(
+                    _announce_time_ms(item, preannounce_lead_ms)
+                    for item in queue
+                )
                 clock.sleep(
                     max(0.0, min(poll_interval_s, (next_ms - now_ms) / 1000.0))
                 )
@@ -1106,6 +1141,9 @@ def _execute_managed_rollout(
                             if deadline_after_ms is None
                             else _ceil_milliseconds(deadline_after_ms)
                         ),
+                        release_after_ms=_ceil_milliseconds(
+                            max(0.0, member.submit_at_ms - dispatch_ms)
+                        ),
                         clock_now_s=dispatch_clock_s,
                         residence_override=(
                             None
@@ -1232,6 +1270,9 @@ def _finalize_rollout(
         "request_count": len(rows),
         "completed": len(rows) == len(submissions),
         "max_submit_lateness_ms": max(float(row["submit_lateness_ms"]) for row in rows),
+        "max_actual_preannounce_lead_ms": max(
+            float(row["preannounce_lead_actual_ms"]) for row in rows
+        ),
         "max_capacity_delay_ms": max(
             float(row.get("capacity_delay_ms", 0.0)) for row in rows
         ),
@@ -1305,6 +1346,7 @@ def execute_rollout(
     service_time_estimator: ServiceTimeEstimator | None = None,
     cohort_barrier_timeout_s: float = 5.0,
     max_cohort_start_skew_ms: float = 100.0,
+    preannounce_lead_ms: int = 0,
 ) -> dict[str, object]:
     """Run every planned request and return measured, JSON-safe evidence."""
 
@@ -1359,6 +1401,14 @@ def execute_rollout(
         raise ValueError("queue_policy must be timeline or deadline")
     if poll_interval_ms <= 0 or not math.isfinite(poll_interval_ms):
         raise ValueError("poll_interval_ms must be finite and positive")
+    if (
+        isinstance(preannounce_lead_ms, bool)
+        or not isinstance(preannounce_lead_ms, int)
+        or not 0 <= preannounce_lead_ms <= 60_000
+    ):
+        raise ValueError("preannounce_lead_ms must be an integer between 0 and 60000")
+    if preannounce_lead_ms and not emit_hints:
+        raise ValueError("preannouncement requires emitted future hints")
     managed = (
         service_time_estimator is not None
         or max_inflight is not None
@@ -1383,6 +1433,7 @@ def execute_rollout(
             poll_interval_s=poll_interval_ms / 1000.0,
             service_time_estimator=service_time_estimator,
             cohort_barrier_timeout_s=cohort_barrier_timeout_s,
+            preannounce_lead_ms=preannounce_lead_ms,
         )
         if failures:
             raise RolloutExecutionError("; ".join(failures))
@@ -1396,6 +1447,7 @@ def execute_rollout(
             max_cohort_start_skew_ms=max_cohort_start_skew_ms,
         )
         result["summary"]["managed_scheduler"] = scheduler_stats
+        result["summary"]["preannounce_lead_ms"] = preannounce_lead_ms
         if service_time_estimator is not None:
             result["summary"]["service_time_estimator"] = (
                 service_time_estimator.snapshot().as_dict()
@@ -1406,7 +1458,8 @@ def execute_rollout(
     with ThreadPoolExecutor(max_workers=worker_count) as pool:
         for group in execution_groups:
             head = group[0]
-            _wait_until(origin + head.submit_at_ms / 1000.0, replay_clock)
+            announce_at_ms = _announce_time_ms(head, preannounce_lead_ms)
+            _wait_until(origin + announce_at_ms / 1000.0, replay_clock)
             dispatch_s = replay_clock.now() - origin
             dispatch_lateness_ms = dispatch_s * 1000.0 - head.submit_at_ms
             if dispatch_lateness_ms > max_submit_lateness_ms:
@@ -1443,6 +1496,9 @@ def execute_rollout(
                             if deadline_after_ms is None
                             else _ceil_milliseconds(deadline_after_ms)
                         ),
+                        release_after_ms=_ceil_milliseconds(
+                            max(0.0, submission.submit_at_ms - dispatch_s * 1000.0)
+                        ),
                         clock_now_s=dispatch_clock_s,
                     )
                 future = pool.submit(
@@ -1474,7 +1530,7 @@ def execute_rollout(
 
     if failures:
         raise RolloutExecutionError("; ".join(failures))
-    return _finalize_rollout(
+    result = _finalize_rollout(
         rows,
         submissions,
         clock=replay_clock,
@@ -1483,3 +1539,5 @@ def execute_rollout(
         residency_evidence_timeout_s=residency_evidence_timeout_s,
         max_cohort_start_skew_ms=max_cohort_start_skew_ms,
     )
+    result["summary"]["preannounce_lead_ms"] = preannounce_lead_ms
+    return result

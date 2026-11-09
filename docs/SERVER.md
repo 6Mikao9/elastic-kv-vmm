@@ -69,6 +69,7 @@ SGLang or touch CUDA.
 | `--elastic-future-policy` | `off` | `deadline`; native `kv_hints` or the built-in 0.5.2 compatibility path |
 | `--elastic-future-ordering-horizon-ms` | `0` | nonnegative; zero keeps native horizon behavior |
 | `--elastic-cohort-wait-timeout-ms` | `1000` | bound for withholding a partial action-v4 cohort; timeout falls back to native scheduling |
+| `--elastic-hard-release-gate` | off | hold preannounced requests out of native prefill until `release_after_ms`; requires deadline future hints |
 | `--elastic-stats-path` | unset | atomic JSON telemetry destination |
 | `--elastic-future-stats-path` | unset | separate future-hook telemetry destination |
 | `--elastic-global-broker-path` | unset | shared SQLite state for one physical GPU |
@@ -159,6 +160,21 @@ reservation still covers the configured future horizon, but only requests whose
 `release_after_ms` falls inside that TTL may trigger immediate `cuMemCreate` and
 mapping. Leaving the TTL environment variable unset preserves full-horizon
 prewarming for existing experiments.
+
+`EKV_HARD_RELEASE_GATE=1` (or
+`--elastic-hard-release-gate`) changes `release_after_ms` from a soft ordering
+preference into a transport-driven admission gate. A preannounced request can
+enter the waiting queue early, where future-prefill planning, active-prefix
+reuse and predictive VMM demand can see it, while the hook temporarily removes
+it before SGLang's native `PrefillAdder`. The request is restored at its original
+queue position after the release time. Every native token, request-slot, radix,
+grammar, LoRA and memory check still runs after release. Requests without a
+hint or with `release_after_ms=0` are unchanged. The flag is disabled by default
+because premature HTTP submission is a client contract and can consume request
+timeouts or transport slots even though generation remains gated. The executor
+also emits `release_clock=perf_counter` and `release_absolute_ms`, so the local
+server does not add HTTP or tokenization delay to the requested release instant;
+cross-host clients require clock calibration before using the absolute field.
 
 For active MiniMax KV demotion, `EKV_ADAPTIVE_DEADLINE_GUARD_MS` (default
 `500`) protects requests whose hinted deadline is imminent. Within the same

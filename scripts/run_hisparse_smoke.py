@@ -404,6 +404,12 @@ def main():
     parser.add_argument("--future-poll-interval-ms", type=float, default=10.0)
     parser.add_argument("--future-cohort-barrier-timeout-s", type=float, default=5.0)
     parser.add_argument("--future-max-cohort-start-skew-ms", type=float, default=100.0)
+    parser.add_argument(
+        "--future-preannounce-lead-ms",
+        type=int,
+        default=0,
+        help="submit planned requests early and hard-gate their prefill",
+    )
     args = parser.parse_args()
     validate_server_endpoint(parser, host=args.host, port=args.port)
     base_url = server_base_url(args.host, args.port)
@@ -436,6 +442,8 @@ def main():
         parser.error("future max in-flight requests must be positive")
     if args.future_poll_interval_ms <= 0:
         parser.error("future poll interval must be positive")
+    if not 0 <= args.future_preannounce_lead_ms <= 60_000:
+        parser.error("future preannounce lead must be between 0 and 60000 ms")
     if (args.future_plan is not None or args.future_workload is not None) and args.future_no_hints and args.future_policy != "off":
         parser.error("future no-hints requires future policy off")
     if args.future_no_hints and args.future_elastic_residency_budget:
@@ -445,6 +453,13 @@ def main():
         parser.error("future service-time feedback requires a future plan or workload")
     if args.future_service_time_feedback and args.future_no_hints:
         parser.error("future service-time feedback requires emitted future hints")
+    if args.future_preannounce_lead_ms:
+        if args.future_plan is None and args.future_workload is None:
+            parser.error("future preannouncement requires a future plan or workload")
+        if args.future_no_hints:
+            parser.error("future preannouncement requires emitted future hints")
+        if args.future_policy == "off":
+            parser.error("future preannouncement requires future policy deadline")
     if not 0 < args.future_service_time_ewma_alpha <= 1:
         parser.error("future service-time EWMA alpha must be in (0, 1]")
     if args.future_plan is None and args.future_workload is None:
@@ -701,6 +716,9 @@ def main():
     if args.future_policy != "off":
         environment["EKV_FUTURE_POLICY"] = args.future_policy
         environment["EKV_FUTURE_STATS_PATH"] = str(output / "future_stats.json")
+    environment.pop("EKV_HARD_RELEASE_GATE", None)
+    if args.future_preannounce_lead_ms:
+        environment["EKV_HARD_RELEASE_GATE"] = "1"
     if args.resident_limit:
         environment["EKV_RESIDENT_LIMIT"] = str(args.resident_limit)
         environment["EKV_RESIDENT_FREE_RESERVE"] = str(args.resident_free_reserve)
@@ -821,6 +839,7 @@ def main():
         "future_max_inflight": args.future_max_inflight,
         "future_queue_policy": args.future_queue_policy,
         "future_elastic_residency_budget": args.future_elastic_residency_budget,
+        "future_preannounce_lead_ms": args.future_preannounce_lead_ms,
         "sha256": {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in sources},
     })
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -854,6 +873,7 @@ def main():
                "future_max_inflight": args.future_max_inflight,
                "future_queue_policy": args.future_queue_policy,
                "future_elastic_residency_budget": args.future_elastic_residency_budget,
+               "future_preannounce_lead_ms": args.future_preannounce_lead_ms,
                "status": "running", "probes": []}
     server = None
     step = "startup"
@@ -929,6 +949,9 @@ def main():
                         ),
                         max_cohort_start_skew_ms=(
                             args.future_max_cohort_start_skew_ms
+                        ),
+                        preannounce_lead_ms=(
+                            args.future_preannounce_lead_ms
                         ),
                     )
                     sampler.take()
@@ -1084,6 +1107,12 @@ def main():
                     or future_stats.get("fallback_invalid_hint", 0)
                     or future_stats.get("telemetry_errors", 0)):
                 raise RuntimeError("future scheduler telemetry indicates an unhealthy run")
+            if args.future_preannounce_lead_ms and (
+                future_stats.get("hard_release_gate_ticks", 0) < 1
+                or future_stats.get("hard_release_gate_holds", 0) < 1
+                or future_stats.get("hard_release_gate_errors", 0)
+            ):
+                raise RuntimeError("future hard release gate was not observed")
             results["future_stats"] = future_stats
         results["status"] = "complete"
     except BaseException as error:
