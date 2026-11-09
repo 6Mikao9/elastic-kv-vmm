@@ -32,7 +32,9 @@ DEFAULT_GLOBAL_BROKER_STALE_SECONDS = 120
 GLOBAL_BROKER_FAIR_MODES = ("off", "observe", "enforce")
 GLOBAL_BROKER_PREFILL_MODES = ("off", "observe", "enforce")
 PREDICTIVE_PREWARM_MODES = ("off", "dry_run", "enforce")
+REQUEST_AFFINE_MODES = ("off", "dry_run", "enforce")
 DEFAULT_PREDICTIVE_PREWARM_MODE = "off"
+DEFAULT_REQUEST_AFFINE_MODE = "off"
 DEFAULT_PREDICTIVE_PREWARM_TTL_MS = 2000
 DEFAULT_PREDICTIVE_PREWARM_MAX_CHUNKS = 8
 
@@ -86,6 +88,7 @@ class ElasticConfig:
     predictive_prewarm_mode: str = DEFAULT_PREDICTIVE_PREWARM_MODE
     predictive_prewarm_ttl_ms: int = DEFAULT_PREDICTIVE_PREWARM_TTL_MS
     predictive_prewarm_max_chunks: int = DEFAULT_PREDICTIVE_PREWARM_MAX_CHUNKS
+    request_affine_mode: str = DEFAULT_REQUEST_AFFINE_MODE
     future_policy: str = DEFAULT_FUTURE_POLICY
     future_ordering_horizon_ms: int = DEFAULT_FUTURE_ORDERING_HORIZON_MS
     stats_path: str | None = None
@@ -146,6 +149,10 @@ class ElasticConfig:
             raise ValueError(
                 "predictive prewarm requires positive TTL and max chunks"
             )
+        if self.request_affine_mode not in REQUEST_AFFINE_MODES:
+            raise ValueError("unknown request-affine placement mode")
+        if self.request_affine_mode != "off" and self.mode != "v5":
+            raise ValueError("request-affine placement requires elastic mode v5")
         if self.future_policy not in FUTURE_POLICIES:
             raise ValueError(f"unknown future policy: {self.future_policy!r}")
         if self.future_ordering_horizon_ms < 0:
@@ -281,6 +288,9 @@ class ElasticConfig:
                 ),
                 minimum=0,
             ),
+            request_affine_mode=env.get(
+                "EKV_REQUEST_AFFINE_MODE", DEFAULT_REQUEST_AFFINE_MODE
+            ).strip().lower(),
             future_policy=env.get("EKV_FUTURE_POLICY", DEFAULT_FUTURE_POLICY),
             future_ordering_horizon_ms=_integer(
                 "EKV_FUTURE_ORDERING_HORIZON_MS",
@@ -367,6 +377,7 @@ class ElasticConfig:
         predictive_prewarm_mode: str | None = None,
         predictive_prewarm_ttl_ms: int | None = None,
         predictive_prewarm_max_chunks: int | None = None,
+        request_affine_mode: str | None = None,
         future_policy: str | None = None,
         future_ordering_horizon_ms: int | None = None,
         stats_path: str | None = None,
@@ -402,6 +413,7 @@ class ElasticConfig:
                     "predictive_prewarm_max_chunks",
                     predictive_prewarm_max_chunks,
                 ),
+                ("request_affine_mode", request_affine_mode),
                 ("future_policy", future_policy),
                 ("future_ordering_horizon_ms", future_ordering_horizon_ms),
                 ("stats_path", stats_path),
@@ -447,6 +459,7 @@ class ElasticConfig:
             "EKV_PREDICTIVE_PREWARM_MAX_CHUNKS": str(
                 self.predictive_prewarm_max_chunks
             ),
+            "EKV_REQUEST_AFFINE_MODE": self.request_affine_mode,
             "EKV_FUTURE_POLICY": self.future_policy,
             "EKV_FUTURE_ORDERING_HORIZON_MS": str(
                 self.future_ordering_horizon_ms
@@ -515,6 +528,7 @@ class ElasticConfig:
             "predictive_prewarm_max_chunks": (
                 self.predictive_prewarm_max_chunks
             ),
+            "request_affine_mode": self.request_affine_mode,
             "future_policy": self.future_policy,
             "future_ordering_horizon_ms": self.future_ordering_horizon_ms,
             "stats_path": self.stats_path,

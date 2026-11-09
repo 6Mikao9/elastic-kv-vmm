@@ -18,6 +18,7 @@ class AdapterCompatibilityTest(unittest.TestCase):
         adapter.MODE = "v5"
         adapter.ALLOW_OVERLAP_SCHEDULE = False
         adapter.OVERLAP_SCHEDULE_ACTIVE = False
+        adapter.REQUEST_AFFINE_MODE = "off"
         adapter._installed = False
         adapter.CONTROLLERS.clear()
 
@@ -26,6 +27,7 @@ class AdapterCompatibilityTest(unittest.TestCase):
         adapter.MODE = "baseline"
         adapter.ALLOW_OVERLAP_SCHEDULE = False
         adapter.OVERLAP_SCHEDULE_ACTIVE = False
+        adapter.REQUEST_AFFINE_MODE = "off"
         adapter.CONTROLLERS.clear()
 
     def test_installs_on_newer_mem_cache_api(self):
@@ -297,6 +299,208 @@ class AdapterCompatibilityTest(unittest.TestCase):
             self.assertNotEqual(
                 configurator.TokenToKVPoolAllocator, LegacyAllocator
             )
+
+    def test_request_affine_wraps_extend_and_decode_with_request_ids(self):
+        adapter.REQUEST_AFFINE_MODE = "dry_run"
+        observed = []
+
+        def original_extend(batch):
+            observed.append(("extend", batch.allocator.demands))
+            return "extend-result"
+
+        def original_decode(batch, token_per_req):
+            observed.append(("decode", batch.allocator.demands, token_per_req))
+            return "decode-result"
+
+        class LegacyMHA:
+            pass
+
+        class LegacyAllocator:
+            pass
+
+        class ModelRunner:
+            pass
+
+        class Configurator:
+            def configure(self, *args, **kwargs):
+                return "configured"
+
+        modules = {
+            "sglang": _module("sglang", __version__="0.5.17"),
+            "sglang.srt": _module("sglang.srt"),
+            "sglang.srt.model_executor": _module("sglang.srt.model_executor"),
+            "sglang.srt.model_executor.model_runner": _module(
+                "sglang.srt.model_executor.model_runner", ModelRunner=ModelRunner
+            ),
+            "sglang.srt.mem_cache": _module("sglang.srt.mem_cache"),
+            "sglang.srt.mem_cache.memory_pool": _module(
+                "sglang.srt.mem_cache.memory_pool", MHATokenToKVPool=LegacyMHA
+            ),
+            "sglang.srt.mem_cache.kv_cache_configurator": _module(
+                "sglang.srt.mem_cache.kv_cache_configurator",
+                KVCacheConfigurator=Configurator,
+                MHATokenToKVPool=LegacyMHA,
+                TokenToKVPoolAllocator=LegacyAllocator,
+            ),
+            "sglang.srt.mem_cache.allocator": _module(
+                "sglang.srt.mem_cache.allocator",
+                TokenToKVPoolAllocator=LegacyAllocator,
+            ),
+            "sglang.srt.mem_cache.allocator.token": _module(
+                "sglang.srt.mem_cache.allocator.token",
+                TokenToKVPoolAllocator=LegacyAllocator,
+            ),
+            "sglang.srt.managers": _module("sglang.srt.managers"),
+            "sglang.srt.managers.schedule_batch": _module(
+                "sglang.srt.managers.schedule_batch",
+                alloc_for_extend=original_extend,
+                alloc_for_decode=original_decode,
+            ),
+        }
+        with patch.dict(sys.modules, modules):
+            adapter.install()
+            schedule_batch = sys.modules[
+                "sglang.srt.managers.schedule_batch"
+            ]
+
+            class Allocator:
+                def __init__(self):
+                    self.demands = None
+
+                def set_request_affine_demands(self, demands):
+                    self.demands = tuple(demands)
+                    return True
+
+                def clear_request_affine_demands(self):
+                    self.demands = None
+
+            allocator = Allocator()
+            req = SimpleNamespace(
+                rid="request-a",
+                sampling_params=SimpleNamespace(max_new_tokens=90),
+            )
+            batch = SimpleNamespace(
+                reqs=[req],
+                seq_lens_cpu=[20],
+                extend_lens=[10],
+                tree_cache=SimpleNamespace(
+                    token_to_kv_pool_allocator=allocator
+                ),
+                allocator=allocator,
+            )
+            self.assertEqual(schedule_batch.alloc_for_extend(batch), "extend-result")
+            self.assertEqual(schedule_batch.alloc_for_decode(batch, 1), "decode-result")
+            self.assertEqual([item[0] for item in observed], ["extend", "decode"])
+            self.assertEqual(observed[0][1][0].request_id, "request-a")
+            self.assertEqual(observed[0][1][0].slots, 10)
+            self.assertEqual(observed[1][2], 1)
+            self.assertIsNone(allocator.demands)
+
+    def test_request_affine_wraps_sglang_052_alloc_token_slots(self):
+        adapter.REQUEST_AFFINE_MODE = "dry_run"
+        observed = []
+
+        class LegacyMHA:
+            pass
+
+        class LegacyAllocator:
+            pass
+
+        class ModelRunner:
+            def init_memory_pool(self, *args, **kwargs):
+                return None
+
+        class ScheduleBatch:
+            def alloc_token_slots(self, num_tokens, backup_state=False):
+                observed.append(
+                    (
+                        self.token_to_kv_pool_allocator.demands,
+                        num_tokens,
+                        backup_state,
+                    )
+                )
+                return "tokens-result"
+
+        schedule_batch = _module(
+            "sglang.srt.managers.schedule_batch",
+            ScheduleBatch=ScheduleBatch,
+        )
+        modules = {
+            "sglang": _module("sglang", __version__="0.5.2"),
+            "sglang.srt": _module("sglang.srt"),
+            "sglang.srt.model_executor": _module("sglang.srt.model_executor"),
+            "sglang.srt.model_executor.model_runner": _module(
+                "sglang.srt.model_executor.model_runner",
+                ModelRunner=ModelRunner,
+                MHATokenToKVPool=LegacyMHA,
+                TokenToKVPoolAllocator=LegacyAllocator,
+            ),
+            "sglang.srt.managers": _module("sglang.srt.managers"),
+            "sglang.srt.managers.schedule_batch": schedule_batch,
+        }
+        with patch.dict(sys.modules, modules):
+            adapter.install()
+
+            class Allocator:
+                def __init__(self):
+                    self.demands = None
+
+                def set_request_affine_demands(self, demands):
+                    self.demands = tuple(demands)
+                    return True
+
+                def clear_request_affine_demands(self):
+                    self.demands = None
+
+            allocator = Allocator()
+            req = SimpleNamespace(
+                rid="legacy-request",
+                sampling_params=SimpleNamespace(max_new_tokens=90),
+                fill_ids=list(range(20)),
+                extend_input_len=10,
+                output_ids=(),
+            )
+            batch = object.__new__(ScheduleBatch)
+            batch.reqs = [req]
+            batch.token_to_kv_pool_allocator = allocator
+            batch.forward_mode = SimpleNamespace(is_decode=lambda: False)
+            self.assertEqual(
+                schedule_batch.ScheduleBatch.alloc_token_slots(batch, 10),
+                "tokens-result",
+            )
+            demand = observed[0][0][0]
+            self.assertEqual(demand.request_id, "legacy-request")
+            self.assertEqual(demand.slots, 10)
+            self.assertEqual(demand.projected_tokens, 110)
+            self.assertIsNone(allocator.demands)
+
+    def test_physical_preflight_counts_private_chunks(self):
+        residency = object.__new__(adapter.Residency)
+        residency.admission_policy = "physical"
+        residency.chunk_bytes = 64
+        residency.prefill_headroom_bytes = 0
+        residency.precommitted = set()
+        residency.counters = {}
+        residency.pool = SimpleNamespace(device=object())
+        residency.arenas = [
+            SimpleNamespace(
+                planes=1,
+                mapped_chunks={0},
+                backing=None,
+            )
+        ]
+        with patch.object(
+            adapter.torch.cuda,
+            "mem_get_info",
+            return_value=(64, 0),
+        ), patch.object(
+            activation,
+            "current_prefill_headroom",
+            return_value=0,
+        ):
+            self.assertFalse(residency.can_commit_chunks({1, 2}))
+            self.assertTrue(residency.can_commit_chunks({1}))
+        self.assertEqual(residency.counters["request_affine_physical_fallbacks"], 1)
 
     def test_installs_on_legacy_model_runner_api(self):
         calls = []

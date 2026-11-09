@@ -23,9 +23,23 @@ from .config import (
     DEFAULT_PREDICTIVE_PREWARM_TTL_MS,
     PREDICTIVE_PREWARM_MODES,
 )
+from .request_affine import (
+    DEFAULT_REQUEST_AFFINE_MODE,
+    REQUEST_AFFINE_MODES,
+    RequestAffinePlanner,
+    extract_request_demands,
+    observe_packed_allocation,
+)
 from .slots import FreeSlots
 
 MODE = os.environ.get("EKV_MODE", "baseline")
+REQUEST_AFFINE_MODE = os.environ.get(
+    "EKV_REQUEST_AFFINE_MODE", DEFAULT_REQUEST_AFFINE_MODE
+).strip().lower()
+if REQUEST_AFFINE_MODE not in REQUEST_AFFINE_MODES:
+    raise ValueError(
+        "EKV_REQUEST_AFFINE_MODE must be off, dry_run or enforce"
+    )
 ALLOW_OVERLAP_SCHEDULE = os.environ.get(
     "EKV_ALLOW_OVERLAP_SCHEDULE", "0"
 ).lower() in ("1", "true", "yes", "on")
@@ -131,6 +145,8 @@ class Residency:
         self.slot_bytes = slot_bytes
         self.layout = layout
         self.chunk_bytes = int(os.environ.get("EKV_CHUNK_MIB", "2")) << 20
+        if REQUEST_AFFINE_MODE != "off" and MODE != "v5":
+            raise ValueError("request-affine VMM placement requires EKV_MODE=v5")
         self.retain_chunks = int(os.environ.get("EKV_RETAIN_CHUNKS", "1"))
         if self.retain_chunks < 1:
             raise ValueError("EKV_RETAIN_CHUNKS must retain at least the sink chunk")
@@ -219,6 +235,23 @@ class Residency:
             predictive_prewarm_exception=0,
             predictive_prewarm_fallback=0,
             predictive_prewarm_telemetry_errors=0,
+            request_affine_calls=0,
+            request_affine_enforced_calls=0,
+            request_affine_dry_run_calls=0,
+            request_affine_fallback_calls=0,
+            request_affine_observations=0,
+            request_affine_requested_requests=0,
+            request_affine_private_requests_allocated=0,
+            request_affine_private_candidates_observed=0,
+            request_affine_observed_mapped_chunks=0,
+            request_affine_observed_shared_chunks=0,
+            request_affine_observed_maximum_owners=0,
+            request_affine_release_calls=0,
+            request_affine_released_chunks=0,
+            request_affine_released_chunk_bytes=0,
+            request_affine_reclaim_sync_ns=0,
+            request_affine_rollback_calls=0,
+            request_affine_withheld_release_tokens=0,
         )
         self.counters["overlap_schedule_enabled"] = int(
             OVERLAP_SCHEDULE_ACTIVE
@@ -526,6 +559,115 @@ class Residency:
         self._publish_predictive_prewarm()
         return len(candidates)
 
+    def _fully_backed_chunks(self):
+        backed_chunks = set(self.precommitted)
+        if self.arenas:
+            backed_chunks.update(
+                set.intersection(
+                    *(set(arena.mapped_chunks) for arena in self.arenas)
+                )
+            )
+        return backed_chunks
+
+    def _physical_chunk_budget(self):
+        chunk_cost = sum(
+            self.chunk_bytes * getattr(arena, "planes", 1)
+            for arena in self.arenas
+        )
+        if chunk_cost <= 0:
+            return None
+        free, _ = torch.cuda.mem_get_info(self.pool.device)
+        prefill_headroom = activation.current_prefill_headroom(
+            self.prefill_headroom_bytes
+        )
+        required_before_commit = prefill_headroom + chunk_cost
+        if free < required_before_commit:
+            empty_start = time.perf_counter_ns()
+            with torch.cuda.device(self.pool.device):
+                torch.cuda.empty_cache()
+            after, _ = torch.cuda.mem_get_info(self.pool.device)
+            self.counters["physical_empty_cache_calls"] = (
+                self.counters.get("physical_empty_cache_calls", 0) + 1
+            )
+            self.counters["physical_empty_cache_freed_bytes"] = (
+                self.counters.get("physical_empty_cache_freed_bytes", 0)
+                + max(0, after - free)
+            )
+            self.counters["physical_empty_cache_ns"] = (
+                self.counters.get("physical_empty_cache_ns", 0)
+                + time.perf_counter_ns()
+                - empty_start
+            )
+            free = after
+
+        usable = max(0, free - prefill_headroom)
+        broker_available = []
+        broker_snapshots = []
+        for arena in self.arenas:
+            backing = getattr(arena, "backing", None)
+            snapshot = getattr(backing, "broker_snapshot", None)
+            if callable(snapshot):
+                snapshot = snapshot()
+            if isinstance(snapshot, dict):
+                broker_snapshots.append(snapshot)
+                value = snapshot.get("available_bytes")
+            else:
+                value = getattr(backing, "broker_available_bytes", None)
+            if value is not None:
+                broker_available.append(value)
+        if broker_available:
+            global_available = min(broker_available)
+            self.counters["physical_global_broker_available_bytes"] = (
+                global_available
+            )
+            if global_available < usable:
+                self.counters["physical_global_broker_limited_calls"] = (
+                    self.counters.get("physical_global_broker_limited_calls", 0)
+                    + 1
+                )
+            usable = min(usable, global_available)
+        fair_available = []
+        for snapshot in broker_snapshots:
+            if snapshot.get("fair_mode") != "enforce":
+                continue
+            if snapshot.get("fairness_pressure"):
+                fair_available.append(0)
+        if fair_available:
+            tenant_available = min(fair_available)
+            self.counters["physical_global_broker_fair_available_bytes"] = (
+                tenant_available
+            )
+            if tenant_available < usable:
+                self.counters["physical_global_broker_fair_limited_calls"] = (
+                    self.counters.get(
+                        "physical_global_broker_fair_limited_calls", 0
+                    )
+                    + 1
+                )
+            usable = min(usable, tenant_available)
+        return usable // chunk_cost, chunk_cost, prefill_headroom
+
+    def can_commit_chunks(self, chunks):
+        """Check aligned request-affine chunks against physical admission."""
+
+        chunks = {int(chunk) for chunk in chunks}
+        if self.admission_policy == "logical" or not chunks:
+            return True
+        budget = self._physical_chunk_budget()
+        if budget is None:
+            return True
+        chunk_budget, _, _ = budget
+        missing = chunks - self._fully_backed_chunks()
+        admitted = len(missing) <= chunk_budget
+        self.counters["request_affine_physical_preflight_calls"] = (
+            self.counters.get("request_affine_physical_preflight_calls", 0) + 1
+        )
+        if not admitted:
+            self.counters["request_affine_physical_fallbacks"] = (
+                self.counters.get("request_affine_physical_fallbacks", 0) + 1
+            )
+        return admitted
+
     def physical_available_tokens(self, logical_free_tokens, free_ranges):
         """Bound scheduler admission by the bytes VMM can actually commit.
 
@@ -553,91 +695,16 @@ class Residency:
         if any(left[1] > right[0] for left, right in zip(ranges, ranges[1:])):
             raise ValueError("free_ranges must be sorted and disjoint")
 
-        chunk_cost = sum(
-            self.chunk_bytes * getattr(arena, "planes", 1)
-            for arena in self.arenas
-        )
-        if chunk_cost <= 0:
-            return logical_free_tokens
-
         self.counters["physical_available_calls"] = (
             self.counters.get("physical_available_calls", 0) + 1
         )
         start = time.perf_counter_ns()
-        free, _ = torch.cuda.mem_get_info(self.pool.device)
-        prefill_headroom = activation.current_prefill_headroom(
-            self.prefill_headroom_bytes
-        )
-        required_before_commit = prefill_headroom + chunk_cost
-        if free < required_before_commit:
-            start = time.perf_counter_ns()
-            with torch.cuda.device(self.pool.device):
-                torch.cuda.empty_cache()
-            after, _ = torch.cuda.mem_get_info(self.pool.device)
-            self.counters["physical_empty_cache_calls"] = (
-                self.counters.get("physical_empty_cache_calls", 0) + 1
-            )
-            self.counters["physical_empty_cache_freed_bytes"] = (
-                self.counters.get("physical_empty_cache_freed_bytes", 0)
-                + max(0, after - free)
-            )
-            self.counters["physical_empty_cache_ns"] = (
-                self.counters.get("physical_empty_cache_ns", 0)
-                + time.perf_counter_ns()
-                - start
-            )
-            free = after
+        budget = self._physical_chunk_budget()
+        if budget is None:
+            return logical_free_tokens
 
-        usable = max(0, free - prefill_headroom)
-        broker_available = []
-        broker_snapshots = []
-        for arena in self.arenas:
-            backing = getattr(arena, "backing", None)
-            snapshot = getattr(backing, "broker_snapshot", None)
-            if callable(snapshot):
-                snapshot = snapshot()
-            if isinstance(snapshot, dict):
-                broker_snapshots.append(snapshot)
-                value = snapshot.get("available_bytes")
-            else:
-                value = getattr(backing, "broker_available_bytes", None)
-            if value is not None:
-                broker_available.append(value)
-        if broker_available:
-            global_available = min(broker_available)
-            self.counters["physical_global_broker_available_bytes"] = (
-                global_available
-            )
-            if global_available < usable:
-                self.counters["physical_global_broker_limited_calls"] = (
-                    self.counters.get("physical_global_broker_limited_calls", 0) + 1
-                )
-            usable = min(usable, global_available)
-        fair_available = []
-        for snapshot in broker_snapshots:
-            if snapshot.get("fair_mode") != "enforce":
-                continue
-            if snapshot.get("fairness_pressure"):
-                fair_available.append(0)
-        if fair_available:
-            tenant_available = min(fair_available)
-            self.counters["physical_global_broker_fair_available_bytes"] = (
-                tenant_available
-            )
-            if tenant_available < usable:
-                self.counters["physical_global_broker_fair_limited_calls"] = (
-                    self.counters.get(
-                        "physical_global_broker_fair_limited_calls", 0
-                    )
-                    + 1
-                )
-            usable = min(usable, tenant_available)
-        chunk_budget = usable // chunk_cost
-        backed_chunks = set(self.precommitted)
-        if self.arenas:
-            backed_chunks.update(
-                set.intersection(*(set(arena.mapped_chunks) for arena in self.arenas))
-            )
+        chunk_budget, chunk_cost, prefill_headroom = budget
+        backed_chunks = self._fully_backed_chunks()
         admitted = 0
         for start, stop in ranges:
             remaining = logical_free_tokens - admitted
@@ -798,6 +865,53 @@ class Residency:
             reclaimed = set().union(*(indices for _, indices in candidates))
             self.precommitted.difference_update(reclaimed)
 
+    def reclaim_chunks(self, chunks):
+        """Reclaim physical backing for explicitly dead logical chunks.
+
+        Request-affine placement calls this only after every live slot in the
+        chunk has been freed.  Precommitted mappings are invalidated as part of
+        the same fence because the chunk is about to re-enter the free pool.
+        """
+
+        chunks = {
+            int(chunk)
+            for chunk in chunks
+            if int(chunk) >= self.retain_chunks
+        }
+        if not chunks:
+            return 0
+        candidates = [
+            (arena, chunks.intersection(arena.allocated_chunks))
+            for arena in self.arenas
+        ]
+        reclaimable = set().union(*(indices for _, indices in candidates))
+        if not reclaimable:
+            return 0
+        start = time.perf_counter_ns()
+        torch.cuda.synchronize()
+        self.counters["request_affine_reclaim_sync_ns"] += (
+            time.perf_counter_ns() - start
+        )
+        for arena, indices in candidates:
+            if indices:
+                arena.reclaim(indices, synchronize=False)
+        self.precommitted.difference_update(reclaimable)
+        self._predictive_precommitted.difference_update(reclaimable)
+        for chunk in reclaimable:
+            self._predictive_prewarm_deadlines.pop(chunk, None)
+        self.counters["predictive_prewarm_active_chunks"] = len(
+            self._predictive_precommitted
+        )
+        self.backed = sum(arena.backed_bytes for arena in self.arenas)
+        self.counters["request_affine_released_chunks"] += len(reclaimable)
+        self.counters["request_affine_released_chunk_bytes"] += (
+            len(reclaimable)
+            * self.chunk_bytes
+            * sum(getattr(arena, "planes", 1) for arena in self.arenas)
+        )
+        self.publish(force=True)
+        return len(reclaimable)
+
     def release(self, ids):
         if len(ids) == 0:
             return
@@ -827,6 +941,17 @@ class Residency:
         self.publish(force=not self.live[1:].any())
 
     def publish(self, force=False):
+        planner = getattr(self, "request_affine_planner", None)
+        if planner is not None:
+            self.counters["request_affine_private_requests_active"] = (
+                planner.private_request_count
+            )
+            self.counters["request_affine_free_chunks"] = len(
+                planner.free_chunks
+            )
+            self.counters["request_affine_withheld_slots"] = (
+                planner.withheld_slots
+            )
         if MODE == "v5":
             backed = self.backed
         else:
@@ -993,6 +1118,31 @@ def install():
                 if MODE == "v5":
                     self.ctrl.counters.update(interval_alloc_calls=0, fragmented_alloc_calls=0)
                 self.ctrl.publish(force=True)
+            self.request_affine_planner = None
+            self._request_affine_demands = None
+            if MODE == "v5" and REQUEST_AFFINE_MODE != "off":
+                if self.ctrl.chunk_bytes % self.ctrl.slot_bytes:
+                    message = (
+                        "request-affine placement requires slot_bytes to divide "
+                        "the VMM chunk"
+                    )
+                    if REQUEST_AFFINE_MODE == "enforce":
+                        raise RuntimeError(message)
+                    self.ctrl.counters["request_affine_disabled_reason"] = message
+                else:
+                    self.request_affine_planner = RequestAffinePlanner(
+                        self.size,
+                        self.ctrl.chunk_bytes // self.ctrl.slot_bytes,
+                    )
+                    self.request_affine_planner.prime(
+                        lambda slot: bool(self.ctrl.live[slot])
+                    )
+                    self.ctrl.counters["request_affine_chunk_slots"] = (
+                        self.ctrl.chunk_bytes // self.ctrl.slot_bytes
+                    )
+                    self.ctrl.counters["request_affine_free_chunks"] = len(
+                        self.request_affine_planner.free_chunks
+                    )
 
         def available_size(self):
             if MODE == "v5":
@@ -1002,6 +1152,207 @@ def install():
             if MODE in HOST_FREE_MODES and hasattr(self, "host_free"):
                 return int(np.count_nonzero(self.host_free))
             return super().available_size()
+
+        def set_request_affine_demands(self, demands):
+            if self.request_affine_planner is None:
+                return False
+            if self._request_affine_demands is not None:
+                raise RuntimeError("nested request-affine allocation context")
+            self._request_affine_demands = tuple(demands)
+            return True
+
+        def clear_request_affine_demands(self):
+            self._request_affine_demands = None
+
+        def _request_affine_tensor(self, plan):
+            parts = []
+            for request in plan.requests:
+                request_parts = []
+                for start, stop in request.ranges:
+                    if stop == start + 1:
+                        request_parts.append(
+                            self.gpu_slot_ids[start - 1 : stop - 1]
+                        )
+                    else:
+                        ids = np.arange(start, stop, dtype=np.int64)
+                        request_parts.append(torch.from_numpy(ids).to(self.device))
+                        self.ctrl.counters["id_upload_calls"] += 1
+                parts.append(
+                    request_parts[0]
+                    if len(request_parts) == 1
+                    else torch.cat(request_parts)
+                )
+            return parts[0] if len(parts) == 1 else torch.cat(parts)
+
+        def _rollback_request_affine_plan(self, plan, *, admitted):
+            all_slot_ids = np.fromiter(
+                (
+                    slot
+                    for request in plan.requests
+                    for start, stop in request.ranges
+                    for slot in range(start, stop)
+                ),
+                dtype=np.int64,
+            )
+            released_chunks = ()
+            if admitted:
+                self.ctrl.release_idle_only(all_slot_ids)
+                released_chunks = self.request_affine_planner.release_slots(
+                    all_slot_ids,
+                    is_live=lambda slot: bool(self.ctrl.live[slot]),
+                )
+                self.ctrl.reclaim_idle()
+                if released_chunks:
+                    self.ctrl.reclaim_chunks(
+                        self.request_affine_planner.chunk_for_slot(lo)
+                        for lo, _ in released_chunks
+                    )
+
+            restore_slots = set()
+            for start, stop in (
+                plan.reserved_chunk_ranges + plan.packed_ranges + released_chunks
+            ):
+                restore_slots.update(range(start, stop))
+            self.free_slots.release(
+                np.fromiter(sorted(restore_slots), dtype=np.int64)
+            )
+
+        def _observe_packed_request_affine(self, demands, result):
+            if self.request_affine_planner is None or not demands:
+                return
+            start = time.perf_counter_ns()
+            ids = result.detach().cpu().numpy()
+            offset = 0
+            by_request = []
+            for demand in demands:
+                by_request.append(ids[offset : offset + demand.slots])
+                offset += demand.slots
+            if offset != len(ids):
+                self.ctrl.counters["request_affine_fallback_calls"] += 1
+                return
+            observation = observe_packed_allocation(
+                demands,
+                by_request,
+                chunk_slots=self.request_affine_planner.chunk_slots,
+            )
+            self.ctrl.counters["request_affine_observations"] += 1
+            self.ctrl.counters["request_affine_private_candidates_observed"] += (
+                observation.private_candidates
+            )
+            self.ctrl.counters["request_affine_observed_mapped_chunks"] += (
+                observation.mapped_chunks
+            )
+            self.ctrl.counters["request_affine_observed_shared_chunks"] += (
+                observation.shared_chunks
+            )
+            self.ctrl.counters["request_affine_observed_maximum_owners"] = max(
+                self.ctrl.counters.get(
+                    "request_affine_observed_maximum_owners", 0
+                ),
+                observation.maximum_owners,
+            )
+            self.ctrl.counters["request_affine_observe_ns"] = (
+                self.ctrl.counters.get("request_affine_observe_ns", 0)
+                + time.perf_counter_ns()
+                - start
+            )
+            self.request_affine_planner.note_packed_slots(ids)
+
+        def _alloc_packed_v5(self, need_size):
+            ranges = self.free_slots.peek(need_size)
+            if ranges is None:
+                return None
+            if len(ranges) <= 1:
+                start_slot = ranges[0][0] - 1 if ranges else 0
+                result = self.gpu_slot_ids[start_slot : start_slot + need_size]
+            else:
+                ids = np.concatenate(
+                    [
+                        np.arange(lo, hi, dtype=np.int64)
+                        for lo, hi in ranges
+                    ]
+                )
+                result = torch.from_numpy(ids).to(self.device)
+            self.ctrl.admit_ranges(ranges)
+            self.free_slots.claim(ranges)
+            self.ctrl.counters["interval_alloc_calls"] += 1
+            if len(ranges) <= 1:
+                self.ctrl.counters["contiguous_id_view_calls"] += 1
+            else:
+                self.ctrl.counters["id_upload_calls"] += 1
+                self.ctrl.counters["fragmented_alloc_calls"] += 1
+            if self.request_affine_planner is not None:
+                self.request_affine_planner.note_packed_slots(
+                    np.concatenate(
+                        [
+                            np.arange(lo, hi, dtype=np.int64)
+                            for lo, hi in ranges
+                        ]
+                    )
+                )
+            return result
+
+        def _alloc_request_affine(self, demands):
+            plan = self.request_affine_planner.plan(
+                demands,
+                free_ranges=self.free_slots.ranges,
+                is_live=lambda slot: bool(self.ctrl.live[slot]),
+            )
+            if plan is None:
+                self.ctrl.counters["request_affine_fallback_calls"] += 1
+                return None
+            needed_chunks = {
+                int(chunk)
+                for start, stop in plan.all_ranges
+                for chunk in range(
+                    start * self.ctrl.slot_bytes // self.ctrl.chunk_bytes,
+                    (
+                        (stop * self.ctrl.slot_bytes - 1)
+                        // self.ctrl.chunk_bytes
+                    )
+                    + 1,
+                )
+            }
+            if not self.ctrl.can_commit_chunks(needed_chunks):
+                self.ctrl.counters["request_affine_fallback_calls"] += 1
+                return None
+            removed_ranges = tuple(
+                sorted(plan.reserved_chunk_ranges + plan.packed_ranges)
+            )
+            admitted = False
+            try:
+                self.free_slots.remove(removed_ranges)
+                self.ctrl.admit_ranges(plan.all_ranges)
+                admitted = True
+                self.request_affine_planner.commit(plan)
+                result = self._request_affine_tensor(plan)
+            except Exception as exc:
+                self.ctrl.counters["request_affine_rollback_calls"] += 1
+                try:
+                    self._rollback_request_affine_plan(plan, admitted=admitted)
+                except Exception as rollback_exc:
+                    self.ctrl.counters[
+                        "request_affine_rollback_failures"
+                    ] = self.ctrl.counters.get(
+                        "request_affine_rollback_failures", 0
+                    ) + 1
+                    if hasattr(exc, "add_note"):
+                        exc.add_note(
+                            f"request-affine rollback failed: {rollback_exc!r}"
+                        )
+                raise
+            self.ctrl.counters["request_affine_enforced_calls"] += 1
+            self.ctrl.counters[
+                "request_affine_private_requests_allocated"
+            ] += plan.private_requests
+            self.ctrl.counters["interval_alloc_calls"] += 1
+            self.ctrl.counters["request_affine_free_chunks"] = len(
+                self.request_affine_planner.free_chunks
+            )
+            self.ctrl.counters["request_affine_withheld_slots"] = (
+                self.request_affine_planner.withheld_slots
+            )
+            return result
 
         def clear(self):
             if hasattr(self, "ctrl") and MODE != "baseline":
@@ -1014,6 +1365,15 @@ def install():
             super().clear()
             if MODE == "v5":
                 self.free_slots = FreeSlots(self.size)
+                if self.request_affine_planner is not None:
+                    self.request_affine_planner.reset()
+                    self.request_affine_planner.prime(
+                        lambda slot: bool(self.ctrl.live[slot])
+                    )
+                    self.ctrl.counters["request_affine_free_chunks"] = len(
+                        self.request_affine_planner.free_chunks
+                    )
+                    self.ctrl.counters["request_affine_withheld_slots"] = 0
             if MODE in ("v4", "v5"):
                 self.gpu_slot_ids = self.free_pages
             if MODE in HOST_FREE_MODES and hasattr(self, "host_free"):
@@ -1027,25 +1387,47 @@ def install():
         def alloc(self, need_size):
             if MODE == "baseline":
                 return super().alloc(need_size)
+            if not need_size:
+                if MODE == "v5":
+                    return self.gpu_slot_ids[:0]
+                return torch.empty(0, dtype=torch.int64, device=self.device)
             start = time.perf_counter_ns()
             if MODE == "v5":
-                ranges = self.free_slots.peek(need_size)
-                if ranges is None:
+                demands = self._request_affine_demands
+                if demands is not None:
+                    self.ctrl.counters["request_affine_calls"] += 1
+                    self.ctrl.counters[
+                        "request_affine_requested_requests"
+                    ] += len(demands)
+                    if sum(demand.slots for demand in demands) != need_size:
+                        self.ctrl.counters[
+                            "request_affine_fallback_calls"
+                        ] += 1
+                    elif REQUEST_AFFINE_MODE == "enforce":
+                        result = self._alloc_request_affine(demands)
+                        if result is not None:
+                            self.ctrl.counters["hook_ns"] += (
+                                time.perf_counter_ns() - start
+                            )
+                            self.ctrl.publish()
+                            return result
+                    else:
+                        result = self._alloc_packed_v5(need_size)
+                        if result is not None:
+                            self.ctrl.counters[
+                                "request_affine_dry_run_calls"
+                            ] += 1
+                            self._observe_packed_request_affine(
+                                demands, result
+                            )
+                            self.ctrl.counters["hook_ns"] += (
+                                time.perf_counter_ns() - start
+                            )
+                            self.ctrl.publish()
+                            return result
+                result = self._alloc_packed_v5(need_size)
+                if result is None:
                     return None
-                if len(ranges) <= 1:
-                    start_slot = ranges[0][0] - 1 if ranges else 0
-                    result = self.gpu_slot_ids[start_slot:start_slot + need_size]
-                else:
-                    ids = np.concatenate([np.arange(lo, hi, dtype=np.int64) for lo, hi in ranges])
-                    result = torch.from_numpy(ids).to(self.device)
-                self.ctrl.admit_ranges(ranges)
-                self.free_slots.claim(ranges)
-                self.ctrl.counters["interval_alloc_calls"] += 1
-                if len(ranges) <= 1:
-                    self.ctrl.counters["contiguous_id_view_calls"] += 1
-                else:
-                    self.ctrl.counters["id_upload_calls"] += 1
-                    self.ctrl.counters["fragmented_alloc_calls"] += 1
                 self.ctrl.counters["hook_ns"] += time.perf_counter_ns() - start
                 self.ctrl.publish()
                 return result
@@ -1095,8 +1477,46 @@ def install():
             if MODE == "v5":
                 ids = np.sort(ids)
                 self.ctrl.release_idle_only(ids)
-                self.free_slots.release(ids)
+                released_chunks = ()
+                if self.request_affine_planner is not None:
+                    released_chunks = self.request_affine_planner.release_slots(
+                        ids,
+                        is_live=lambda slot: bool(self.ctrl.live[slot]),
+                    )
+                    self.ctrl.counters["request_affine_release_calls"] += 1
+                inside_released = np.zeros(len(ids), dtype=np.bool_)
+                for lo, hi in released_chunks:
+                    inside_released |= (ids >= lo) & (ids < hi)
+                inside_private = np.zeros(len(ids), dtype=np.bool_)
+                if self.request_affine_planner is not None:
+                    inside_private = np.fromiter(
+                        (
+                            self.request_affine_planner.is_slot_withheld(int(slot))
+                            for slot in ids
+                        ),
+                        dtype=np.bool_,
+                        count=len(ids),
+                    )
+                self.ctrl.counters[
+                    "request_affine_withheld_release_tokens"
+                ] += int(np.count_nonzero(inside_private & ~inside_released))
+                regular_ids = ids[~inside_released & ~inside_private]
+                self.free_slots.release(regular_ids)
+                for lo, hi in released_chunks:
+                    self.free_slots.release(np.arange(lo, hi, dtype=np.int64))
                 self.ctrl.reclaim_idle()
+                if REQUEST_AFFINE_MODE == "enforce" and released_chunks:
+                    self.ctrl.reclaim_chunks(
+                        self.request_affine_planner.chunk_for_slot(lo)
+                        for lo, _ in released_chunks
+                    )
+                if self.request_affine_planner is not None:
+                    self.ctrl.counters["request_affine_free_chunks"] = len(
+                        self.request_affine_planner.free_chunks
+                    )
+                    self.ctrl.counters["request_affine_withheld_slots"] = (
+                        self.request_affine_planner.withheld_slots
+                    )
                 self.ctrl.counters["hook_ns"] += time.perf_counter_ns() - start
                 self.ctrl.publish(force=not self.ctrl.live_count)
                 return
@@ -1276,6 +1696,128 @@ def install():
         runner.MHATokenToKVPool = original_pool if MODE == "baseline" else ElasticPool
         runner.TokenToKVPoolAllocator = ObservedAllocator
         runner.ModelRunner.init_memory_pool = guarded_init
+    if REQUEST_AFFINE_MODE != "off":
+        from sglang.srt.managers import schedule_batch
+
+        def run_with_request_demands(allocator, demands, callback):
+            set_demands = getattr(
+                allocator, "set_request_affine_demands", None
+            )
+            if set_demands is None or demands is None or not set_demands(demands):
+                return callback()
+            try:
+                return callback()
+            finally:
+                allocator.clear_request_affine_demands()
+
+        def allocate_with_request_demands(
+            batch, allocation_lens, *, decode, original, extra_args=()
+        ):
+            allocator = getattr(
+                getattr(batch, "tree_cache", None),
+                "token_to_kv_pool_allocator",
+                None,
+            )
+            demands = extract_request_demands(
+                batch.reqs,
+                getattr(batch, "seq_lens_cpu", ()),
+                allocation_lens,
+                decode=decode,
+            )
+            return run_with_request_demands(
+                allocator,
+                demands,
+                lambda: original(batch, *extra_args),
+            )
+
+        if hasattr(schedule_batch, "alloc_for_extend") and hasattr(
+            schedule_batch, "alloc_for_decode"
+        ):
+            original_alloc_extend = schedule_batch.alloc_for_extend
+            original_alloc_decode = schedule_batch.alloc_for_decode
+
+            def request_affine_alloc_for_extend(batch):
+                return allocate_with_request_demands(
+                    batch,
+                    getattr(batch, "extend_lens", ()),
+                    decode=False,
+                    original=original_alloc_extend,
+                )
+
+            def request_affine_alloc_for_decode(batch, token_per_req):
+                return allocate_with_request_demands(
+                    batch,
+                    [token_per_req] * len(batch.reqs),
+                    decode=True,
+                    original=original_alloc_decode,
+                    extra_args=(token_per_req,),
+                )
+
+            request_affine_alloc_for_extend._elastic_kv_request_affine = True
+            request_affine_alloc_for_decode._elastic_kv_request_affine = True
+            schedule_batch.alloc_for_extend = request_affine_alloc_for_extend
+            schedule_batch.alloc_for_decode = request_affine_alloc_for_decode
+        elif hasattr(schedule_batch, "ScheduleBatch") and hasattr(
+            schedule_batch.ScheduleBatch, "alloc_token_slots"
+        ):
+            original_alloc_token_slots = (
+                schedule_batch.ScheduleBatch.alloc_token_slots
+            )
+
+            def request_affine_alloc_token_slots(
+                batch, num_tokens, backup_state=False
+            ):
+                allocator = getattr(batch, "token_to_kv_pool_allocator", None)
+                forward_mode = getattr(batch, "forward_mode", None)
+                decode = bool(
+                    callable(getattr(forward_mode, "is_decode", None))
+                    and forward_mode.is_decode()
+                )
+                request_count = len(batch.reqs)
+                if request_count:
+                    tokens_per_request = num_tokens // request_count
+                else:
+                    tokens_per_request = 0
+                if decode:
+                    raw_seq_lens = getattr(batch, "seq_lens", ())
+                    if hasattr(raw_seq_lens, "tolist"):
+                        raw_seq_lens = raw_seq_lens.tolist()
+                    current_seq_lens = [
+                        max(0, int(seq_len) - tokens_per_request)
+                        for seq_len in raw_seq_lens
+                    ]
+                    allocation_lens = [tokens_per_request] * request_count
+                else:
+                    current_seq_lens = [
+                        len(getattr(req, "fill_ids", ())) for req in batch.reqs
+                    ]
+                    allocation_lens = [
+                        int(req.extend_input_len) for req in batch.reqs
+                    ]
+                demands = extract_request_demands(
+                    batch.reqs,
+                    current_seq_lens,
+                    allocation_lens,
+                    decode=decode,
+                )
+                return run_with_request_demands(
+                    allocator,
+                    demands,
+                    lambda: original_alloc_token_slots(
+                        batch, num_tokens, backup_state
+                    ),
+                )
+
+            request_affine_alloc_token_slots._elastic_kv_request_affine = True
+            schedule_batch.ScheduleBatch.alloc_token_slots = (
+                request_affine_alloc_token_slots
+            )
+        else:
+            raise RuntimeError(
+                "request-affine placement requires SGLang 0.5.2 "
+                "ScheduleBatch.alloc_token_slots or the newer "
+                "alloc_for_extend/alloc_for_decode hooks"
+            )
     from .graph_support import install_graph_hooks
     install_graph_hooks()
     activation_requested = (

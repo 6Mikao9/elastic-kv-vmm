@@ -33,6 +33,7 @@ class ElasticConfigTest(unittest.TestCase):
                 "EKV_PREDICTIVE_PREWARM_MODE": "enforce",
                 "EKV_PREDICTIVE_PREWARM_TTL_MS": "275",
                 "EKV_PREDICTIVE_PREWARM_MAX_CHUNKS": "6",
+                "EKV_REQUEST_AFFINE_MODE": "enforce",
                 "EKV_FUTURE_POLICY": "deadline",
                 "EKV_FUTURE_ORDERING_HORIZON_MS": "2000",
                 "EKV_FUTURE_STATS_PATH": "/tmp/future.json",
@@ -61,6 +62,7 @@ class ElasticConfigTest(unittest.TestCase):
         self.assertEqual(config.predictive_prewarm_mode, "enforce")
         self.assertEqual(config.predictive_prewarm_ttl_ms, 275)
         self.assertEqual(config.predictive_prewarm_max_chunks, 6)
+        self.assertEqual(config.request_affine_mode, "enforce")
         self.assertEqual(config.future_policy, "deadline")
         self.assertEqual(config.future_ordering_horizon_ms, 2000)
         self.assertEqual(config.future_stats_path, "/tmp/future.json")
@@ -120,6 +122,16 @@ class ElasticConfigTest(unittest.TestCase):
         )
         self.assertEqual(
             config.as_env()["EKV_PREDICTIVE_PREWARM_MODE"], "enforce"
+        )
+
+    def test_request_affine_mode_requires_v5(self):
+        with self.assertRaisesRegex(ValueError, "requires elastic mode v5"):
+            ElasticConfig(mode="v4", request_affine_mode="dry_run")
+        with self.assertRaisesRegex(ValueError, "unknown request-affine"):
+            ElasticConfig(request_affine_mode="cached")
+        config = ElasticConfig(mode="v5", request_affine_mode="enforce")
+        self.assertEqual(
+            config.as_env()["EKV_REQUEST_AFFINE_MODE"], "enforce"
         )
 
     def test_dynamic_prefill_workspace_requires_v5_physical_admission(self):
@@ -215,6 +227,8 @@ class ElasticConfigTest(unittest.TestCase):
                 "275",
                 "--elastic-predictive-prewarm-max-chunks",
                 "6",
+                "--elastic-request-affine-mode",
+                "dry_run",
                 "--elastic-future-ordering-horizon-ms",
                 "1500",
                 "--elastic-future-stats-path",
@@ -254,6 +268,7 @@ class ElasticConfigTest(unittest.TestCase):
                 config.predictive_prewarm_mode,
                 config.predictive_prewarm_ttl_ms,
                 config.predictive_prewarm_max_chunks,
+                config.request_affine_mode,
                 config.future_ordering_horizon_ms,
                 config.future_stats_path,
                 config.prefill_headroom_scoped,
@@ -280,6 +295,7 @@ class ElasticConfigTest(unittest.TestCase):
                 "enforce",
                 275,
                 6,
+                "dry_run",
                 1500,
                 "/tmp/future.json",
                 True,
