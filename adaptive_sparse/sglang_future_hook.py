@@ -11,10 +11,11 @@ from __future__ import annotations
 import math
 import os
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from .service_time import (
     DEFAULT_DECODE_TOKENS_PER_S,
@@ -24,14 +25,19 @@ from .service_time import (
 )
 
 ACTION_TYPE = "elastic.future"
-ACTION_VERSION = "3"
+ACTION_VERSION = "4"
+RATE_ACTION_VERSION = "3"
 LEGACY_ACTION_VERSION = "2"
-SUPPORTED_ACTION_VERSIONS = frozenset(("1", "2", ACTION_VERSION))
+SUPPORTED_ACTION_VERSIONS = frozenset(
+    ("1", LEGACY_ACTION_VERSION, RATE_ACTION_VERSION, ACTION_VERSION)
+)
 POLICY_ENV = "EKV_FUTURE_POLICY"
 STATS_PATH_ENV = "EKV_FUTURE_STATS_PATH"
 HORIZON_ENV = "EKV_FUTURE_ORDERING_HORIZON_MS"
+COHORT_WAIT_TIMEOUT_ENV = "EKV_COHORT_WAIT_TIMEOUT_MS"
 POLICIES = ("off", "deadline")
 _STATS_INTERVAL_S = 0.25
+_DEFAULT_COHORT_WAIT_TIMEOUT_MS = 1000.0
 
 _installed = False
 _last_stats_publish = 0.0
@@ -46,7 +52,22 @@ _stats = {
     "fallback_horizon": 0,
     "fallback_exception": 0,
     "telemetry_errors": 0,
+    "prefill_batches": 0,
+    "cohort_batches": 0,
+    "complete_cohort_batches": 0,
+    "partial_cohort_batches": 0,
+    "cohort_members_observed": 0,
+    "cohort_gate_ticks": 0,
+    "cohort_gate_holds": 0,
+    "cohort_members_held": 0,
+    "cohort_gate_timeouts": 0,
+    "cohort_metadata_conflicts": 0,
+    "cohort_gate_errors": 0,
 }
+_last_cohort_batch: dict[str, object] | None = None
+_last_held_cohorts: list[dict[str, object]] = []
+_cohort_first_seen_s: dict[str, float] = {}
+_cohort_arrival_complete: set[str] = set()
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,11 +84,13 @@ class FutureHint:
     shared_prefix_tokens: int = 0
     prefill_tokens_per_s: float | None = None
     decode_tokens_per_s: float | None = None
+    cohort_id: str | None = None
+    cohort_size: int = 1
 
     @classmethod
-    def from_payload(cls, payload: Any) -> "FutureHint":
+    def from_payload(cls, payload: Any) -> FutureHint:
         if not isinstance(payload, dict):
-            raise ValueError("elastic.future payload must be an object")
+            raise ValueError("elastic.future payload must be an object")  # noqa: TRY004
         allowed = {
             "release_after_ms",
             "deadline_after_ms",
@@ -81,6 +104,8 @@ class FutureHint:
             "shared_prefix_tokens",
             "prefill_tokens_per_s",
             "decode_tokens_per_s",
+            "cohort_id",
+            "cohort_size",
         }
         unknown = set(payload) - allowed
         if unknown:
@@ -116,7 +141,7 @@ class FutureHint:
         )
         weight = payload.get("weight", 1.0)
         if isinstance(weight, bool) or not isinstance(weight, (int, float)):
-            raise ValueError("weight must be numeric")
+            raise ValueError("weight must be numeric")  # noqa: TRY004
         weight = float(weight)
         if not math.isfinite(weight) or not 0 < weight <= 1e6:
             raise ValueError("weight must be finite and in (0, 1e6]")
@@ -145,6 +170,22 @@ class FutureHint:
         decode_tokens_per_s = _optional_rate(
             payload.get("decode_tokens_per_s"), "decode_tokens_per_s"
         )
+        cohort_id = payload.get("cohort_id")
+        cohort_size = _bounded_int(
+            payload.get("cohort_size", 1), "cohort_size", minimum=1
+        )
+        if cohort_id is None:
+            if cohort_size != 1:
+                raise ValueError("cohort_size greater than 1 requires cohort_id")
+        elif (
+            not isinstance(cohort_id, str)
+            or not cohort_id
+            or len(cohort_id) > 128
+            or cohort_size < 2
+        ):
+            raise ValueError(
+                "cohort_id must be a short non-empty string and requires cohort_size >= 2"
+            )
         return cls(
             release,
             deadline,
@@ -158,12 +199,14 @@ class FutureHint:
             shared_prefix_tokens,
             prefill_tokens_per_s,
             decode_tokens_per_s,
+            cohort_id,
+            cohort_size,
         )
 
 
 def _bounded_int(value: Any, name: str, *, minimum: int = 0) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{name} must be an integer")
+        raise ValueError(f"{name} must be an integer")  # noqa: TRY004
     if not minimum <= value <= 86_400_000:
         raise ValueError(f"{name} is outside the supported range")
     return value
@@ -171,7 +214,7 @@ def _bounded_int(value: Any, name: str, *, minimum: int = 0) -> int:
 
 def _bounded_int64(value: Any, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{name} must be an integer")
+        raise ValueError(f"{name} must be an integer")  # noqa: TRY004
     if not 0 <= value <= (1 << 63) - 1:
         raise ValueError(f"{name} is outside the supported range")
     return value
@@ -211,11 +254,13 @@ def _extract_hint(request: Any) -> FutureHint | None:
     hint = FutureHint.from_payload(getattr(action, "payload", None))
     if action_version == "1" and hint.deadline_clock is not None:
         raise ValueError("action version 1 cannot carry an absolute deadline clock")
-    if action_version != ACTION_VERSION and (
+    if action_version not in (RATE_ACTION_VERSION, ACTION_VERSION) and (
         hint.prefill_tokens_per_s is not None
         or hint.decode_tokens_per_s is not None
     ):
         raise ValueError("service-time rates require action version 3")
+    if action_version != ACTION_VERSION and hint.cohort_id is not None:
+        raise ValueError("cohort metadata requires action version 4")
     return hint
 
 
@@ -431,7 +476,7 @@ def apply_to_waiting_queue(
         _stats["fallback_invalid_hint"] += 1
         _publish_stats()
         return
-    except Exception:
+    except Exception:  # noqa: BLE001 - hint failures must preserve native scheduling
         _stats["fallback_exception"] += 1
         _publish_stats()
         return
@@ -439,8 +484,165 @@ def apply_to_waiting_queue(
     _publish_stats()
 
 
-def snapshot_stats() -> dict[str, int]:
-    return dict(_stats)
+def observe_prefill_batch(batch: Any) -> None:
+    """Record whether planned cohorts landed together in a real prefill batch."""
+
+    global _last_cohort_batch
+    batch = _prefill_batch(batch)
+    if batch is None:
+        return
+    _stats["prefill_batches"] += 1
+    requests = getattr(batch, "reqs", None) or ()
+    cohorts: dict[str, list[Any]] = {}
+    for request in requests:
+        try:
+            hint = _extract_hint(request)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if hint is not None and hint.cohort_id is not None:
+            cohorts.setdefault(hint.cohort_id, []).append(request)
+    for cohort_id, members in cohorts.items():
+        hints = [_extract_hint(member) for member in members]
+        expected_sizes = {
+            hint.cohort_size for hint in hints if hint is not None
+        }
+        expected = next(iter(expected_sizes)) if len(expected_sizes) == 1 else None
+        observed = len(members)
+        complete = expected is not None and observed == expected
+        _stats["cohort_batches"] += 1
+        _stats["cohort_members_observed"] += observed
+        if complete:
+            _stats["complete_cohort_batches"] += 1
+        else:
+            _stats["partial_cohort_batches"] += 1
+        _last_cohort_batch = {
+            "cohort_id": cohort_id,
+            "expected_members": expected,
+            "observed_members": observed,
+            "request_ids": sorted(
+                str(getattr(member, "request_id", "<missing>"))
+                for member in members
+            ),
+            "complete": complete,
+            "reason": None if complete else "native_prefill_selected_partial_members",
+        }
+
+
+def _prefill_batch(result: Any) -> Any:
+    """Extract a batch from the 0.5.2 batch and 0.5.17 NextBatchPlan APIs."""
+
+    if result is None or hasattr(result, "reqs"):
+        return result
+    return getattr(result, "batch_to_run", None)
+
+
+def withhold_incomplete_cohorts(
+    waiting_queue: list[Any],
+    *,
+    now_s: float | None = None,
+    timeout_ms: float | None = None,
+) -> list[Any]:
+    """Temporarily remove partial cohorts while native admission serves others.
+
+    The caller must restore the returned requests after native prefill scheduling.
+    This gate only controls cohort arrival. Native ``PrefillAdder`` still decides
+    request count, tokens, radix, grammar, LoRA, and every other capacity limit.
+    """
+
+    global _last_held_cohorts
+    if not waiting_queue:
+        _cohort_first_seen_s.clear()
+        _cohort_arrival_complete.clear()
+        _last_held_cohorts = []
+        return []
+
+    now = time.monotonic() if now_s is None else now_s
+    if not math.isfinite(now):
+        raise ValueError("cohort gate clock must be finite")
+    if timeout_ms is None:
+        raw_timeout = os.environ.get(COHORT_WAIT_TIMEOUT_ENV)
+        timeout_ms = (
+            _DEFAULT_COHORT_WAIT_TIMEOUT_MS
+            if raw_timeout in (None, "")
+            else float(raw_timeout)
+        )
+    if not math.isfinite(timeout_ms) or timeout_ms < 0:
+        raise ValueError(f"{COHORT_WAIT_TIMEOUT_ENV} must be finite and non-negative")
+
+    cohorts: dict[str, list[Any]] = {}
+    for request in waiting_queue:
+        try:
+            hint = _extract_hint(request)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if hint is not None and hint.cohort_id is not None:
+            cohorts.setdefault(hint.cohort_id, []).append(request)
+
+    _cohort_arrival_complete.intersection_update(cohorts)
+    incomplete: dict[str, tuple[int, list[Any]]] = {}
+    for cohort_id, members in cohorts.items():
+        sizes = {_extract_hint(member).cohort_size for member in members}
+        if len(sizes) != 1:
+            _stats["cohort_metadata_conflicts"] += 1
+            _cohort_first_seen_s.pop(cohort_id, None)
+            _cohort_arrival_complete.discard(cohort_id)
+            continue
+        expected = next(iter(sizes))
+        if len(members) > expected:
+            _stats["cohort_metadata_conflicts"] += 1
+            _cohort_first_seen_s.pop(cohort_id, None)
+            _cohort_arrival_complete.discard(cohort_id)
+        elif len(members) == expected:
+            _cohort_arrival_complete.add(cohort_id)
+            _cohort_first_seen_s.pop(cohort_id, None)
+        elif cohort_id not in _cohort_arrival_complete:
+            incomplete[cohort_id] = (expected, members)
+
+    active_ids = set(incomplete)
+    for stale_id in set(_cohort_first_seen_s) - active_ids:
+        del _cohort_first_seen_s[stale_id]
+
+    held_members: list[Any] = []
+    held_records: list[dict[str, object]] = []
+    for cohort_id, (expected, members) in incomplete.items():
+        first_seen = _cohort_first_seen_s.setdefault(cohort_id, now)
+        waited_ms = max(0.0, (now - first_seen) * 1000.0)
+        if waited_ms > timeout_ms:
+            _stats["cohort_gate_timeouts"] += 1
+            del _cohort_first_seen_s[cohort_id]
+            continue
+        held_members.extend(members)
+        held_records.append(
+            {
+                "cohort_id": cohort_id,
+                "expected_members": expected,
+                "observed_members": len(members),
+                "waited_ms": round(waited_ms, 3),
+                "request_ids": sorted(
+                    str(getattr(member, "request_id", "<missing>"))
+                    for member in members
+                ),
+            }
+        )
+
+    _stats["cohort_gate_ticks"] += 1
+    _last_held_cohorts = held_records
+    if not held_members:
+        return []
+    _stats["cohort_gate_holds"] += 1
+    _stats["cohort_members_held"] += len(held_members)
+    held_ids = {id(member) for member in held_members}
+    waiting_queue[:] = [
+        member for member in waiting_queue if id(member) not in held_ids
+    ]
+    return held_members
+
+
+def snapshot_stats() -> dict[str, object]:
+    snapshot: dict[str, object] = dict(_stats)
+    snapshot["last_cohort_batch"] = _last_cohort_batch
+    snapshot["last_held_cohorts"] = list(_last_held_cohorts)
+    return snapshot
 
 
 def _publish_stats(*, force: bool = False, now_s: float | None = None) -> None:
@@ -518,4 +720,34 @@ def install() -> None:
 
     elastic_calc_priority._elastic_future_hook = True
     SchedulePolicy.calc_priority = elastic_calc_priority
+
+    try:
+        from sglang.srt.managers.scheduler import Scheduler
+    except (ImportError, AttributeError):
+        Scheduler = None
+    if Scheduler is not None and hasattr(Scheduler, "get_new_batch_prefill"):
+        original_prefill = Scheduler.get_new_batch_prefill
+        if not getattr(original_prefill, "_elastic_cohort_observer", False):
+
+            @wraps(original_prefill)
+            def elastic_get_new_batch_prefill(self, *args, **kwargs):
+                try:
+                    held = withhold_incomplete_cohorts(self.waiting_queue)
+                except (AttributeError, TypeError, ValueError, OSError):
+                    # A malformed optional gate must not suppress native prefill.
+                    _stats["cohort_gate_errors"] += 1
+                    held = []
+                try:
+                    result = original_prefill(self, *args, **kwargs)
+                finally:
+                    # Native scheduling may append grammar-ready work. Partial
+                    # cohorts stay at the tail; the next native priority pass
+                    # remains authoritative for their eventual order.
+                    self.waiting_queue.extend(held)
+                observe_prefill_batch(_prefill_batch(result))
+                _publish_stats()
+                return result
+
+            elastic_get_new_batch_prefill._elastic_cohort_observer = True
+            Scheduler.get_new_batch_prefill = elastic_get_new_batch_prefill
     _installed = True

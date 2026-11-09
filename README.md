@@ -274,9 +274,22 @@ dispatch group: it reserves worker and in-flight capacity for every member,
 checks their budget together, installs one client-side release barrier, and
 fails the run when observed generator-entry skew exceeds the configured
 tolerance. The result records cohort membership and actual start skew. This is
-still client-dispatch evidence, not proof that SGLang placed every member in
-one server-side prefill batch; profile values and the server-side batch gate
-need calibration against real co-batch traces.
+still does not prove by itself that SGLang placed every member in one prefill
+batch. Action version 4 carries the cohort identity and expected size through
+`kv_hints`; the scheduler hook wraps `get_new_batch_prefill` and records the
+actual request membership of each resulting batch. `cohort_batches`,
+`complete_cohort_batches`, `partial_cohort_batches` and `last_cohort_batch` in
+the future stats distinguish a scheduled cohort from one that the server
+actually co-batched. A partial cohort is withheld while other ready requests
+continue through the native scheduler. Once all advertised members arrive, the
+native `PrefillAdder` rechecks the complete group and may still choose only a
+subset because of its token, request-slot, radix, grammar, LoRA or memory
+limits; that result is counted as a native partial batch. The arrival gate
+therefore never forces an oversized batch. `EKV_COHORT_WAIT_TIMEOUT_MS` bounds
+the wait (default 1000 ms) so a lost transport request falls back to native
+scheduling and records a timeout. The hook supports both the SGLang 0.5.2 batch
+return and 0.5.17 `NextBatchPlan` return. Profile values still need paired runs
+against real SGLang co-batch traces.
 `search_exact` distinguishes a completed search from a capped incumbent. Use
 `online` to evaluate each immediate action by completing the deployable
 `future` heuristic from that branch, then commit only the first action. Its

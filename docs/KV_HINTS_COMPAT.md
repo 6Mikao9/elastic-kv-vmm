@@ -68,6 +68,13 @@ service-rate range. Older action versions remain accepted, but carrying either
 rate in a version 1 or 2 action is rejected so old and new semantics cannot be
 confused.
 
+Action version 4 adds `cohort_id` and `cohort_size` for planned co-batched
+requests. The scheduler keeps an incomplete cohort out of native prefill
+admission while other ready requests proceed, then lets the unchanged native
+`PrefillAdder` decide whether the complete cohort fits in one batch. A bounded
+`EKV_COHORT_WAIT_TIMEOUT_MS` wait prevents a lost member from blocking the
+survivors forever. Cohort fields are rejected on versions 1-3.
+
 `residence` accepts `auto`, `resident` or `host_backed`. It is inert unless the
 request-residency adapter is compiled into the run and
 `EKV_RESIDENT_HINT_POLICY=adaptive` is set. `resident` requests a complete-GPU

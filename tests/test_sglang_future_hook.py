@@ -8,8 +8,10 @@ from adaptive_sparse import sglang_future_hook as hook
 from adaptive_sparse.future_residency import decide_resident_claim
 from adaptive_sparse.sglang_future_hook import (
     apply_to_waiting_queue,
+    observe_prefill_batch,
     order_requests,
     snapshot_stats,
+    withhold_incomplete_cohorts,
 )
 
 
@@ -30,6 +32,11 @@ def request(name, prompt, created, payload, *, version="1"):
 
 
 class SGLangFutureHookTest(unittest.TestCase):
+    def setUp(self):
+        hook._cohort_first_seen_s.clear()
+        hook._cohort_arrival_complete.clear()
+        hook._last_held_cohorts = []
+
     def test_absolute_deadline_uses_dispatch_clock_not_request_age(self):
         hint = hook.FutureHint.from_payload(
             {
@@ -167,6 +174,197 @@ class SGLangFutureHookTest(unittest.TestCase):
         )
 
         self.assertEqual([item.request_id for item in ordered], ["fast", "slow"])
+
+    def test_v4_cohort_metadata_requires_version_four(self):
+        cohort_payload = {"cohort_id": "batch-0", "cohort_size": 2}
+        hint = hook.FutureHint.from_payload(cohort_payload)
+        self.assertEqual(hint.cohort_id, "batch-0")
+        self.assertEqual(hint.cohort_size, 2)
+        supported = request("member", 10, 1.0, cohort_payload, version="4")
+        self.assertEqual(hook._extract_hint(supported).cohort_id, "batch-0")
+        rejected = request("member", 10, 1.0, cohort_payload, version="3")
+        with self.assertRaisesRegex(ValueError, "version 4"):
+            hook._extract_hint(rejected)
+        with self.assertRaisesRegex(ValueError, "requires cohort_id"):
+            hook.FutureHint.from_payload({"cohort_size": 2})
+
+    def test_observes_complete_and_partial_server_prefill_cohorts(self):
+        first = request(
+            "first",
+            10,
+            1.0,
+            {"cohort_id": "batch-0", "cohort_size": 2},
+            version="4",
+        )
+        second = request(
+            "second",
+            10,
+            1.0,
+            {"cohort_id": "batch-0", "cohort_size": 2},
+            version="4",
+        )
+        before = snapshot_stats()
+
+        observe_prefill_batch(SimpleNamespace(reqs=[first]))
+        partial = snapshot_stats()
+        observe_prefill_batch(SimpleNamespace(reqs=[first, second]))
+        complete = snapshot_stats()
+
+        self.assertEqual(
+            partial["partial_cohort_batches"]
+            - before["partial_cohort_batches"],
+            1,
+        )
+        self.assertFalse(partial["last_cohort_batch"]["complete"])
+        self.assertEqual(
+            complete["complete_cohort_batches"]
+            - partial["complete_cohort_batches"],
+            1,
+        )
+        self.assertTrue(complete["last_cohort_batch"]["complete"])
+        self.assertEqual(
+            complete["last_cohort_batch"]["request_ids"],
+            ["first", "second"],
+        )
+
+    def test_observer_unwraps_new_scheduler_prefill_plan(self):
+        first = request(
+            "first",
+            10,
+            1.0,
+            {"cohort_id": "batch-0", "cohort_size": 2},
+            version="4",
+        )
+        second = request(
+            "second",
+            10,
+            1.0,
+            {"cohort_id": "batch-0", "cohort_size": 2},
+            version="4",
+        )
+        before = snapshot_stats()
+
+        observe_prefill_batch(
+            SimpleNamespace(
+                batch_to_run=SimpleNamespace(reqs=[first, second]),
+                running_batch=object(),
+            )
+        )
+
+        after = snapshot_stats()
+        self.assertEqual(
+            after["complete_cohort_batches"]
+            - before["complete_cohort_batches"],
+            1,
+        )
+
+    def test_partial_cohort_is_withheld_without_blocking_other_requests(self):
+        first = request(
+            "first",
+            10,
+            1.0,
+            {"cohort_id": "batch-0", "cohort_size": 2},
+            version="4",
+        )
+        other = request("other", 10, 1.0, {})
+        queue = [first, other]
+
+        held = withhold_incomplete_cohorts(queue, now_s=10.0, timeout_ms=100.0)
+
+        self.assertEqual(held, [first])
+        self.assertEqual(queue, [other])
+        state = snapshot_stats()
+        self.assertEqual(state["last_held_cohorts"][0]["cohort_id"], "batch-0")
+        self.assertEqual(state["last_held_cohorts"][0]["expected_members"], 2)
+
+    def test_partial_cohort_timeout_releases_members_fail_safe(self):
+        first = request(
+            "first",
+            10,
+            1.0,
+            {"cohort_id": "batch-0", "cohort_size": 2},
+            version="4",
+        )
+        queue = [first]
+
+        with patch.dict("os.environ", {hook.COHORT_WAIT_TIMEOUT_ENV: "10"}):
+            initially_held = withhold_incomplete_cohorts(queue, now_s=1.0)
+            self.assertEqual(initially_held, [first])
+            queue.extend(initially_held)
+            before = snapshot_stats()["cohort_gate_timeouts"]
+            held = withhold_incomplete_cohorts(queue, now_s=1.011)
+
+        self.assertEqual(held, [])
+        self.assertEqual(queue, [first])
+        self.assertEqual(snapshot_stats()["cohort_gate_timeouts"] - before, 1)
+
+    def test_completed_cohort_is_not_reheld_after_native_partial_admission(self):
+        first = request(
+            "first",
+            10,
+            1.0,
+            {"cohort_id": "batch-0", "cohort_size": 2},
+            version="4",
+        )
+        second = request(
+            "second",
+            10,
+            1.0,
+            {"cohort_id": "batch-0", "cohort_size": 2},
+            version="4",
+        )
+        queue = [first]
+        queue.extend(withhold_incomplete_cohorts(queue, now_s=1.0, timeout_ms=100))
+
+        queue.append(second)
+        self.assertEqual(
+            withhold_incomplete_cohorts(queue, now_s=1.01, timeout_ms=100), []
+        )
+        queue.remove(first)
+        self.assertEqual(
+            withhold_incomplete_cohorts(queue, now_s=1.02, timeout_ms=100), []
+        )
+        self.assertEqual(queue, [second])
+
+    def test_oversubscribed_cohort_metadata_fails_open(self):
+        members = [
+            request(
+                request_id,
+                10,
+                1.0,
+                {"cohort_id": "batch-0", "cohort_size": 2},
+                version="4",
+            )
+            for request_id in ("first", "second", "extra")
+        ]
+        original = list(members)
+        before = snapshot_stats()["cohort_metadata_conflicts"]
+
+        held = withhold_incomplete_cohorts(members, now_s=1.0, timeout_ms=100)
+
+        self.assertEqual(held, [])
+        self.assertEqual(members, original)
+        self.assertEqual(
+            snapshot_stats()["cohort_metadata_conflicts"] - before,
+            1,
+        )
+
+    def test_invalid_cohort_timeout_leaves_native_scheduling_available(self):
+        first = request(
+            "first",
+            10,
+            1.0,
+            {"cohort_id": "batch-0", "cohort_size": 2},
+            version="4",
+        )
+        queue = [first]
+
+        with patch.dict(
+            "os.environ", {hook.COHORT_WAIT_TIMEOUT_ENV: "not-a-number"}
+        ), self.assertRaises(ValueError):
+            withhold_incomplete_cohorts(queue, now_s=1.0)
+
+        self.assertEqual(queue, [first])
 
     def test_service_rates_are_rejected_from_older_action_versions(self):
         legacy = request(
@@ -492,6 +690,168 @@ class SGLangFutureHookTest(unittest.TestCase):
             hook.install()
         hook._installed = False
         compat_install.assert_not_called()
+
+    def test_installer_observes_real_prefill_batch_composition(self):
+        class SchedulePolicy:
+            def calc_priority(self, waiting_queue, *args, **kwargs):
+                return None
+
+        first = request(
+            "first",
+            10,
+            1.0,
+            {"cohort_id": "batch-0", "cohort_size": 2},
+            version="4",
+        )
+        second = request(
+            "second",
+            10,
+            1.0,
+            {"cohort_id": "batch-0", "cohort_size": 2},
+            version="4",
+        )
+
+        class Scheduler:
+            def __init__(self):
+                self.waiting_queue = [first, second]
+
+            def get_new_batch_prefill(self, *args, **kwargs):
+                return SimpleNamespace(reqs=[first, second])
+
+        modules = {
+            "sglang": SimpleNamespace(__path__=[]),
+            "sglang.srt": SimpleNamespace(__path__=[]),
+            "sglang.srt.managers": SimpleNamespace(__path__=[]),
+            "sglang.srt.managers.kv_hints": SimpleNamespace(),
+            "sglang.srt.managers.schedule_policy": SimpleNamespace(
+                SchedulePolicy=SchedulePolicy
+            ),
+            "sglang.srt.managers.scheduler": SimpleNamespace(
+                Scheduler=Scheduler
+            ),
+        }
+        before = snapshot_stats()
+        with patch.dict(sys.modules, modules), patch.dict(
+            "os.environ", {"EKV_FUTURE_POLICY": "deadline"}
+        ):
+            hook._installed = False
+            hook.install()
+            batch = Scheduler().get_new_batch_prefill()
+        hook._installed = False
+
+        self.assertEqual(
+            [item.request_id for item in batch.reqs], ["first", "second"]
+        )
+        after = snapshot_stats()
+        self.assertEqual(
+            after["complete_cohort_batches"]
+            - before["complete_cohort_batches"],
+            1,
+        )
+        self.assertTrue(after["last_cohort_batch"]["complete"])
+
+    def test_installer_accepts_new_scheduler_plan_and_restores_held_cohort(self):
+        class SchedulePolicy:
+            def calc_priority(self, waiting_queue, *args, **kwargs):
+                return None
+
+        partial = request(
+            "partial",
+            10,
+            1.0,
+            {"cohort_id": "batch-0", "cohort_size": 2},
+            version="4",
+        )
+        other = request("other", 10, 1.0, {})
+
+        class Scheduler:
+            def __init__(self):
+                self.waiting_queue = [partial, other]
+                self.observed_queue = None
+
+            def get_new_batch_prefill(self, running_batch):
+                self.observed_queue = list(self.waiting_queue)
+                self.waiting_queue.remove(other)
+                return SimpleNamespace(
+                    batch_to_run=SimpleNamespace(reqs=[other]),
+                    running_batch=running_batch,
+                )
+
+        modules = {
+            "sglang": SimpleNamespace(__path__=[]),
+            "sglang.srt": SimpleNamespace(__path__=[]),
+            "sglang.srt.managers": SimpleNamespace(__path__=[]),
+            "sglang.srt.managers.kv_hints": SimpleNamespace(),
+            "sglang.srt.managers.schedule_policy": SimpleNamespace(
+                SchedulePolicy=SchedulePolicy
+            ),
+            "sglang.srt.managers.scheduler": SimpleNamespace(
+                Scheduler=Scheduler
+            ),
+        }
+        with patch.dict(sys.modules, modules), patch.dict(
+            "os.environ", {"EKV_FUTURE_POLICY": "deadline"}
+        ):
+            hook._installed = False
+            hook.install()
+            scheduler = Scheduler()
+            plan = scheduler.get_new_batch_prefill("running")
+        hook._installed = False
+
+        self.assertEqual(scheduler.observed_queue, [other])
+        self.assertEqual([item.request_id for item in plan.batch_to_run.reqs], ["other"])
+        self.assertEqual([item.request_id for item in scheduler.waiting_queue], ["partial"])
+
+    def test_installer_cohort_gate_error_falls_back_to_native_prefill(self):
+        class SchedulePolicy:
+            def calc_priority(self, waiting_queue, *args, **kwargs):
+                return None
+
+        waiting = request(
+            "waiting",
+            10,
+            1.0,
+            {"cohort_id": "batch-0", "cohort_size": 2},
+            version="4",
+        )
+
+        class Scheduler:
+            def __init__(self):
+                self.waiting_queue = [waiting]
+                self.called = False
+
+            def get_new_batch_prefill(self, *args, **kwargs):
+                self.called = True
+
+        modules = {
+            "sglang": SimpleNamespace(__path__=[]),
+            "sglang.srt": SimpleNamespace(__path__=[]),
+            "sglang.srt.managers": SimpleNamespace(__path__=[]),
+            "sglang.srt.managers.kv_hints": SimpleNamespace(),
+            "sglang.srt.managers.schedule_policy": SimpleNamespace(
+                SchedulePolicy=SchedulePolicy
+            ),
+            "sglang.srt.managers.scheduler": SimpleNamespace(
+                Scheduler=Scheduler
+            ),
+        }
+        before = snapshot_stats()["cohort_gate_errors"]
+        with patch.dict(sys.modules, modules), patch.dict(
+            "os.environ",
+            {
+                "EKV_FUTURE_POLICY": "deadline",
+                hook.COHORT_WAIT_TIMEOUT_ENV: "invalid",
+            },
+        ):
+            hook._installed = False
+            hook.install()
+            scheduler = Scheduler()
+            self.assertIsNone(scheduler.get_new_batch_prefill())
+        hook._installed = False
+
+        self.assertTrue(scheduler.called)
+        self.assertEqual(scheduler.waiting_queue, [waiting])
+        self.assertEqual(snapshot_stats()["cohort_gate_errors"] - before, 1)
 
     def test_stats_are_published_atomically(self):
         import json

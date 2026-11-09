@@ -135,6 +135,20 @@ class RolloutExecutorTest(unittest.TestCase):
 
         self.assertEqual(envelope["actions"][0]["action_version"], "3")
 
+    def test_cohort_payload_uses_v4_and_carries_batch_identity(self):
+        planned = replace(
+            submission(),
+            prefill_batch_size=2,
+            cohort_id="batch-0",
+        )
+
+        envelope = make_kv_hints(planned)
+
+        action = envelope["actions"][0]
+        self.assertEqual(action["action_version"], "4")
+        self.assertEqual(action["payload"]["cohort_id"], "batch-0")
+        self.assertEqual(action["payload"]["cohort_size"], 2)
+
     def test_measured_rates_upgrade_only_later_hints_to_v3(self):
         base = submission()
         hints = {
@@ -1086,6 +1100,7 @@ class RolloutExecutorTest(unittest.TestCase):
                 "http://server/generate",
                 cohort,
                 max_parallel=2,
+                max_submit_lateness_ms=1000.0,
                 generator=generate,
                 max_cohort_start_skew_ms=1.0,
             )

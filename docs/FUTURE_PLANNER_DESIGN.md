@@ -420,12 +420,32 @@ cohort 的 placement 联合求解，可以在字节预算内选择 resident、Hi
 在实测启动偏差超过 `--max-cohort-start-skew-ms` 时让整轮实验失败；受管与非受管
 执行路径使用相同语义。
 
-这条证据只证明客户端在接近同一时刻启动各个独立 HTTP 请求，不证明 SGLang 的服务端
-scheduler 已把它们放入同一个 prefill batch。当前 transport 尚未把 cohort ID 变成
-服务端 admission gate，网络、tokenization 和调度 tick 仍可能拆开请求。下一步必须在
-SGLang scheduler 记录真实 batch 成员，或等待完整 cohort 后再调用原生
-`PrefillAdder`；在此之前，`prefill_batch_profiles` 不能引用客户端 skew 作为同批吞吐
-已验证的依据。
+action version 4 进一步把这组提交的 `cohort_id` 与 `cohort_size` 放进
+`elastic.future` payload。scheduler hook 包装原生 `get_new_batch_prefill()`，检查返回
+的 `ScheduleBatch.reqs`（同时兼容 0.5.2 直接返回 batch 与 0.5.17 返回
+`NextBatchPlan.batch_to_run`），并在 `EKV_FUTURE_STATS_PATH` 中记录 `prefill_batches`、
+`cohort_batches`、`complete_cohort_batches`、`partial_cohort_batches`、
+`cohort_members_observed` 与最近一次的 `last_cohort_batch`。因此客户端 barrier 证明的是
+“同时发起”，而服务端计数才能区分它是否真的形成了完整 cohort。
+
+服务端现在增加一个只控制“到齐”的等待门：等待队列里某 cohort 的成员数小于
+`cohort_size` 时，hook 暂时移出这些成员，让其它 ready 请求先进入原生
+`get_new_batch_prefill()`；调用返回后恢复未准入成员。全部成员到齐后，hook 不再按
+cohort 分组，原生调度仍按原始队列和 `PrefillAdder` 检查 token、request slot、
+radix、grammar、LoRA 与显存容量。因此这里不会通过模拟或 monkeypatch 绕过原生限额。
+如果完整 cohort 在原生准入时仍只选中一部分，`partial_cohort_batches` 与
+`last_cohort_batch.reason=native_prefill_selected_partial_members` 明确记录该降级。
+
+为防单个传输请求丢失导致永久等待，`EKV_COHORT_WAIT_TIMEOUT_MS` 设置到齐等待上限，
+默认 1000 ms。超时后成员照常进入原生调度，并累计 `cohort_gate_timeouts`；非法配置
+或无法解析的 hint 采用 fail-open，累计 `cohort_gate_errors` 或
+`cohort_metadata_conflicts`，不能阻断普通请求。等待期间的
+`cohort_gate_ticks`、`cohort_gate_holds`、`cohort_members_held` 和
+`last_held_cohorts` 可用于区分“尚未到齐”“超时降级”和“已到齐但原生未同批”。
+
+在这些约束完成前，`prefill_batch_profiles` 只能引用真实
+`complete_cohort_batches` 的对局结果，不能把客户端 skew、规划器假设或“成员已到齐”
+当成原生同批吞吐已验证的依据。
 
 ### 4.2 受控 rollout 的可执行计划
 

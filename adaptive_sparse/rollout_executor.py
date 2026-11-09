@@ -35,6 +35,7 @@ from .service_time import ServiceTimeEstimator, estimate_service_duration_ms
 from .sglang_future_hook import (
     ACTION_VERSION,
     LEGACY_ACTION_VERSION,
+    RATE_ACTION_VERSION,
     FutureHint,
 )
 
@@ -190,6 +191,9 @@ def make_kv_hints(
         payload["prefill_tokens_per_s"] = prefill_tokens_per_s
     if decode_tokens_per_s is not None:
         payload["decode_tokens_per_s"] = decode_tokens_per_s
+    if submission.cohort_id is not None:
+        payload["cohort_id"] = submission.cohort_id
+        payload["cohort_size"] = submission.prefill_batch_size
     # Revalidate the complete payload after runtime overrides.  A malformed
     # feedback value must fail before any request reaches the server.
     try:
@@ -199,7 +203,12 @@ def make_kv_hints(
     has_service_rates = any(
         name in payload for name in ("prefill_tokens_per_s", "decode_tokens_per_s")
     )
-    action_version = ACTION_VERSION if has_service_rates else LEGACY_ACTION_VERSION
+    if submission.cohort_id is not None:
+        action_version = ACTION_VERSION
+    elif has_service_rates:
+        action_version = RATE_ACTION_VERSION
+    else:
+        action_version = LEGACY_ACTION_VERSION
     request_id = submission.request_id
     return {
         "protocol_version": "1",
