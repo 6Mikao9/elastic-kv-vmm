@@ -1,0 +1,18 @@
+{
+  "tool": "nsys",
+  "version": "2026.5.1.161",
+  "url": "https://developer.download.nvidia.com/devtools/repos/ubuntu2204/amd64/NsightSystems-linux-cli-public-2026.5.1.161-3889610.deb",
+  "expected_sha256": "61829db6392e5c293ada1319df86a97c3356bc810335a1975cb551fcfe3eca08",
+  "expected_bytes": 225594886,
+  "started": 1794213825.8448005,
+  "status": "installed_not_gpu_validated",
+  "gpu_profile_validated": false,
+  "downloaded_bytes": 225594886,
+  "sha256": "61829db6392e5c293ada1319df86a97c3356bc810335a1975cb551fcfe3eca08",
+  "package_metadata": "Package: nsight-systems-cli-2026.5.1\nVersion: 2026.5.1.161-265138896106v0\nArchitecture: amd64\n",
+  "executable": "/workspace/elastic-kv-vmm/tools/nsys-2026.5.1.161/root/opt/nvidia/nsight-systems-cli/2026.5.1/target-linux-x64/nsys",
+  "version_output": "NVIDIA Nsight Systems version 2026.5.1.161-265138896106v0",
+  "environment_check_exit": 0,
+  "environment_check": "NVIDIA Nsight Systems version 2026.5.1.161-265138896106v0\n\nGeneral Check\n- Platform: Linux\n- Timestamp counter supported: Yes\n\nCPU Profiling Environment Check\n- Root privilege: disabled\n- Linux Kernel Paranoid Level: 4 (some features maybe not available)\n- Linux Distribution: Ubuntu\n- Linux Kernel Version (5.15.0-191-generic): OK\n- Linux perf_event_open syscall available: Fail\n- Sampling trigger event available: Fail\n- Intel(c) Last Branch Record support: Not Available\n- CPU Profiling Environment (process-tree): Fail\n- CPU Profiling Environment (system-wide): Fail\n\nSee the product documentation at https://docs.nvidia.com/nsight-systems for more information,\nincluding information on how to set the Linux Kernel Paranoid Level.\n",
+  "finished": 1794213837.3656905
+}
