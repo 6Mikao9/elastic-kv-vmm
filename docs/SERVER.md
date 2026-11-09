@@ -14,6 +14,13 @@ dense `--elastic-mode v0`–`v5` values are rejected for this profile. The old
 `adaptive_sparse/launch_minimax_sm80.py` command remains available as a
 compatibility wrapper and calls the same installer sequence.
 
+For a local model directory, `--elastic-runtime-profile auto` reads
+`config.json` and selects the MiniMax runtime when `model_type` or
+`architectures` contains `minimax`; all other configs select the dense runtime.
+Auto mode requires an explicit local upstream `--model-path` and does not
+resolve remote identifiers or download metadata. The resolved value is frozen
+before server import and propagated to spawned workers.
+
 `--elastic-mode baseline` deliberately skips the VMM monkeypatch. This keeps a
 native baseline available. The separate future-ordering hook uses native
 `kv_hints` when present and installs the guarded 0.5.2 transport compatibility
@@ -60,7 +67,7 @@ SGLang or touch CUDA.
 
 | Option | Default | Constraint |
 |---|---:|---|
-| `--elastic-runtime-profile` | `dense` | `dense` or `minimax-hisparse`; the latter disables dense V5 |
+| `--elastic-runtime-profile` | `dense` | `auto`, `dense`, or `minimax-hisparse`; `auto` requires a local model config and the MiniMax profile disables dense V5 |
 | `--elastic-mode` | `baseline` | `baseline`, `v0` through `v5` |
 | `--elastic-chunk-mib` | `2` | positive integer |
 | `--elastic-retain-chunks` | `1` | at least the sink chunk |

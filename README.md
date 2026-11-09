@@ -235,6 +235,13 @@ point so spawned workers reconstruct the same hooks. This consolidates launch
 plumbing only; it does not change the documented TP4/eager scope or turn CPU
 tests into serving evidence.
 
+For a local snapshot, `--elastic-runtime-profile auto` reads its `config.json`
+and selects `minimax-hisparse` when the model type or architecture identifies
+MiniMax; other architectures use `dense`. Auto mode deliberately refuses remote
+model identifiers or directories without `config.json`, so startup never gains
+an implicit network lookup. The resolved profile is printed in the launch
+manifest and inherited by spawned SGLang workers.
+
 For the separate future-ordering path, set `EKV_FUTURE_POLICY=deadline` and
 optionally `EKV_FUTURE_STATS_PATH=/path/to/future-stats.json`. On SGLang 0.5.2,
 the launcher installs a small request-transport compatibility layer before the

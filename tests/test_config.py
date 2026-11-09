@@ -2,8 +2,10 @@ import io
 import json
 import os
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -363,6 +365,78 @@ class ElasticConfigTest(unittest.TestCase):
                     "v5",
                 ]
             )
+
+    def test_auto_runtime_profile_uses_local_model_config(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            dense = Path(temporary) / "dense"
+            sparse = Path(temporary) / "sparse"
+            dense.mkdir()
+            sparse.mkdir()
+            (dense / "config.json").write_text(
+                json.dumps(
+                    {
+                        "model_type": "qwen3",
+                        "architectures": ["Qwen3ForCausalLM"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (sparse / "config.json").write_text(
+                json.dumps(
+                    {
+                        "model_type": "minimax_m3",
+                        "architectures": ["MiniMaxM3SparseForCausalLM"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            dense_result = resolve_launch_config(
+                [
+                    "--elastic-runtime-profile",
+                    "auto",
+                    "--model-path",
+                    str(dense),
+                ]
+            )
+            sparse_result = resolve_launch_config(
+                [
+                    "--elastic-runtime-profile",
+                    "auto",
+                    f"--model-path={sparse}",
+                ]
+            )
+
+        self.assertEqual(dense_result[3], "dense")
+        self.assertEqual(sparse_result[3], "minimax-hisparse")
+        self.assertEqual(sparse_result[0].mode, "baseline")
+
+    def test_auto_runtime_profile_requires_local_config(self):
+        with (
+            redirect_stdout(io.StringIO()),
+            patch("sys.stderr", io.StringIO()),
+            self.assertRaises(SystemExit),
+        ):
+            resolve_launch_config(
+                ["--elastic-runtime-profile", "auto"]
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            empty = Path(temporary) / "empty"
+            empty.mkdir()
+            with (
+                redirect_stdout(io.StringIO()),
+                patch("sys.stderr", io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                resolve_launch_config(
+                    [
+                        "--elastic-runtime-profile",
+                        "auto",
+                        "--model-path",
+                        str(empty),
+                    ]
+                )
 
     def test_dry_run_does_not_import_sglang(self):
         output = io.StringIO()

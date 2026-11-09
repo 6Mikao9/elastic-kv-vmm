@@ -7,6 +7,7 @@ import json
 import os
 import sys
 from collections.abc import Sequence
+from pathlib import Path
 
 from .config import (
     ACTIVATION_POLICIES,
@@ -22,14 +23,15 @@ from .config import (
 
 SPAWN_INSTALL_ENV = "_ELASTIC_KV_INSTALL_ON_IMPORT"
 RUNTIME_PROFILE_ENV = "EKV_RUNTIME_PROFILE"
-RUNTIME_PROFILES = ("dense", "minimax-hisparse")
+REQUESTED_RUNTIME_PROFILES = ("auto", "dense", "minimax-hisparse")
+RESOLVED_RUNTIME_PROFILES = ("dense", "minimax-hisparse")
 
 
 def _install_adapter() -> None:
     runtime_profile = os.environ.get(RUNTIME_PROFILE_ENV, "dense").strip().lower()
-    if runtime_profile not in RUNTIME_PROFILES:
+    if runtime_profile not in RESOLVED_RUNTIME_PROFILES:
         raise ValueError(
-            f"{RUNTIME_PROFILE_ENV} must be one of {RUNTIME_PROFILES}"
+            f"{RUNTIME_PROFILE_ENV} must be one of {RESOLVED_RUNTIME_PROFILES}"
         )
     if runtime_profile == "minimax-hisparse":
         from adaptive_sparse.minimax_runtime import install_minimax_runtime
@@ -73,9 +75,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--elastic-mode", choices=MODES)
     parser.add_argument(
         "--elastic-runtime-profile",
-        choices=RUNTIME_PROFILES,
+        choices=REQUESTED_RUNTIME_PROFILES,
         help=(
-            "install the dense VMM adapter or the audited MiniMax HiSparse runtime"
+            "install the dense VMM adapter, the audited MiniMax HiSparse "
+            "runtime, or infer the profile from a local model config"
         ),
     )
     parser.add_argument("--elastic-chunk-mib", type=int)
@@ -144,7 +147,13 @@ def resolve_launch_config(
     """Resolve backend settings and the selected runtime-install profile."""
     parser = _parser()
     args, sglang_argv = parser.parse_known_args(list(argv))
-    runtime_profile = args.elastic_runtime_profile or "dense"
+    requested_runtime_profile = args.elastic_runtime_profile or "dense"
+    try:
+        runtime_profile = resolve_runtime_profile(
+            requested_runtime_profile, sglang_argv
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        parser.error(str(exc))
     if runtime_profile == "minimax-hisparse" and args.elastic_mode not in (
         None,
         "baseline",
@@ -196,6 +205,69 @@ def resolve_launch_config(
         # A stale dense experiment shell must not activate V5 through EKV_MODE.
         config = config.with_overrides(mode="baseline")
     return config, sglang_argv, args.elastic_dry_run, runtime_profile
+
+
+def _upstream_model_path(argv: Sequence[str]) -> Path:
+    """Read one local ``--model-path`` without normalizing upstream args."""
+
+    value: str | None = None
+    for index, item in enumerate(argv):
+        if item == "--model-path":
+            if index + 1 >= len(argv):
+                raise ValueError(
+                    "--model-path requires a value for auto profile detection"
+                )
+            value = argv[index + 1]
+            break
+        if item.startswith("--model-path="):
+            value = item.split("=", 1)[1]
+            break
+    if not value:
+        raise ValueError(
+            "--elastic-runtime-profile auto requires upstream --model-path"
+        )
+    path = Path(value).expanduser()
+    if not path.is_dir():
+        raise ValueError(
+            "--elastic-runtime-profile auto requires a local model directory: "
+            f"{path}"
+        )
+    return path
+
+
+def resolve_runtime_profile(
+    requested: str, sglang_argv: Sequence[str]
+) -> str:
+    """Resolve ``auto`` from a local Hugging Face ``config.json``.
+
+    Explicit profiles remain authoritative and do not inspect model files.
+    Auto mode is deliberately limited to local snapshots so launch never adds
+    an implicit network or cache-resolution dependency.
+    """
+
+    if requested not in REQUESTED_RUNTIME_PROFILES:
+        raise ValueError(
+            f"runtime profile must be one of {REQUESTED_RUNTIME_PROFILES}"
+        )
+    if requested != "auto":
+        return requested
+    config_path = _upstream_model_path(sglang_argv) / "config.json"
+    with config_path.open("r", encoding="utf-8") as handle:
+        config = json.load(handle)
+    if not isinstance(config, dict):
+        raise ValueError(f"model config must be an object: {config_path}")
+    model_type = str(config.get("model_type", "")).lower()
+    architectures = config.get("architectures", ())
+    if isinstance(architectures, str):
+        architectures = (architectures,)
+    if not isinstance(architectures, (tuple, list)):
+        raise ValueError(
+            f"model architectures must be a list in {config_path}"
+        )
+    identity = " ".join(
+        [model_type, *(str(value).lower() for value in architectures)]
+    )
+    return "minimax-hisparse" if "minimax" in identity else "dense"
 
 
 def resolve_config(argv: Sequence[str]) -> tuple[ElasticConfig, list[str], bool]:
