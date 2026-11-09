@@ -68,6 +68,45 @@ CUDA_VISIBLE_DEVICES= PYTHONPATH=. python -B tests/smoke_profile_ranges_pinned.p
   --output-dir /reports/scope-pinned-bound
 ```
 
+## Offline timeline analysis
+
+The [timeline reader](../scripts/analyze_hisparse_timeline.py) can inspect the
+existing compressed traces without changing the capture or its frozen source:
+
+```bash
+python -m scripts.analyze_hisparse_timeline \
+  /path/to/completed-run/profile_traces --expected-tp-size 4
+```
+
+It writes JSON to stdout. Save that output in a new analysis artifact rather
+than overwriting the original capture. A single trace or partial directory can
+also be inspected by omitting the expected TP size; that does not establish
+that the full capture completed.
+
+For each rank, the reader merges positive-duration GPU intervals and reports
+the first-to-last GPU envelope, activity coverage and interior gaps, plus
+separate category and stream unions. Zero-duration events cannot extend the
+envelope. A gap means no activity was recorded in this trace: it does not prove
+that the entire device was idle or that those cycles can be eliminated.
+Category and stream totals may overlap. Recorded CPU-op overlap is a union of
+wall-time scopes, which can include sleeping or waiting; it is not CPU usage.
+
+Host synchronization calls and stream-wait enqueue calls are reported
+separately. Direct kernel launches are linked only through unique explicit
+correlation IDs, with unmatched and ambiguous events counted. The signed
+kernel-start minus launch-end interval can be negative because execution can
+begin before the launch call returns. It is not a measurement of GPU stall or
+critical-path cost. The reader does not infer dependencies from nearby events.
+
+The current r8 profiles use the same `mixed` workload for native and static
+arms, but `mixed12k_unequal` for the adaptive group-2 arm. The latter supports
+diagnosis within that run, not a matched speed comparison against those two
+profiles. The default 16-token output cap also truncates both long requests to
+16 tokens, removing the original 128-versus-64 output-length asymmetry. Use
+the recorded request shapes, not the workload name, when interpreting results.
+These captures run with CUDA Graph, scheduler overlap and radix caching
+disabled. They cannot establish the benefit of enabling those features.
+
 ## Nsight Systems installation, 2026-11-09
 
 Nsight Systems CLI **2026.5.1.161** is now extracted into the persistent container
