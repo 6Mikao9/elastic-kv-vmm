@@ -94,6 +94,13 @@ runner 现在会落盘逐请求 TTFT、TPOT、总延迟、输出 token/s、整�
 真实 batch size 上的驻留时长和时间加权 exact fraction；最后一个未闭合事件明确
 不计入时长。
 
+`adaptive_sparse/profile_calibration.py` 进一步把同一 `results.json` 中的逐请求
+TTFT/TPOT 和 `future_stats` 转成规划器可直接读取的 `decode_batch_profiles` 与
+`prefill_batch_profiles`。它只采用宽度唯一的 decode 观测和完整原生 prefill cohort，
+排除 mixed-width/incomplete-cohort 样本；样本数不足的组合只保留为证据。推荐用
+`scripts/calibrate_future_profiles.py --min-samples 3 --require-available` 生成下一轮
+workload 的 profile，避免把一次偶然命中写成稳定吞吐。
+
 ## 本次修复
 
 第一次 V5 smoke 没有进入 `ElasticPool`：服务日志仍显示原生固定 pool。原因是新启动器

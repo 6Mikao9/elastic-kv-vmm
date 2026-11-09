@@ -405,6 +405,24 @@ request/cohort ID 和 mixed prefill/decode 标记，用于恢复 occupancy 变�
 batch size 上驻留的时长，并输出时间加权的 exact fraction；最后一个事件没有下一次
 观察，因而不被虚构时长补全。
 
+`adaptive_sparse/profile_calibration.py` 可以把一次真实 smoke 的 `results.json`
+转换为规划器可直接使用的 `decode_batch_profiles` 和 `prefill_batch_profiles`：
+
+```bash
+python scripts/calibrate_future_profiles.py \
+  --result results/future-smoke/<run>/results.json \
+  --min-samples 3 \
+  --require-available \
+  --output results/future-smoke/<run>/planner-profiles.json
+```
+
+标定器只接受测量含义明确的样本。decode 请求必须在服务端只出现于一个真实 batch
+宽度；跨多个宽度共享同一个 TPOT 的请求会被排除。prefill cohort 必须出现在
+`complete_cohort_ids` 中、成员数与 batch size 一致、所有成员宽度一致，并使用 cohort
+成员 TTFT 的中位数计算 aggregate tokens/ms。低于 `--min-samples` 的组合只保留在
+`evidence` 中，不会进入 profile，也不会对 batch size 做插值。生成的 JSON 可直接作为
+`PlannerConfig` 的两个 profile 参数；没有真实测量时继续使用逐请求线性回退。
+
 ### 4.1.3 已实现：已知未来 cohort 的保守等待策略
 
 `prefill_batch_profiles` 按精确 cohort size 记录 aggregate prefill tokens/ms。
