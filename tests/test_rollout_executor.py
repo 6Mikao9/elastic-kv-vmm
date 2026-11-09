@@ -5,7 +5,10 @@ import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
+from adaptive_sparse import rollout_executor as rollout_module
 from adaptive_sparse.elastic_admission import ElasticKVConfig
 from adaptive_sparse.future_plan import (
     PlannerConfig,
@@ -1041,6 +1044,226 @@ class RolloutExecutorTest(unittest.TestCase):
         self.assertTrue(cohort_started.is_set())
         self.assertEqual(
             outcome["result"]["summary"]["batched_request_count"], 2
+        )
+
+    def test_managed_executor_runs_singleton_past_capacity_blocked_cohort(self):
+        base = without_deadline(submission())
+        blocker = replace(
+            base,
+            request_id="a-blocker",
+            planned_arrival_ms=0,
+            submit_at_ms=0,
+            estimated_finish_ms=500,
+        )
+        cohort = [
+            replace(
+                base,
+                request_id=f"b-cohort-{index}",
+                planned_arrival_ms=20,
+                submit_at_ms=20,
+                estimated_finish_ms=60,
+                prefill_batch_size=2,
+                cohort_id="batch-0",
+            )
+            for index in range(2)
+        ]
+        singleton = replace(
+            base,
+            request_id="c-ready",
+            planned_arrival_ms=20,
+            submit_at_ms=20,
+            estimated_finish_ms=60,
+        )
+        blocker_started = threading.Event()
+        release_blocker = threading.Event()
+        singleton_started = threading.Event()
+        cohort_started = threading.Event()
+        starts = []
+        lock = threading.Lock()
+
+        def generate(url, spec, timeout, stream):
+            started = time.perf_counter()
+            with lock:
+                starts.append(spec["request_id"])
+            if spec["request_id"] == "a-blocker":
+                blocker_started.set()
+                release_blocker.wait(timeout=2.0)
+            elif spec["request_id"] == "c-ready":
+                singleton_started.set()
+            else:
+                cohort_started.set()
+            return {
+                "_started_perf_s": started,
+                "end_to_end_s": 0.001,
+                "output_tokens": 8,
+                "ttft_s": 0.0005,
+                "tpot_s": 0.0001,
+            }
+
+        outcome = {}
+
+        def run():
+            try:
+                outcome["result"] = execute_rollout(
+                    "http://server/generate",
+                    [blocker, *cohort, singleton],
+                    max_inflight=2,
+                    max_parallel=4,
+                    generator=generate,
+                    poll_interval_ms=1,
+                    cohort_barrier_timeout_s=1.0,
+                )
+            except Exception as exc:  # noqa: BLE001 - re-raised below
+                outcome["error"] = exc
+
+        worker = threading.Thread(target=run)
+        worker.start()
+        self.assertTrue(blocker_started.wait(timeout=1.0))
+        singleton_ran = singleton_started.wait(timeout=0.5)
+        cohort_wait_while_full = not cohort_started.wait(timeout=0.05)
+        release_blocker.set()
+        worker.join(timeout=3.0)
+
+        self.assertFalse(worker.is_alive())
+        if "error" in outcome:
+            raise outcome["error"]
+        self.assertTrue(singleton_ran)
+        self.assertTrue(cohort_wait_while_full)
+        self.assertLess(
+            starts.index("c-ready"),
+            min(
+                index
+                for index, request_id in enumerate(starts)
+                if request_id.startswith("b-cohort-")
+            ),
+        )
+        scheduler = outcome["result"]["summary"]["managed_scheduler"]
+        self.assertGreaterEqual(
+            scheduler["head_of_line_capacity_bypasses"], 1
+        )
+
+    def test_managed_executor_runs_singleton_past_budget_blocked_group(self):
+        base = without_deadline(submission())
+        blocker = replace(
+            base,
+            request_id="a-blocker",
+            planned_arrival_ms=0,
+            submit_at_ms=0,
+            estimated_finish_ms=500,
+        )
+        blocked = replace(
+            base,
+            request_id="b-blocked",
+            planned_arrival_ms=20,
+            submit_at_ms=20,
+            estimated_finish_ms=60,
+        )
+        singleton = replace(
+            base,
+            request_id="c-ready",
+            planned_arrival_ms=20,
+            submit_at_ms=20,
+            estimated_finish_ms=60,
+        )
+        blocker_started = threading.Event()
+        release_blocker = threading.Event()
+        blocked_started = threading.Event()
+        singleton_started = threading.Event()
+        starts = []
+        lock = threading.Lock()
+
+        def admit(member, *, active_bytes, **kwargs):
+            hold = 10
+            return SimpleNamespace(
+                request_id=member.request_id,
+                planned_residence="resident",
+                chosen_residence="resident",
+                reason="test-admission",
+                active_before_bytes=active_bytes,
+                active_after_bytes=active_bytes + hold,
+                resident_bytes=hold,
+                sparse_bytes=4,
+                defer_for_budget=(
+                    member.request_id == "b-blocked" and active_bytes > 0
+                ),
+                over_budget=False,
+                future_reserved_bytes=0,
+                future_prefill_bytes=0,
+                future_reserved_requests=0,
+                future_effective_after_bytes=active_bytes + hold,
+                future_over_budget=False,
+                prefill_workspace_bytes=0,
+                prefill_peak_bytes=active_bytes + hold,
+                future_effective_peak_bytes=active_bytes + hold,
+                prefill_over_budget=False,
+                future_peak_over_budget=False,
+                service_time_feedback_applied=False,
+                service_time_current_duration_ms=None,
+                service_time_calibrated_future_requests=0,
+            )
+
+        def generate(url, spec, timeout, stream):
+            started = time.perf_counter()
+            with lock:
+                starts.append(spec["request_id"])
+            if spec["request_id"] == "a-blocker":
+                blocker_started.set()
+                release_blocker.wait(timeout=2.0)
+            elif spec["request_id"] == "b-blocked":
+                blocked_started.set()
+            else:
+                singleton_started.set()
+            return {
+                "_started_perf_s": started,
+                "end_to_end_s": 0.001,
+                "output_tokens": 8,
+                "ttft_s": 0.0005,
+                "tpot_s": 0.0001,
+            }
+
+        outcome = {}
+
+        def run():
+            try:
+                with patch.object(
+                    rollout_module,
+                    "decide_elastic_admission",
+                    side_effect=admit,
+                ):
+                    outcome["result"] = execute_rollout(
+                        "http://server/generate",
+                        [blocker, blocked, singleton],
+                        max_inflight=2,
+                        max_parallel=3,
+                        elastic_kv_config=ElasticKVConfig(
+                            memory_budget_bytes=1024,
+                            kv_bytes_per_token=1,
+                            sparse_hot_tokens=16,
+                            lookahead_ms=200,
+                        ),
+                        generator=generate,
+                        poll_interval_ms=1,
+                    )
+            except Exception as exc:  # noqa: BLE001 - re-raised below
+                outcome["error"] = exc
+
+        worker = threading.Thread(target=run)
+        worker.start()
+        self.assertTrue(blocker_started.wait(timeout=1.0))
+        singleton_ran = singleton_started.wait(timeout=0.5)
+        blocked_waited = not blocked_started.wait(timeout=0.05)
+        release_blocker.set()
+        worker.join(timeout=3.0)
+
+        self.assertFalse(worker.is_alive())
+        if "error" in outcome:
+            raise outcome["error"]
+        self.assertTrue(singleton_ran)
+        self.assertTrue(blocked_waited)
+        self.assertLess(starts.index("c-ready"), starts.index("b-blocked"))
+        scheduler = outcome["result"]["summary"]["managed_scheduler"]
+        self.assertGreaterEqual(
+            scheduler["head_of_line_budget_bypasses"], 1
         )
 
     def test_rejects_parallelism_smaller_than_cohort(self):

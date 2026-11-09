@@ -492,6 +492,11 @@ python3 scripts/future_plan_compare.py \
 限制进入服务的请求；`--queue-policy deadline` 会在同一时刻已到达的竞争者中先
 选择绝对 deadline 最紧且剩余 slack 最小的请求。计划时间在这种模式下是“最早
 可提交时间”，实际容量等待会写入 `capacity_delay_ms`，不会伪装成网络提交抖动。
+调度器以完整 cohort 为原子候选组：最高优先级组暂时无法满足 in-flight 数量或
+KV/workspace 字节预算时，会继续尝试同一 pass 中仍可安全准入的下一组，不能拆分
+cohort。这样可避免一个尚不可运行的 request 或 batch 阻塞其他 deadline 请求。
+`summary.managed_scheduler` 分别记录 capacity/budget 阻塞、队头绕过、deadline
+强制准入和实际派发组数，便于比较不同已知未来 workload 上的利用率。
 
 `--elastic-residency-budget` 从计划中的 `planner_config` 恢复每 token KV 字节数、
 热 token 数和总预算。执行器维护当前在飞请求的预测字节账本：低负载且完整 KV

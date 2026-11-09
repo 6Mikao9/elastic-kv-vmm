@@ -633,6 +633,106 @@ def _select_due(
     return min(due, key=key)
 
 
+def _ordered_due_cohorts(
+    due: Sequence[RolloutSubmission],
+    queue: Sequence[RolloutSubmission],
+    policy: str,
+    *,
+    prefill_tokens_per_s: float | None = None,
+    decode_tokens_per_s: float | None = None,
+    decode_tokens_per_s_by_residence: Mapping[str, float | None] | None = None,
+) -> tuple[tuple[RolloutSubmission, ...], ...]:
+    """Return atomic cohorts in policy order for this scheduling pass."""
+
+    remaining = list(due)
+    ordered: list[tuple[RolloutSubmission, ...]] = []
+    while remaining:
+        head = _select_due(
+            remaining,
+            policy,
+            prefill_tokens_per_s=prefill_tokens_per_s,
+            decode_tokens_per_s=decode_tokens_per_s,
+            decode_tokens_per_s_by_residence=(
+                decode_tokens_per_s_by_residence
+            ),
+        )
+        cohort = _cohort_from_queue(head, queue)
+        cohort_ids = {item.request_id for item in cohort}
+        ordered.append(cohort)
+        remaining = [
+            item for item in remaining if item.request_id not in cohort_ids
+        ]
+    return tuple(ordered)
+
+
+def _admit_managed_cohort(
+    cohort: Sequence[RolloutSubmission],
+    *,
+    queue: Sequence[RolloutSubmission],
+    active_bytes: int,
+    now_ms: float,
+    config: ElasticKVConfig | None,
+    allow_deadline_overcommit: bool,
+    prefill_tokens_per_s: float | None,
+    decode_tokens_per_s: float | None,
+    decode_tokens_per_s_by_residence: Mapping[str, float | None],
+) -> tuple[
+    dict[str, ElasticAdmissionDecision | None],
+    list[RolloutSubmission],
+    bool,
+]:
+    """Simulate all-or-nothing admission for one atomic scheduling cohort."""
+
+    cohort_ids = {item.request_id for item in cohort}
+    other_queue = tuple(
+        item for item in queue if item.request_id not in cohort_ids
+    )
+    provisional_bytes = active_bytes
+    admissions: dict[str, ElasticAdmissionDecision | None] = {}
+    deferred: list[RolloutSubmission] = []
+    deadline_forced = False
+    for member in cohort:
+        admission = None
+        if config is not None:
+            planned_residence = FutureHint.from_payload(
+                dict(member.hint)
+            ).residence
+            admission = decide_elastic_admission(
+                member,
+                active_bytes=provisional_bytes,
+                config=config,
+                future_submissions=other_queue,
+                now_ms=now_ms,
+                prefill_tokens_per_s=prefill_tokens_per_s,
+                decode_tokens_per_s=decode_tokens_per_s_by_residence.get(
+                    planned_residence
+                ),
+            )
+            if admission.defer_for_budget:
+                hint = FutureHint.from_payload(dict(member.hint))
+                predicted_duration = _duration_ms(
+                    member,
+                    hint,
+                    fallback_ms=max(
+                        1,
+                        member.estimated_finish_ms - member.submit_at_ms,
+                    ),
+                    prefill_tokens_per_s=prefill_tokens_per_s,
+                    decode_tokens_per_s=decode_tokens_per_s,
+                )
+                forced = bool(
+                    allow_deadline_overcommit
+                    and member.deadline_ms is not None
+                    and now_ms + predicted_duration > member.deadline_ms
+                )
+                deadline_forced = deadline_forced or forced
+                if not forced:
+                    deferred.append(member)
+            provisional_bytes += _admission_hold_bytes(admission)
+        admissions[member.request_id] = admission
+    return admissions, deferred, deadline_forced
+
+
 def _measure_result(
     submission: RolloutSubmission,
     record: object,
@@ -756,7 +856,11 @@ def _execute_managed_rollout(
     poll_interval_s: float,
     service_time_estimator: ServiceTimeEstimator | None = None,
     cohort_barrier_timeout_s: float = 5.0,
-) -> tuple[list[dict[str, object]], list[str]]:
+) -> tuple[
+    list[dict[str, object]],
+    list[str],
+    dict[str, int],
+]:
     """Dispatch through an observed in-flight set and aggregate byte budget."""
 
     if queue_policy not in ("timeline", "deadline"):
@@ -776,6 +880,15 @@ def _execute_managed_rollout(
     pending: list[_PendingRequest] = []
     rows: list[dict[str, object]] = []
     failures: list[str] = []
+    scheduler_stats = {
+        "selection_passes": 0,
+        "capacity_blocked_groups": 0,
+        "budget_blocked_groups": 0,
+        "head_of_line_capacity_bypasses": 0,
+        "head_of_line_budget_bypasses": 0,
+        "deadline_forced_groups": 0,
+        "dispatched_groups": 0,
+    }
 
     def harvest() -> None:
         for item in tuple(pending):
@@ -859,8 +972,9 @@ def _execute_managed_rollout(
                     for residence in ("resident", "host_backed")
                 }
             )
-            submission = _select_due(
+            cohorts = _ordered_due_cohorts(
                 due,
+                queue,
                 queue_policy,
                 prefill_tokens_per_s=feedback_rates.get(
                     "prefill_tokens_per_s"
@@ -872,73 +986,73 @@ def _execute_managed_rollout(
                 ),
                 decode_tokens_per_s_by_residence=decode_by_residence,
             )
-            cohort = _cohort_from_queue(submission, queue)
             capacity = worker_count if max_inflight is None else max_inflight
-            if len(pending) + len(cohort) > capacity:
-                clock.sleep(poll_interval_s)
-                continue
-            cohort_ids = {item.request_id for item in cohort}
-            other_queue = tuple(
-                item for item in queue if item.request_id not in cohort_ids
-            )
             active_bytes = sum(item.hold_bytes for item in pending)
-            provisional_bytes = active_bytes
-            admissions: dict[str, ElasticAdmissionDecision | None] = {}
-            deferred: list[RolloutSubmission] = []
-            cohort_deadline_forced = False
-            for member in cohort:
-                admission = None
-                if elastic_kv_config is not None:
-                    planned_residence = FutureHint.from_payload(
-                        dict(member.hint)
-                    ).residence
-                    admission = decide_elastic_admission(
-                        member,
-                        active_bytes=provisional_bytes,
-                        config=elastic_kv_config,
-                        future_submissions=other_queue,
-                        now_ms=now_ms,
-                        prefill_tokens_per_s=feedback_rates.get(
-                            "prefill_tokens_per_s"
-                        ),
-                        decode_tokens_per_s=decode_by_residence.get(
-                            planned_residence
-                        ),
-                    )
-                    if admission.defer_for_budget:
-                        member_hint = FutureHint.from_payload(dict(member.hint))
-                        predicted_duration = _duration_ms(
-                            member,
-                            member_hint,
-                            fallback_ms=max(
-                                1,
-                                member.estimated_finish_ms - member.submit_at_ms,
-                            ),
-                            prefill_tokens_per_s=feedback_rates.get(
-                                "prefill_tokens_per_s"
-                            ),
-                            decode_tokens_per_s=feedback_rates.get(
-                                "decode_tokens_per_s"
-                            ),
-                        )
-                        forced = bool(
-                            allow_deadline_overcommit
-                            and member.deadline_ms is not None
-                            and now_ms + predicted_duration > member.deadline_ms
-                        )
-                        cohort_deadline_forced = cohort_deadline_forced or forced
-                        if not forced:
-                            deferred.append(member)
-                    provisional_bytes += _admission_hold_bytes(admission)
-                admissions[member.request_id] = admission
-            if deferred and not cohort_deadline_forced:
+            scheduler_stats["selection_passes"] += 1
+            selected: tuple[
+                tuple[RolloutSubmission, ...],
+                dict[str, ElasticAdmissionDecision | None],
+                bool,
+            ] | None = None
+            first_block: tuple[str, list[RolloutSubmission]] | None = None
+            for candidate_index, cohort in enumerate(cohorts):
+                if len(pending) + len(cohort) > capacity:
+                    scheduler_stats["capacity_blocked_groups"] += 1
+                    if first_block is None:
+                        first_block = ("capacity", list(cohort))
+                    continue
+                (
+                    admissions,
+                    deferred,
+                    cohort_deadline_forced,
+                ) = _admit_managed_cohort(
+                    cohort,
+                    queue=queue,
+                    active_bytes=active_bytes,
+                    now_ms=now_ms,
+                    config=elastic_kv_config,
+                    allow_deadline_overcommit=allow_deadline_overcommit,
+                    prefill_tokens_per_s=feedback_rates.get(
+                        "prefill_tokens_per_s"
+                    ),
+                    decode_tokens_per_s=feedback_rates.get(
+                        "decode_tokens_per_s"
+                    ),
+                    decode_tokens_per_s_by_residence=decode_by_residence,
+                )
+                if deferred and not cohort_deadline_forced:
+                    scheduler_stats["budget_blocked_groups"] += 1
+                    if first_block is None:
+                        first_block = ("budget", deferred)
+                    continue
+                if candidate_index > 0 and first_block is not None:
+                    blocked_reason, _ = first_block
+                    if blocked_reason == "capacity":
+                        scheduler_stats[
+                            "head_of_line_capacity_bypasses"
+                        ] += 1
+                    else:
+                        scheduler_stats[
+                            "head_of_line_budget_bypasses"
+                        ] += 1
+                if cohort_deadline_forced:
+                    scheduler_stats["deadline_forced_groups"] += 1
+                selected = (cohort, admissions, cohort_deadline_forced)
+                break
+            if selected is None:
                 if pending:
                     clock.sleep(poll_interval_s)
                     continue
+                if first_block is not None and first_block[0] == "budget":
+                    raise RolloutExecutionError(
+                        f"{first_block[1][0].request_id}: bounded KV hot set plus "
+                        "prefill workspace exceeds the total elastic budget"
+                    )
                 raise RolloutExecutionError(
-                    f"{deferred[0].request_id}: bounded KV hot set plus "
-                    "prefill workspace exceeds the total elastic budget"
+                    "managed scheduler made no progress with an empty in-flight set"
                 )
+            cohort, admissions, _ = selected
+            scheduler_stats["dispatched_groups"] += 1
 
             dispatch_ms = (clock.now() - origin) * 1000.0
             dispatch_lateness_ms = dispatch_ms - cohort[0].submit_at_ms
@@ -1030,7 +1144,7 @@ def _execute_managed_rollout(
                     )
                 )
         harvest()
-    return rows, failures
+    return rows, failures, scheduler_stats
 
 
 def _finalize_rollout(
@@ -1252,7 +1366,7 @@ def execute_rollout(
         or elastic_kv_config is not None
     )
     if managed:
-        rows, failures = _execute_managed_rollout(
+        rows, failures, scheduler_stats = _execute_managed_rollout(
             url,
             submissions,
             timeout_s=timeout_s,
@@ -1281,6 +1395,7 @@ def execute_rollout(
             residency_evidence_timeout_s=residency_evidence_timeout_s,
             max_cohort_start_skew_ms=max_cohort_start_skew_ms,
         )
+        result["summary"]["managed_scheduler"] = scheduler_stats
         if service_time_estimator is not None:
             result["summary"]["service_time_estimator"] = (
                 service_time_estimator.snapshot().as_dict()
