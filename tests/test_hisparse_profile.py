@@ -21,6 +21,10 @@ def write_trace(directory, rank, *, include_gpu=True, multiple_devices=False):
 
     events = [
         event("cpu_op", 0, 20),
+        event("cuda_driver", 0, 1000, "cuMemCreate"),
+        event("cuda_driver", 1000, 250, "cuMemCreate"),
+        event("cuda_driver", 1250, 100, "cuMemMap"),
+        event("cuda_runtime", 1, 1, "cudaLaunchKernel"),
         event("cuda_runtime", 9, 2, "cudaStreamSynchronize"),
         event("cuda_runtime", 12, 1, "cudaStreamWaitEvent"),
     ]
@@ -57,6 +61,17 @@ class HiSparseProfileTest(unittest.TestCase):
         self.assertEqual(ranks["0"]["cuda_device_from_trace"], 0)
         self.assertEqual(ranks["0"]["cuda_kernels_by_name"], {
             "kernel": {"count": 2, "sum_us": 18, "max_us": 10},
+        })
+        self.assertEqual(ranks["0"]["cuda_api_cpu_durations_by_category_and_name"], {
+            "cuda_driver": {
+                "cuMemCreate": {"count": 2, "sum_us": 1250, "max_us": 1000},
+                "cuMemMap": {"count": 1, "sum_us": 100, "max_us": 100},
+            },
+            "cuda_runtime": {
+                "cudaLaunchKernel": {"count": 1, "sum_us": 1, "max_us": 1},
+                "cudaStreamSynchronize": {"count": 1, "sum_us": 2, "max_us": 2},
+                "cudaStreamWaitEvent": {"count": 1, "sum_us": 1, "max_us": 1},
+            },
         })
         self.assertEqual(ranks["0"]["cuda_wait_api_cpu_durations_by_name"], {
             "cudaStreamSynchronize": {"count": 1, "sum_us": 2, "max_us": 2},

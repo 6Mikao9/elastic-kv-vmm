@@ -12,6 +12,7 @@ from pathlib import Path
 
 TRACE_NAME = re.compile(r".+-TP-(\d+)(?:-(?:DP|PP|EP)-\d+)*\.trace\.json\.gz")
 GPU_CATEGORIES = {"kernel", "gpu_memcpy", "gpu_memset"}
+CUDA_API_CATEGORIES = ("cuda_driver", "cuda_runtime")
 WAIT_CALLS = re.compile(r"Synchronize|StreamWaitEvent")
 DEFAULT_OUTPUT_TOKEN_CAP = 16
 MAX_OUTPUT_TOKEN_CAP = 32
@@ -34,6 +35,7 @@ def inspect_trace(path):
     counts = Counter()
     kernels = {}
     waits = {}
+    cuda_apis = {category: {} for category in CUDA_API_CATEGORIES}
     devices = set()
     intervals = []
     memcpy = {}
@@ -41,7 +43,7 @@ def inspect_trace(path):
         if event.get("ph") != "X":
             continue
         category = event.get("cat")
-        if category not in GPU_CATEGORIES | {"cpu_op", "cuda_runtime", "cuda_driver"}:
+        if category not in GPU_CATEGORIES and category != "cpu_op" and category not in cuda_apis:
             continue
         name = event["name"]
         start, duration = event["ts"], event["dur"]
@@ -57,8 +59,10 @@ def inspect_trace(path):
                 devices.add(device)
         if category == "kernel":
             accumulate_duration(kernels, name, duration)
-        if category in {"cuda_runtime", "cuda_driver"} and WAIT_CALLS.search(name):
-            accumulate_duration(waits, name, duration)
+        if category in cuda_apis:
+            accumulate_duration(cuda_apis[category], name, duration)
+            if WAIT_CALLS.search(name):
+                accumulate_duration(waits, name, duration)
         if category == "gpu_memcpy":
             entry = memcpy.setdefault(name, {"events": 0, "events_with_bytes": 0,
                                              "reported_bytes": 0})
@@ -80,6 +84,7 @@ def inspect_trace(path):
         "gpu_activity_sum_us": sum(stop - start for start, stop in intervals),
         "cuda_device_from_trace": next(iter(devices), None),
         "cuda_kernels_by_name": kernels,
+        "cuda_api_cpu_durations_by_category_and_name": cuda_apis,
         "cuda_wait_api_cpu_durations_by_name": waits,
         "explicit_gpu_memcpy": memcpy,
     }
@@ -172,6 +177,8 @@ def capture(base_url, output, workload, opener, output_token_cap=DEFAULT_OUTPUT_
         "ranks": inspect_traces(trace_dir),
         "limitations": (
             "GPU union assumes one CUDA device per rank, checked when device metadata is present. "
+            "CUDA API durations describe observed CPU calls only. An empty API category "
+            "does not establish that VMM operations were absent. "
             "Wait API durations measure CPU calls, including stream-wait enqueues, and cannot "
             "measure GPU stall time. Explicit CUDA memcpy events "
             "report bytes only when provided by the trace. HiSparse kernels can read "

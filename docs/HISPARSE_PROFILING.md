@@ -15,6 +15,18 @@ Use the static or pressure treatment flags from the reproduction guide when capt
 
 Each rank reports both the union of GPU intervals and the sum of their durations. The union assumes one CUDA device per rank and checks that assumption when events identify the device. The sum counts concurrent work more than once. GPU intervals include kernels and explicit CUDA copy and memset activity. Each kernel and runtime or driver wait API name has a count, sum and maximum duration. Wait API timings measure the CPU calls. A stream wait call can enqueue a dependency and its CPU duration does not measure GPU stall time. Copy bytes are taken from explicit GPU memcpy events when present. HiSparse kernels can read mapped host memory without issuing a CUDA memcpy, so the reported bytes cover the observed copy events only. Traces can include idle time and profiler overhead around the request batch. Use the separate, unprofiled measurements for throughput and latency comparisons.
 
+The offline reader also retains every observed CUDA Driver and Runtime API in
+`cuda_api_cpu_durations_by_category_and_name`, grouped by category and API name.
+This makes VMM calls such as `cuMemCreate`, `cuMemMap` and `cuMemUnmap` visible
+when the raw trace contains them. These are CPU call durations and do not enter
+the GPU activity union. An empty category does not establish that no VMM work
+occurred. Native swap kernels also serve zero-length resident rows, while
+promotion and demotion share generic copy kernels with ordinary serving;
+kernel counts alone cannot establish migration counts or host traffic.
+Per-action attribution still needs explicit ranges and launch correlations.
+An existing frozen run can be re-read offline into a new analysis artifact;
+do not overwrite its original trace or equate re-analysis with a new capture.
+
 ## Nsight Systems installation, 2026-11-09
 
 Nsight Systems CLI **2026.5.1.161** is now extracted into the persistent container
@@ -22,6 +34,11 @@ workspace. The archive passed its official repository SHA-256 and size checks;
 the executable returned its expected version under the unprivileged project UID.
 This establishes installation, **not successful GPU tracing**. A CUDA/NVTX smoke
 in the pinned MiniMax image is still required when a GPU is available.
+CPU-only NVTX collection and SQLite export subsequently passed in both the
+development container and the pinned MiniMax image with GPU visibility disabled.
+The exported database contains the intended positive-duration NVTX range in
+each case. This validates the collection/export setup only, not CUDA tracing
+or model performance. [Recorded evidence](../results/profiling/nsys-cpu-nvtx-20261109.json)
 
 The development environment is Torch 2.8.0+cu128, but the pinned MiniMax image
 contains Torch 2.15.0.dev20261005+cu134. The profiler version was selected for the
@@ -39,9 +56,35 @@ Sourcing `scripts/container_session.sh` exposes this installed CLI as `nsys` and
 NSYS=/workspace/elastic-kv-vmm/tools/nsys-2026.5.1.161/root/opt/nvidia/nsight-systems-cli/2026.5.1/target-linux-x64/nsys
 "$NSYS" --version
 "$NSYS" status --environment
-# Run only in a separately admitted diagnostic, with a fresh report destination:
-"$NSYS" profile --trace=cuda,nvtx --sample=none --cpuctxsw=none \
-  -o /reports/smoke python cuda_nvtx_smoke.py
+```
+
+For a separate model-free diagnostic, run from the project root inside the
+pinned MiniMax image. Set `GPU_UUID` to one explicitly admitted idle A100 and
+use fresh report destinations. The default Torch backend exports
+`trace.json` alongside the handoff correctness result.
+Bind the project and a writable `/reports` directory into that container.
+For Nsight, bind the entire extracted `target-linux-x64` directory read-only
+at `/nsys/target-linux-x64`, then set `NSYS=/nsys/target-linux-x64/nsys`.
+Preserve that directory name: mounting its contents directly at `/nsys`
+was rejected by the CLI in the pinned-image CPU smoke. Neither tool mounting
+nor the `--ack-idle-gpu` flag establishes GPU exclusivity.
+
+```bash
+CUDA_VISIBLE_DEVICES="$GPU_UUID" python -m scripts.profile_vmm_handoff \
+  --ack-idle-gpu --output-dir /reports/vmm-handoff-torch
+```
+
+For external CUDA and NVTX tracing, select the NVTX backend so Torch does
+not start its own profiler session. The script runs the same VMM and CUDA Graph
+checks and emits `vmm_handoff/` ranges. The Nsight report is written separately
+by `nsys` and must be checked there. `result.json` records the backend and
+`external_trace_verified: false` in this mode.
+
+```bash
+CUDA_VISIBLE_DEVICES="$GPU_UUID" \
+  "$NSYS" profile --trace=cuda,nvtx --sample=none --cpuctxsw=none \
+  -o /reports/vmm-handoff-nsys python -m scripts.profile_vmm_handoff \
+  --ack-idle-gpu --profiler-backend nvtx --output-dir /reports/vmm-handoff-nvtx
 ```
 
 The observed host has `perf_event_paranoid=4`, and the unprivileged container's

@@ -1,0 +1,40 @@
+{
+  "scope": "Nsight Systems CPU-only NVTX collection and export; no CUDA validation or serving performance",
+  "nsys_version": "2026.5.1.161",
+  "gpu_trace_validated": false,
+  "cases": [
+    {
+      "environment": "nsys-cpu-nvtx-r1",
+      "torch_version": "2.8.0+cu128",
+      "CUDA_VISIBLE_DEVICES": "",
+      "trace_option": "nvtx",
+      "gpu_exposed_to_pinned_container": null,
+      "range": "ekv_cpu_only_nvtx_smoke",
+      "range_duration_ns": 20074127,
+      "note": "One intentionally sleeping CPU range; duration is not a performance result.",
+      "artifact_directory": "/workspace/elastic-kv-vmm/project/.container-work/profiles/nsys-cpu-nvtx-r1",
+      "sha256": {
+        "cpu-nvtx.nsys-rep": "7fc264d66d37012979a4c7e5444e3a9b275f1bd7deb29d9a379c6e589fbae666",
+        "cpu-nvtx.sqlite": "8b8953f7b9ce0195ab564ecac862587db35a67256a0205a9fbf39bb41691f640",
+        "console.log": "3c957aee3986004b4fe46e33a91c949d609ff904df6f1a3ce403d0de803a3412"
+      }
+    },
+    {
+      "environment": "nsys-pinned-cpu-nvtx-r2",
+      "torch_version": "2.15.0.dev20261005+cu134",
+      "CUDA_VISIBLE_DEVICES": "",
+      "trace_option": "nvtx",
+      "gpu_exposed_to_pinned_container": false,
+      "range": "ekv_pinned_cpu_only_nvtx_smoke",
+      "range_duration_ns": 20098159,
+      "note": "One intentionally sleeping CPU range; duration is not a performance result.",
+      "artifact_directory": "/workspace/elastic-kv-vmm/project/.container-work/profiles/nsys-pinned-cpu-nvtx-r2",
+      "sha256": {
+        "pinned-cpu-nvtx.nsys-rep": "c0df48259ddde635348a1eef65d0cdad309205247cb14307ddbad16490fa32f1",
+        "pinned-cpu-nvtx.sqlite": "dd5260e4261f14b910322cbe22a8b3ee5626c92788262cda49fadf4145bec6cc",
+        "console.log": "d7837cf2a0dc3ae5beaa6cd02a861c50a51cbf497d453ac5051728b46fb13d6d"
+      }
+    }
+  ],
+  "preserved_failure": "pinned-cpu-nvtx-r1: renaming the target directory to /nsys was rejected; r2 preserves /nsys/target-linux-x64"
+}

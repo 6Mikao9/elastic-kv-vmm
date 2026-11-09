@@ -8,7 +8,7 @@ import json
 import os
 import re
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 
@@ -26,6 +26,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--ack-idle-gpu", action="store_true", required=True)
+    parser.add_argument("--profiler-backend", choices=("torch", "nvtx"), default="torch",
+                        help="use Torch profiling (default) or emit NVTX ranges for an external profiler")
     args = parser.parse_args()
     selected = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     if GPU_UUID.fullmatch(selected) is None:
@@ -34,7 +36,6 @@ def main():
         parser.error("unset EKV_GLOBAL_BROKER_* for this isolated smoke")
 
     import torch
-    from torch.profiler import ProfilerActivity, profile, record_function
 
     from elastic_kv.backing import Backing
 
@@ -57,15 +58,24 @@ def main():
     regions = {}
     states = []
 
+    if args.profiler_backend == "torch":
+        from torch.profiler import ProfilerActivity, profile, record_function
+
+        profiler = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
+        mark_region = record_function
+    else:
+        profiler = nullcontext()
+        mark_region = torch.cuda.nvtx.range
+
     @contextmanager
     def region(name):
         start = time.perf_counter_ns()
-        with record_function(f"vmm_handoff/{name}"):
+        with mark_region(f"vmm_handoff/{name}"):
             yield
         regions.setdefault(name, []).append(time.perf_counter_ns() - start)
 
     started = time.time()
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as trace:
+    with profiler as trace:
         with region("reserve"):
             backing = Backing(4 * CHUNK, chunk_bytes=CHUNK, device=device, library=library)
         graph = None
@@ -145,10 +155,10 @@ def main():
                     graph.reset()
                 backing.close()
 
-    trace.export_chrome_trace(str(args.output_dir / "trace.json"))
     result = {
         "status": "passed",
         "scope": "model-free CUDA VMM and CUDA Graph smoke",
+        "profiler_backend": args.profiler_backend,
         "gpu": {"uuid": selected, "name": properties.name, "capability": [8, 0]},
         "torch_version": torch.__version__,
         "torch_cuda_version": torch.version.cuda,
@@ -162,8 +172,12 @@ def main():
             name: {"count": len(samples), "host_elapsed_ns": samples}
             for name, samples in regions.items()
         },
-        "trace": "trace.json",
     }
+    if args.profiler_backend == "torch":
+        trace.export_chrome_trace(str(args.output_dir / "trace.json"))
+        result["trace"] = "trace.json"
+    else:
+        result["external_trace_verified"] = False
     (args.output_dir / "result.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
 
 

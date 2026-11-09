@@ -129,3 +129,22 @@ Top-K，并经过共享内存和索引范围验证。随后才研究运行中升
 不能仅凭命中率升高判定更快。容量分配按实际物理 chunk 的增量和可回收字节计费，
 不能假设减小逻辑 `t` 就等量归还 HBM；若无法读取硬件流量计数，只报告逻辑 miss
 字节，不能把它称为 PCIe 实测。以上是待执行的研究计划，尚无收益数据。
+
+## 补齐 Nsight 采集入口与 CPU 时间域统计
+
+在不暴露 GPU 的固定 MiniMax 容器中，Nsight 已完成一次真实 CPU NVTX 采集和
+SQLite 导出；数据库中能找到预期的完整标记区间。开发容器中的同类检查也通过。
+首次固定容器尝试把工具目录改名为 `/nsys` 被 CLI 拒绝，保留 `target-linux-x64`
+目录名后通过，失败记录保留。该检查验证采集与导出流程，不是 CUDA 或模型性能证据。
+
+单卡 VMM/Graph 测试新增 `--profiler-backend nvtx`：只发 NVTX 区间，由外部 Nsight
+采集，避免同时开启 PyTorch Profiler；默认 Torch 模式保持原行为。NVTX 模式沿用
+原有映射、回收、重映射和旧 Graph replay 正确性检查，但这些 GPU 步骤尚未以
+新模式运行，结果也不会虚构外部 trace 已通过。
+
+离线分析器此前只保留 wait 类 CUDA API 的 CPU 统计，现在同时保留观察到的全部
+Driver/Runtime API，便于检查 VMM API 开销。针对性测试验证：即使 CPU 上有很长的
+`cuMemCreate` 等调用，GPU 区间并集也不受影响。空字典不能证明没有 VMM 工作；
+swap 内核次数也不能换算为 miss 或迁移次数。原始 trace、实际动作计数和关联信息
+需要共同用于归因，不能将 kernel 耗时求和当作关键路径。当前冻结的 r6 不受这些
+诊断脚本修改影响。[采集说明与记录](HISPARSE_PROFILING.md)
