@@ -420,6 +420,10 @@ cohort 的 placement 联合求解，可以在字节预算内选择 resident、Hi
 在实测启动偏差超过 `--max-cohort-start-skew-ms` 时让整轮实验失败；受管与非受管
 执行路径使用相同语义。
 
+`plan_rollout()` 为每次可执行计划生成独立的短 cohort namespace，并把 namespace
+追加到原 cohort ID；同一毫秒生成的两份计划因此不会在服务端合并。该 namespace
+写入 rollout JSON，便于从运行记录追回原始模拟。
+
 action version 4 进一步把这组提交的 `cohort_id` 与 `cohort_size` 放进
 `elastic.future` payload。scheduler hook 包装原生 `get_new_batch_prefill()`，检查返回
 的 `ScheduleBatch.reqs`（同时兼容 0.5.2 直接返回 batch 与 0.5.17 返回
@@ -436,8 +440,10 @@ radix、grammar、LoRA 与显存容量。因此这里不会通过模拟或 monke
 如果完整 cohort 在原生准入时仍只选中一部分，`partial_cohort_batches` 与
 `last_cohort_batch.reason=native_prefill_selected_partial_members` 明确记录该降级。
 
-为防单个传输请求丢失导致永久等待，`EKV_COHORT_WAIT_TIMEOUT_MS` 设置到齐等待上限，
-默认 1000 ms。超时后成员照常进入原生调度，并累计 `cohort_gate_timeouts`；非法配置
+为防单个传输请求丢失导致永久等待，`EKV_COHORT_WAIT_TIMEOUT_MS`（启动器参数
+`--elastic-cohort-wait-timeout-ms`）设置到齐等待上限，默认 1000 ms。超时状态会保持到
+成员集合变化，不会每个调度 tick 重新等待；超时后成员照常进入原生调度，并累计
+`cohort_gate_timeouts`；非法配置
 或无法解析的 hint 采用 fail-open，累计 `cohort_gate_errors` 或
 `cohort_metadata_conflicts`，不能阻断普通请求。等待期间的
 `cohort_gate_ticks`、`cohort_gate_holds`、`cohort_members_held` 和
@@ -903,8 +909,11 @@ HINTED -> RELEASED -> ADMITTED -> RUNNING -> DONE
 可选设置 `EKV_FUTURE_ORDERING_HORIZON_MS` 后，队列中任一请求的
 `release_after_ms` 超出该窗口都会让本轮排序整体回退，并累加
 `fallback_horizon`。带 deadline 但缺少 `expected_output_tokens` 的请求也会
-整体回退；未知工作量不再被当作 1 个输出 token 做乐观估计。该 JSON 是单个
-调度进程的最后 writer 快照；多 TP rank 实验应按 rank 分目录保存后再聚合。
+整体回退；未知工作量不再被当作 1 个输出 token 做乐观估计。hook 从 SGLang
+scheduler 捕获 TP/PP/DP 坐标后，会为每个进程写独立的
+`future_stats.rank-*.pid-*.json`；`find_stats_paths()` 可以发现旧版单文件或全部
+rank shard，`load_stats()` 保留每 rank 原始文档并只从最活跃 rank 选择顶层视图，
+不会把相同 TP 工作盲目相加。只有无法取得 rank 元数据的独立测试仍写原路径。
 
 实验至少比较 native、EDF/SPT 排序、排序 + 驻留建议、完整执行四组；报告 TTFT p50/p95、
 端到端延迟、deadline hit rate、吞吐、OOM/retraction 次数、迁移字节和浪费预留。

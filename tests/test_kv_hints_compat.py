@@ -6,7 +6,7 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 from adaptive_sparse import kv_hints_compat as compat
-
+from adaptive_sparse import sglang_future_hook as hook
 
 ENVELOPE = {
     "protocol_version": "1",
@@ -70,9 +70,33 @@ class KvHintsTransportTest(unittest.TestCase):
         envelope = compat.decode_kv_hints_envelope(ENVELOPE)
         self.assertIs(compat.decode_kv_hints_envelope(envelope), envelope)
         self.assertEqual(pickle.loads(pickle.dumps(envelope)), envelope)
-        with self.assertRaises(Exception):
+        with self.assertRaises(Exception):  # noqa: B017 - frozen dataclass contract
             envelope.message_id = "changed"
         self.assertEqual(compat._encode_kv_hints(envelope), ENVELOPE)
+
+    def test_v4_cohort_metadata_round_trips_to_scheduler_hint(self):
+        payload = {
+            "protocol_version": "1",
+            "message_id": "cohort-message",
+            "actions": [
+                {
+                    "action_id": "cohort-member",
+                    "action_type": "elastic.future",
+                    "action_version": "4",
+                    "payload": {
+                        "cohort_id": "batch-0",
+                        "cohort_size": 2,
+                    },
+                }
+            ],
+        }
+
+        envelope = compat.decode_kv_hints_envelope(payload)
+        hint = hook._extract_hint(SimpleNamespace(kv_hints=envelope))
+
+        self.assertEqual(hint.cohort_id, "batch-0")
+        self.assertEqual(hint.cohort_size, 2)
+        self.assertEqual(compat._encode_kv_hints(envelope), payload)
 
     def test_rejects_malformed_envelope_and_action(self):
         cases = (

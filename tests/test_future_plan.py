@@ -1,15 +1,15 @@
 import json
 import math
-from pathlib import Path
 import tempfile
 import unittest
 from dataclasses import replace
+from pathlib import Path
 
 from adaptive_sparse.future_plan import (
     DecodeBatchProfile,
     KindServiceProfile,
-    PlanResult,
     PlannerConfig,
+    PlanResult,
     RequestProfile,
     ResidencyMode,
     RuntimeCapabilities,
@@ -929,8 +929,30 @@ class FuturePlanTest(unittest.TestCase):
         self.assertLess(batched.weighted_completion_ms, fifo.weighted_completion_ms)
         self.assertLess(batched.makespan_ms, fifo.makespan_ms)
         rollout = plan_rollout(
-            workload, config, "batched", simulation=batched
+            workload,
+            config,
+            "batched",
+            simulation=batched,
+            cohort_namespace="run-a",
         )
+        second_rollout = plan_rollout(
+            workload,
+            config,
+            "batched",
+            simulation=batched,
+            cohort_namespace="run-b",
+        )
+        runtime_cohorts = {
+            item.cohort_id for item in rollout.submissions
+        }
+        self.assertEqual(len(runtime_cohorts), 1)
+        self.assertTrue(next(iter(runtime_cohorts)).endswith("-run-a"))
+        self.assertTrue(
+            runtime_cohorts.isdisjoint(
+                item.cohort_id for item in second_rollout.submissions
+            )
+        )
+        self.assertEqual(rollout.cohort_namespace, "run-a")
         self.assertEqual(
             {item.hint["prefill_tokens_per_s"] for item in rollout.submissions},
             {15_000.0},

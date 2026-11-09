@@ -6,7 +6,7 @@ import argparse
 import json
 import os
 import sys
-from typing import Sequence
+from collections.abc import Sequence
 
 from .config import (
     ACTIVATION_POLICIES,
@@ -19,7 +19,6 @@ from .config import (
     REQUEST_AFFINE_MODES,
     ElasticConfig,
 )
-
 
 SPAWN_INSTALL_ENV = "_ELASTIC_KV_INSTALL_ON_IMPORT"
 
@@ -86,6 +85,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--elastic-future-policy", choices=FUTURE_POLICIES)
     parser.add_argument("--elastic-future-ordering-horizon-ms", type=int)
+    parser.add_argument("--elastic-cohort-wait-timeout-ms", type=int)
     parser.add_argument("--elastic-stats-path")
     parser.add_argument("--elastic-future-stats-path")
     parser.add_argument("--elastic-global-broker-path")
@@ -132,6 +132,7 @@ def resolve_config(argv: Sequence[str]) -> tuple[ElasticConfig, list[str], bool]
         request_affine_mode=args.elastic_request_affine_mode,
         future_policy=args.elastic_future_policy,
         future_ordering_horizon_ms=args.elastic_future_ordering_horizon_ms,
+        cohort_wait_timeout_ms=args.elastic_cohort_wait_timeout_ms,
         stats_path=args.elastic_stats_path,
         future_stats_path=args.elastic_future_stats_path,
         prefill_headroom_scoped=args.elastic_prefill_headroom_scoped,

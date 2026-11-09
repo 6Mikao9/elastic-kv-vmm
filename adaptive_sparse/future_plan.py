@@ -14,16 +14,16 @@ boundary and must validate the resulting reservation against physical backing.
 from __future__ import annotations
 
 import argparse
+import json
+import math
+import secrets
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
 from itertools import product
-import json
-import math
 from pathlib import Path
 
 from .future_residency import RESIDENCE_HINTS
-
 
 POLICIES = (
     "fifo",
@@ -735,6 +735,7 @@ class RolloutPlan:
     submissions: tuple[RolloutSubmission, ...]
     planner_config: PlannerConfig | None = None
     runtime_capabilities: RuntimeCapabilities | None = None
+    cohort_namespace: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -762,6 +763,8 @@ class RolloutPlan:
             payload["planner_config"] = self.planner_config.as_dict()
         if self.runtime_capabilities is not None:
             payload["runtime_capabilities"] = self.runtime_capabilities.as_dict()
+        if self.cohort_namespace is not None:
+            payload["cohort_namespace"] = self.cohort_namespace
         return payload
 
 
@@ -2341,6 +2344,7 @@ def plan_rollout(
     *,
     simulation: PlanResult | None = None,
     runtime_capabilities: RuntimeCapabilities | None = None,
+    cohort_namespace: str | None = None,
 ) -> RolloutPlan:
     """Convert a simulated policy into delayed submissions and runtime hints.
 
@@ -2367,6 +2371,25 @@ def plan_rollout(
     if workload_ids != admission_ids or len(workload_ids) != len(simulation.admissions):
         raise ValueError("simulation requests do not match the rollout workload")
     requests_by_id = {item.request_id: item for item in workload}
+    namespace = cohort_namespace or secrets.token_hex(6)
+    if (
+        not isinstance(namespace, str)
+        or not namespace
+        or len(namespace) > 32
+        or any(
+            not (character.isalnum() or character in "-_")
+            for character in namespace
+        )
+    ):
+        raise ValueError("cohort_namespace must be a short alphanumeric identifier")
+    runtime_cohort_ids = {
+        cohort_id: f"{cohort_id}-{namespace}"
+        for cohort_id in {
+            item.cohort_id
+            for item in simulation.admissions
+            if item.cohort_id is not None
+        }
+    }
     submissions = []
     for admission in simulation.admissions:
         request = requests_by_id[admission.request_id]
@@ -2415,10 +2438,20 @@ def plan_rollout(
                 deadline_ms=request.deadline_ms,
                 decode_batch_size=admission.decode_batch_size,
                 prefill_batch_size=admission.prefill_batch_size,
-                cohort_id=admission.cohort_id,
+                cohort_id=(
+                    runtime_cohort_ids.get(admission.cohort_id)
+                    if admission.cohort_id is not None
+                    else None
+                ),
             )
         )
-    return RolloutPlan(simulation, tuple(submissions), config, capabilities)
+    return RolloutPlan(
+        simulation,
+        tuple(submissions),
+        config,
+        capabilities,
+        namespace,
+    )
 
 
 def _load_workload(

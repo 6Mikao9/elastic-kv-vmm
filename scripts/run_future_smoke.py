@@ -20,6 +20,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from adaptive_sparse.future_plan import POLICIES
+from adaptive_sparse.sglang_future_hook import find_stats_paths, load_stats
 
 HOST = "127.0.0.1"
 PORT = 31180
@@ -419,11 +420,11 @@ def main(argv: list[str] | None = None) -> int:
                 sampler.take()
             nvml = memory_summary(sampler.samples)
         deadline = time.monotonic() + 2
-        while not stats_path.exists() and time.monotonic() < deadline:
+        while not find_stats_paths(stats_path) and time.monotonic() < deadline:
             time.sleep(0.05)
         hook_stats = (
-            json.loads(stats_path.read_text())
-            if args.future_policy != "off" and stats_path.exists()
+            load_stats(stats_path)
+            if args.future_policy != "off" and find_stats_paths(stats_path)
             else None
         )
         elastic_stats = (

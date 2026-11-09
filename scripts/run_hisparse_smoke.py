@@ -18,6 +18,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from adaptive_sparse.future_plan import POLICIES
+from adaptive_sparse.sglang_future_hook import find_stats_paths, load_stats
 from benchmarks.client import digest_ids, prompt_ids, write_json
 from scripts.run_case import HOST, PORT, ROOT, leader_exit, on_sigterm, stop_server
 
@@ -1075,9 +1076,9 @@ def main():
             results["semantic_smoke_passed"] = semantic["passed"]
         if args.future_policy != "off":
             stats_path = output / "future_stats.json"
-            if not stats_path.is_file():
+            if not find_stats_paths(stats_path):
                 raise RuntimeError("future scheduler produced no telemetry")
-            future_stats = json.loads(stats_path.read_text())
+            future_stats = load_stats(stats_path)
             if (future_stats.get("ticks", 0) < 1
                     or future_stats.get("fallback_exception", 0)
                     or future_stats.get("fallback_invalid_hint", 0)

@@ -12,7 +12,8 @@ import math
 import os
 import time
 from collections.abc import Iterable
-from dataclasses import dataclass
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
 from typing import Any
@@ -68,6 +69,19 @@ _last_cohort_batch: dict[str, object] | None = None
 _last_held_cohorts: list[dict[str, object]] = []
 _cohort_first_seen_s: dict[str, float] = {}
 _cohort_arrival_complete: set[str] = set()
+_cohort_timed_out: dict[str, tuple[int, tuple[int, ...]]] = {}
+_stats_identity: dict[str, int] = {}
+
+
+@dataclass(slots=True)
+class _PrefillGateFrame:
+    ordered_queue: list[Any] | None = None
+    held: list[Any] = field(default_factory=list)
+
+
+_active_prefill_gate: ContextVar[_PrefillGateFrame | None] = ContextVar(
+    "elastic_prefill_gate", default=None
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -549,10 +563,11 @@ def withhold_incomplete_cohorts(
     request count, tokens, radix, grammar, LoRA, and every other capacity limit.
     """
 
-    global _last_held_cohorts
+    global _cohort_timed_out, _last_held_cohorts
     if not waiting_queue:
         _cohort_first_seen_s.clear()
         _cohort_arrival_complete.clear()
+        _cohort_timed_out.clear()
         _last_held_cohorts = []
         return []
 
@@ -579,6 +594,11 @@ def withhold_incomplete_cohorts(
             cohorts.setdefault(hint.cohort_id, []).append(request)
 
     _cohort_arrival_complete.intersection_update(cohorts)
+    _cohort_timed_out = {
+        cohort_id: signature
+        for cohort_id, signature in _cohort_timed_out.items()
+        if cohort_id in cohorts
+    }
     incomplete: dict[str, tuple[int, list[Any]]] = {}
     for cohort_id, members in cohorts.items():
         sizes = {_extract_hint(member).cohort_size for member in members}
@@ -586,15 +606,18 @@ def withhold_incomplete_cohorts(
             _stats["cohort_metadata_conflicts"] += 1
             _cohort_first_seen_s.pop(cohort_id, None)
             _cohort_arrival_complete.discard(cohort_id)
+            _cohort_timed_out.pop(cohort_id, None)
             continue
         expected = next(iter(sizes))
         if len(members) > expected:
             _stats["cohort_metadata_conflicts"] += 1
             _cohort_first_seen_s.pop(cohort_id, None)
             _cohort_arrival_complete.discard(cohort_id)
+            _cohort_timed_out.pop(cohort_id, None)
         elif len(members) == expected:
             _cohort_arrival_complete.add(cohort_id)
             _cohort_first_seen_s.pop(cohort_id, None)
+            _cohort_timed_out.pop(cohort_id, None)
         elif cohort_id not in _cohort_arrival_complete:
             incomplete[cohort_id] = (expected, members)
 
@@ -605,11 +628,19 @@ def withhold_incomplete_cohorts(
     held_members: list[Any] = []
     held_records: list[dict[str, object]] = []
     for cohort_id, (expected, members) in incomplete.items():
+        signature = (expected, tuple(sorted(id(member) for member in members)))
+        if _cohort_timed_out.get(cohort_id) == signature:
+            continue
+        if cohort_id in _cohort_timed_out:
+            # A newly arrived member changes the admission problem; retry the
+            # bounded wait once from the new membership set.
+            del _cohort_timed_out[cohort_id]
         first_seen = _cohort_first_seen_s.setdefault(cohort_id, now)
         waited_ms = max(0.0, (now - first_seen) * 1000.0)
         if waited_ms > timeout_ms:
             _stats["cohort_gate_timeouts"] += 1
             del _cohort_first_seen_s[cohort_id]
+            _cohort_timed_out[cohort_id] = signature
             continue
         held_members.extend(members)
         held_records.append(
@@ -638,11 +669,140 @@ def withhold_incomplete_cohorts(
     return held_members
 
 
+def _gate_active_prefill_queue(waiting_queue: list[Any]) -> None:
+    """Apply the arrival gate after SGLang has published grammar-ready work."""
+
+    frame = _active_prefill_gate.get()
+    if frame is None or frame.ordered_queue is not None:
+        return
+    frame.ordered_queue = list(waiting_queue)
+    try:
+        frame.held = withhold_incomplete_cohorts(waiting_queue)
+    except (AttributeError, TypeError, ValueError, OSError):
+        # A malformed optional gate must not suppress native prefill.
+        _stats["cohort_gate_errors"] += 1
+        frame.held = []
+
+
+def _restore_prefill_queue(
+    waiting_queue: list[Any], *, frame: _PrefillGateFrame
+) -> None:
+    """Restore held requests without changing the native order of survivors."""
+
+    if frame.ordered_queue is None or not frame.held:
+        return
+    current = list(waiting_queue)
+    current_ids = {id(request) for request in current}
+    held_ids = {id(request) for request in frame.held}
+    previous_ids = {id(request) for request in frame.ordered_queue}
+    restored = [
+        request
+        for request in frame.ordered_queue
+        if id(request) in current_ids or id(request) in held_ids
+    ]
+    restored.extend(
+        request for request in current if id(request) not in previous_ids
+    )
+    waiting_queue[:] = restored
+
+
 def snapshot_stats() -> dict[str, object]:
     snapshot: dict[str, object] = dict(_stats)
     snapshot["last_cohort_batch"] = _last_cohort_batch
     snapshot["last_held_cohorts"] = list(_last_held_cohorts)
+    snapshot["stats_identity"] = dict(_stats_identity)
     return snapshot
+
+
+def _capture_stats_identity(scheduler: Any) -> None:
+    """Capture the scheduler's TP/PP/DP coordinates once per process."""
+
+    source = getattr(scheduler, "ps", scheduler)
+    identity = {}
+    for name in (
+        "tp_rank",
+        "pp_rank",
+        "dp_rank",
+        "attn_tp_rank",
+        "attn_dp_rank",
+        "moe_dp_rank",
+    ):
+        value = getattr(source, name, None)
+        if isinstance(value, int) and not isinstance(value, bool):
+            identity[name] = value
+    if identity:
+        _stats_identity.clear()
+        _stats_identity.update(identity)
+
+
+def _stats_target(path: str | Path) -> Path:
+    target = Path(path).expanduser()
+    if not _stats_identity:
+        return target
+    tag = ".".join(
+        f"{name}-{_stats_identity.get(name, 0)}"
+        for name in (
+            "tp_rank",
+            "pp_rank",
+            "dp_rank",
+            "attn_tp_rank",
+            "attn_dp_rank",
+            "moe_dp_rank",
+        )
+    )
+    return target.with_name(
+        f"{target.stem}.rank-{tag}.pid-{os.getpid()}{target.suffix}"
+    )
+
+
+def find_stats_paths(path: str | Path) -> list[Path]:
+    """Return a legacy unsplit file or every per-rank shard for ``path``."""
+
+    target = Path(path).expanduser()
+    paths = []
+    if target.is_file():
+        paths.append(target)
+    prefix = f"{target.stem}.rank-"
+    paths.extend(
+        candidate
+        for candidate in target.parent.glob(f"{prefix}*{target.suffix}")
+        if candidate.is_file()
+    )
+    return sorted(set(paths), key=lambda item: item.name)
+
+
+def load_stats(path: str | Path) -> dict[str, object]:
+    """Load all rank shards without pretending they are additive counters."""
+
+    import json
+
+    paths = find_stats_paths(path)
+    if not paths:
+        raise FileNotFoundError(path)
+    documents = [json.loads(item.read_text(encoding="utf-8")) for item in paths]
+    selected = max(
+        documents,
+        key=lambda document: (
+            int(document.get("complete_cohort_batches", 0)),
+            int(document.get("prefill_batches", 0)),
+            int(document.get("ticks", 0)),
+        ),
+    )
+    result = dict(selected)
+    for name in (
+        "fallback_exception",
+        "fallback_invalid_hint",
+        "telemetry_errors",
+        "cohort_gate_errors",
+    ):
+        result[name] = sum(int(document.get(name, 0)) for document in documents)
+    result["shard_count"] = len(paths)
+    result["stats_files"] = [str(item) for item in paths]
+    result["stats_shards"] = [
+        {"path": str(item), "stats": document}
+        for item, document in zip(paths, documents, strict=True)
+    ]
+    return result
 
 
 def _publish_stats(*, force: bool = False, now_s: float | None = None) -> None:
@@ -654,7 +814,7 @@ def _publish_stats(*, force: bool = False, now_s: float | None = None) -> None:
     if not force and now - _last_stats_publish < _STATS_INTERVAL_S:
         return
     try:
-        target = Path(path).expanduser()
+        target = _stats_target(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         # Scheduler workers publish the same aggregate telemetry path. A
         # process-unique temporary file prevents one rank from replacing or
@@ -716,6 +876,7 @@ def install() -> None:
         apply_to_waiting_queue(
             waiting_queue, priority_sign=priority_sign, horizon_ms=horizon_ms
         )
+        _gate_active_prefill_queue(waiting_queue)
         return result
 
     elastic_calc_priority._elastic_future_hook = True
@@ -731,19 +892,14 @@ def install() -> None:
 
             @wraps(original_prefill)
             def elastic_get_new_batch_prefill(self, *args, **kwargs):
-                try:
-                    held = withhold_incomplete_cohorts(self.waiting_queue)
-                except (AttributeError, TypeError, ValueError, OSError):
-                    # A malformed optional gate must not suppress native prefill.
-                    _stats["cohort_gate_errors"] += 1
-                    held = []
+                _capture_stats_identity(self)
+                frame = _PrefillGateFrame()
+                token = _active_prefill_gate.set(frame)
                 try:
                     result = original_prefill(self, *args, **kwargs)
                 finally:
-                    # Native scheduling may append grammar-ready work. Partial
-                    # cohorts stay at the tail; the next native priority pass
-                    # remains authoritative for their eventual order.
-                    self.waiting_queue.extend(held)
+                    _restore_prefill_queue(self.waiting_queue, frame=frame)
+                    _active_prefill_gate.reset(token)
                 observe_prefill_batch(_prefill_batch(result))
                 _publish_stats()
                 return result

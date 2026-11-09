@@ -7,12 +7,11 @@ address space or loads model weights.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
 import json
 import math
 import os
-from typing import Mapping
-
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
 
 MODES = ("baseline", "v0", "v1", "v2", "v3", "v4", "v5")
 ACTIVATION_POLICIES = ("off", "telemetry", "trim", "recycle", "both")
@@ -28,6 +27,7 @@ DEFAULT_PREFILL_WORKSPACE_MAX_MIB = 256
 DEFAULT_FUTURE_POLICY = "off"
 DEFAULT_PRECOMMIT_CHUNKS = 0
 DEFAULT_FUTURE_ORDERING_HORIZON_MS = 0
+DEFAULT_COHORT_WAIT_TIMEOUT_MS = 1000
 DEFAULT_GLOBAL_BROKER_STALE_SECONDS = 120
 GLOBAL_BROKER_FAIR_MODES = ("off", "observe", "enforce")
 GLOBAL_BROKER_PREFILL_MODES = ("off", "observe", "enforce")
@@ -91,6 +91,7 @@ class ElasticConfig:
     request_affine_mode: str = DEFAULT_REQUEST_AFFINE_MODE
     future_policy: str = DEFAULT_FUTURE_POLICY
     future_ordering_horizon_ms: int = DEFAULT_FUTURE_ORDERING_HORIZON_MS
+    cohort_wait_timeout_ms: int = DEFAULT_COHORT_WAIT_TIMEOUT_MS
     stats_path: str | None = None
     future_stats_path: str | None = None
     prefill_headroom_scoped: bool = False
@@ -157,6 +158,8 @@ class ElasticConfig:
             raise ValueError(f"unknown future policy: {self.future_policy!r}")
         if self.future_ordering_horizon_ms < 0:
             raise ValueError("future_ordering_horizon_ms must be nonnegative")
+        if not 0 <= self.cohort_wait_timeout_ms <= 60_000:
+            raise ValueError("cohort_wait_timeout_ms must be between 0 and 60000")
         if self.prefill_workspace_bytes_per_token < 0:
             raise ValueError("prefill_workspace_bytes_per_token must be nonnegative")
         if self.prefill_workspace_max_mib < 1:
@@ -228,7 +231,7 @@ class ElasticConfig:
                 )
 
     @classmethod
-    def from_env(cls, environ: Mapping[str, str] | None = None) -> "ElasticConfig":
+    def from_env(cls, environ: Mapping[str, str] | None = None) -> ElasticConfig:
         env = os.environ if environ is None else environ
         precommit_chunks = _integer(
             "EKV_PRECOMMIT_CHUNKS",
@@ -297,6 +300,14 @@ class ElasticConfig:
                 env.get(
                     "EKV_FUTURE_ORDERING_HORIZON_MS",
                     DEFAULT_FUTURE_ORDERING_HORIZON_MS,
+                ),
+                minimum=0,
+            ),
+            cohort_wait_timeout_ms=_integer(
+                "EKV_COHORT_WAIT_TIMEOUT_MS",
+                env.get(
+                    "EKV_COHORT_WAIT_TIMEOUT_MS",
+                    DEFAULT_COHORT_WAIT_TIMEOUT_MS,
                 ),
                 minimum=0,
             ),
@@ -380,6 +391,7 @@ class ElasticConfig:
         request_affine_mode: str | None = None,
         future_policy: str | None = None,
         future_ordering_horizon_ms: int | None = None,
+        cohort_wait_timeout_ms: int | None = None,
         stats_path: str | None = None,
         future_stats_path: str | None = None,
         prefill_headroom_scoped: bool | None = None,
@@ -395,7 +407,7 @@ class ElasticConfig:
         global_broker_demand_ttl_seconds: float | None = None,
         global_broker_wait_ms: int | None = None,
         global_broker_prefill_mode: str | None = None,
-    ) -> "ElasticConfig":
+    ) -> ElasticConfig:
         changes = {
             key: value
             for key, value in (
@@ -416,6 +428,7 @@ class ElasticConfig:
                 ("request_affine_mode", request_affine_mode),
                 ("future_policy", future_policy),
                 ("future_ordering_horizon_ms", future_ordering_horizon_ms),
+                ("cohort_wait_timeout_ms", cohort_wait_timeout_ms),
                 ("stats_path", stats_path),
                 ("future_stats_path", future_stats_path),
                 ("prefill_headroom_scoped", prefill_headroom_scoped),
@@ -464,6 +477,7 @@ class ElasticConfig:
             "EKV_FUTURE_ORDERING_HORIZON_MS": str(
                 self.future_ordering_horizon_ms
             ),
+            "EKV_COHORT_WAIT_TIMEOUT_MS": str(self.cohort_wait_timeout_ms),
             "EKV_PREFILL_HEADROOM_SCOPED": (
                 "1" if self.prefill_headroom_scoped else "0"
             ),
@@ -531,6 +545,7 @@ class ElasticConfig:
             "request_affine_mode": self.request_affine_mode,
             "future_policy": self.future_policy,
             "future_ordering_horizon_ms": self.future_ordering_horizon_ms,
+            "cohort_wait_timeout_ms": self.cohort_wait_timeout_ms,
             "stats_path": self.stats_path,
             "future_stats_path": self.future_stats_path,
             "prefill_headroom_scoped": self.prefill_headroom_scoped,

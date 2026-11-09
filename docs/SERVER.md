@@ -68,7 +68,7 @@ SGLang or touch CUDA.
 | `--elastic-predictive-prewarm-max-chunks` | `8` | global outstanding logical-chunk lease cap from 1 to 64; requested demand is total K/V bytes across all planes |
 | `--elastic-future-policy` | `off` | `deadline`; native `kv_hints` or the built-in 0.5.2 compatibility path |
 | `--elastic-future-ordering-horizon-ms` | `0` | nonnegative; zero keeps native horizon behavior |
-| `EKV_COHORT_WAIT_TIMEOUT_MS` | `1000` | bound for withholding a partial action-v4 cohort; timeout falls back to native scheduling |
+| `--elastic-cohort-wait-timeout-ms` | `1000` | bound for withholding a partial action-v4 cohort; timeout falls back to native scheduling |
 | `--elastic-stats-path` | unset | atomic JSON telemetry destination |
 | `--elastic-future-stats-path` | unset | separate future-hook telemetry destination |
 | `--elastic-global-broker-path` | unset | shared SQLite state for one physical GPU |
@@ -132,7 +132,9 @@ not make the activation allocation itself VMM-backed.
 
 Set `--elastic-future-stats-path` (or `EKV_FUTURE_STATS_PATH`) to atomically
 export scheduler hook counters from `adaptive_sparse.sglang_future_hook`; these
-are separate from the VMM adapter's `--elastic-stats-path` file. The launcher
+are separate from the VMM adapter's `--elastic-stats-path` file. Once scheduler
+rank metadata is available, each process writes a discoverable
+`future_stats.rank-*.json` shard instead of racing on one last-writer file. The launcher
 also exposes the existing bounded VMM precommit controls, so spawned workers
 receive the exact same validated settings.
 

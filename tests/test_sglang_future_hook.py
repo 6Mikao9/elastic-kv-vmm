@@ -35,6 +35,8 @@ class SGLangFutureHookTest(unittest.TestCase):
     def setUp(self):
         hook._cohort_first_seen_s.clear()
         hook._cohort_arrival_complete.clear()
+        hook._cohort_timed_out.clear()
+        hook._stats_identity.clear()
         hook._last_held_cohorts = []
 
     def test_absolute_deadline_uses_dispatch_clock_not_request_age(self):
@@ -296,6 +298,11 @@ class SGLangFutureHookTest(unittest.TestCase):
 
         self.assertEqual(held, [])
         self.assertEqual(queue, [first])
+        self.assertEqual(snapshot_stats()["cohort_gate_timeouts"] - before, 1)
+        self.assertEqual(
+            withhold_incomplete_cohorts(queue, now_s=2.0),
+            [],
+        )
         self.assertEqual(snapshot_stats()["cohort_gate_timeouts"] - before, 1)
 
     def test_completed_cohort_is_not_reheld_after_native_partial_admission(self):
@@ -714,8 +721,10 @@ class SGLangFutureHookTest(unittest.TestCase):
         class Scheduler:
             def __init__(self):
                 self.waiting_queue = [first, second]
+                self.policy = SchedulePolicy()
 
             def get_new_batch_prefill(self, *args, **kwargs):
+                self.policy.calc_priority(self.waiting_queue)
                 return SimpleNamespace(reqs=[first, second])
 
         modules = {
@@ -768,8 +777,10 @@ class SGLangFutureHookTest(unittest.TestCase):
             def __init__(self):
                 self.waiting_queue = [partial, other]
                 self.observed_queue = None
+                self.policy = SchedulePolicy()
 
             def get_new_batch_prefill(self, running_batch):
+                self.policy.calc_priority(self.waiting_queue, running_batch)
                 self.observed_queue = list(self.waiting_queue)
                 self.waiting_queue.remove(other)
                 return SimpleNamespace(
@@ -799,8 +810,115 @@ class SGLangFutureHookTest(unittest.TestCase):
         hook._installed = False
 
         self.assertEqual(scheduler.observed_queue, [other])
-        self.assertEqual([item.request_id for item in plan.batch_to_run.reqs], ["other"])
-        self.assertEqual([item.request_id for item in scheduler.waiting_queue], ["partial"])
+        self.assertEqual(
+            [item.request_id for item in plan.batch_to_run.reqs], ["other"]
+        )
+        self.assertEqual(
+            [item.request_id for item in scheduler.waiting_queue], ["partial"]
+        )
+
+    def test_gate_sees_grammar_request_added_before_policy(self):
+        first = request(
+            "first",
+            10,
+            1.0,
+            {"cohort_id": "batch-0", "cohort_size": 2},
+            version="4",
+        )
+        second = request(
+            "second",
+            10,
+            1.0,
+            {"cohort_id": "batch-0", "cohort_size": 2},
+            version="4",
+        )
+
+        class SchedulePolicy:
+            def calc_priority(self, waiting_queue, *args, **kwargs):
+                return None
+
+        class Scheduler:
+            def __init__(self):
+                self.waiting_queue = [first]
+                self.policy = SchedulePolicy()
+                self.observed_queue = None
+
+            def get_new_batch_prefill(self, *args, **kwargs):
+                self.waiting_queue.append(second)
+                self.policy.calc_priority(self.waiting_queue)
+                self.observed_queue = list(self.waiting_queue)
+                return SimpleNamespace(reqs=[first, second])
+
+        modules = {
+            "sglang": SimpleNamespace(__path__=[]),
+            "sglang.srt": SimpleNamespace(__path__=[]),
+            "sglang.srt.managers": SimpleNamespace(__path__=[]),
+            "sglang.srt.managers.kv_hints": SimpleNamespace(),
+            "sglang.srt.managers.schedule_policy": SimpleNamespace(
+                SchedulePolicy=SchedulePolicy
+            ),
+            "sglang.srt.managers.scheduler": SimpleNamespace(
+                Scheduler=Scheduler
+            ),
+        }
+        with patch.dict(sys.modules, modules), patch.dict(
+            "os.environ", {"EKV_FUTURE_POLICY": "deadline"}
+        ):
+            hook._installed = False
+            hook.install()
+            scheduler = Scheduler()
+            scheduler.get_new_batch_prefill()
+        hook._installed = False
+
+        self.assertEqual(scheduler.observed_queue, [first, second])
+
+    def test_restoring_held_cohort_preserves_original_fcfs_order(self):
+        partial = request(
+            "partial",
+            10,
+            1.0,
+            {"cohort_id": "batch-0", "cohort_size": 2},
+            version="4",
+        )
+        other = request("other", 10, 1.0, {})
+
+        class SchedulePolicy:
+            def calc_priority(self, waiting_queue, *args, **kwargs):
+                return None
+
+        class Scheduler:
+            def __init__(self):
+                self.waiting_queue = [partial, other]
+                self.policy = SchedulePolicy()
+                self.native_queue = None
+
+            def get_new_batch_prefill(self, *args, **kwargs):
+                self.policy.calc_priority(self.waiting_queue)
+                self.native_queue = list(self.waiting_queue)
+
+        modules = {
+            "sglang": SimpleNamespace(__path__=[]),
+            "sglang.srt": SimpleNamespace(__path__=[]),
+            "sglang.srt.managers": SimpleNamespace(__path__=[]),
+            "sglang.srt.managers.kv_hints": SimpleNamespace(),
+            "sglang.srt.managers.schedule_policy": SimpleNamespace(
+                SchedulePolicy=SchedulePolicy
+            ),
+            "sglang.srt.managers.scheduler": SimpleNamespace(
+                Scheduler=Scheduler
+            ),
+        }
+        with patch.dict(sys.modules, modules), patch.dict(
+            "os.environ", {"EKV_FUTURE_POLICY": "deadline"}
+        ):
+            hook._installed = False
+            hook.install()
+            scheduler = Scheduler()
+            scheduler.get_new_batch_prefill()
+        hook._installed = False
+
+        self.assertEqual(scheduler.native_queue, [other])
+        self.assertEqual(scheduler.waiting_queue, [partial, other])
 
     def test_installer_cohort_gate_error_falls_back_to_native_prefill(self):
         class SchedulePolicy:
@@ -819,8 +937,10 @@ class SGLangFutureHookTest(unittest.TestCase):
             def __init__(self):
                 self.waiting_queue = [waiting]
                 self.called = False
+                self.policy = SchedulePolicy()
 
             def get_new_batch_prefill(self, *args, **kwargs):
+                self.policy.calc_priority(self.waiting_queue)
                 self.called = True
 
         modules = {
@@ -864,6 +984,35 @@ class SGLangFutureHookTest(unittest.TestCase):
                 hook._publish_stats(force=True, now_s=10.0)
             self.assertEqual(json.loads(path.read_text()), snapshot_stats())
             self.assertFalse(path.with_name(f"{path.name}.{os.getpid()}.tmp").exists())
+
+    def test_ranked_stats_use_discoverable_rank_shards(self):
+        import tempfile
+        from pathlib import Path
+
+        hook._stats_identity.update(
+            {
+                "tp_rank": 3,
+                "pp_rank": 1,
+                "dp_rank": 2,
+                "attn_tp_rank": 3,
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "future.json"
+            with patch.dict("os.environ", {"EKV_FUTURE_STATS_PATH": str(path)}):
+                hook._publish_stats(force=True, now_s=10.0)
+
+            paths = hook.find_stats_paths(path)
+            self.assertEqual(len(paths), 1)
+            self.assertNotEqual(paths[0], path)
+            self.assertIn("tp_rank-3", paths[0].name)
+            self.assertIn("dp_rank-2", paths[0].name)
+            loaded = hook.load_stats(path)
+            self.assertEqual(loaded["shard_count"], 1)
+            self.assertEqual(
+                loaded["stats_shards"][0]["stats"]["stats_identity"]["tp_rank"],
+                3,
+            )
 
 
 if __name__ == "__main__":

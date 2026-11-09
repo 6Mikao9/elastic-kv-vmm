@@ -222,6 +222,8 @@ their own implementation. The VMM adapter and future-ordering hook can therefore
 share one process without changing sampling or attention behavior. See [the
 compatibility boundary](docs/KV_HINTS_COMPAT.md), [scheduler integration
 design](docs/FUTURE_PLANNER_DESIGN.md), and [smoke script](scripts/container_future_smoke.sh).
+SGLang scheduler rank metadata is carried into the telemetry; multi-rank runs
+write discoverable per-process shards instead of silently overwriting one file.
 For a source build that should carry the transport natively, the checked-in
 [SGLang 0.5.2 transport patch](patches/sglang-v0.5.2-kv-hints-transport.patch)
 backports only request validation and propagation; it does not change attention
@@ -286,7 +288,8 @@ native `PrefillAdder` rechecks the complete group and may still choose only a
 subset because of its token, request-slot, radix, grammar, LoRA or memory
 limits; that result is counted as a native partial batch. The arrival gate
 therefore never forces an oversized batch. `EKV_COHORT_WAIT_TIMEOUT_MS` bounds
-the wait (default 1000 ms) so a lost transport request falls back to native
+the wait (also exposed as `--elastic-cohort-wait-timeout-ms`, default 1000 ms)
+so a lost transport request falls back to native
 scheduling and records a timeout. The hook supports both the SGLang 0.5.2 batch
 return and 0.5.17 `NextBatchPlan` return. Profile values still need paired runs
 against real SGLang co-batch traces.

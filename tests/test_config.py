@@ -1,14 +1,14 @@
 import io
 import json
-from contextlib import redirect_stdout
 import os
 import sys
-from types import SimpleNamespace
 import unittest
+from contextlib import redirect_stdout
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from elastic_kv.config import ElasticConfig
 from elastic_kv import launch
+from elastic_kv.config import ElasticConfig
 from elastic_kv.launch import main, resolve_config
 
 
@@ -36,6 +36,7 @@ class ElasticConfigTest(unittest.TestCase):
                 "EKV_REQUEST_AFFINE_MODE": "enforce",
                 "EKV_FUTURE_POLICY": "deadline",
                 "EKV_FUTURE_ORDERING_HORIZON_MS": "2000",
+                "EKV_COHORT_WAIT_TIMEOUT_MS": "1250",
                 "EKV_FUTURE_STATS_PATH": "/tmp/future.json",
                 "EKV_GLOBAL_BROKER_PATH": "/tmp/gpu0-broker.sqlite",
                 "EKV_GLOBAL_BROKER_MIB": "6144",
@@ -65,6 +66,7 @@ class ElasticConfigTest(unittest.TestCase):
         self.assertEqual(config.request_affine_mode, "enforce")
         self.assertEqual(config.future_policy, "deadline")
         self.assertEqual(config.future_ordering_horizon_ms, 2000)
+        self.assertEqual(config.cohort_wait_timeout_ms, 1250)
         self.assertEqual(config.future_stats_path, "/tmp/future.json")
         self.assertEqual(config.global_broker_path, "/tmp/gpu0-broker.sqlite")
         self.assertEqual(config.global_broker_mib, 6144)
@@ -96,6 +98,8 @@ class ElasticConfigTest(unittest.TestCase):
     def test_future_policy_is_validated(self):
         with self.assertRaisesRegex(ValueError, "unknown future policy"):
             ElasticConfig(future_policy="predict-everything")
+        with self.assertRaisesRegex(ValueError, "between 0 and 60000"):
+            ElasticConfig(cohort_wait_timeout_ms=60_001)
 
     def test_precommit_budget_is_validated(self):
         with self.assertRaisesRegex(ValueError, "between 0 and 4"):
@@ -231,6 +235,8 @@ class ElasticConfigTest(unittest.TestCase):
                 "dry_run",
                 "--elastic-future-ordering-horizon-ms",
                 "1500",
+                "--elastic-cohort-wait-timeout-ms",
+                "1750",
                 "--elastic-future-stats-path",
                 "/tmp/future.json",
                 "--elastic-global-broker-path",
@@ -270,6 +276,7 @@ class ElasticConfigTest(unittest.TestCase):
                 config.predictive_prewarm_max_chunks,
                 config.request_affine_mode,
                 config.future_ordering_horizon_ms,
+                config.cohort_wait_timeout_ms,
                 config.future_stats_path,
                 config.prefill_headroom_scoped,
                 config.allow_overlap_schedule,
@@ -297,6 +304,7 @@ class ElasticConfigTest(unittest.TestCase):
                 6,
                 "dry_run",
                 1500,
+                1750,
                 "/tmp/future.json",
                 True,
                 True,
