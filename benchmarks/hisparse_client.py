@@ -32,6 +32,14 @@ class RankSampler(MemorySampler):
         self.stop = threading.Event()
         self.error = None
         self.origin = time.perf_counter()
+        anchor_before = time.perf_counter_ns()
+        anchor_utc = time.time_ns()
+        self.clock_anchor = {
+            "origin_perf_counter_s": self.origin,
+            "utc_unix_ns": anchor_utc,
+            "perf_counter_before_ns": anchor_before,
+            "perf_counter_after_ns": time.perf_counter_ns(),
+        }
         self.thread = threading.Thread(target=self._run, daemon=True)
         try:
             self.handles = [self.nvml.nvmlDeviceGetHandleByUUID(uuid) for uuid in uuids]
@@ -40,13 +48,30 @@ class RankSampler(MemorySampler):
             raise
 
     def take(self):
+        requested = time.perf_counter_ns()
         with self.lock:
-            used = [int(self.nvml.nvmlDeviceGetMemoryInfo(handle).used)
-                    for handle in self.handles]
+            acquired = time.perf_counter_ns()
+            used = []
+            queries = []
+            started = time.perf_counter_ns()
+            for handle in self.handles:
+                query_start = time.perf_counter_ns()
+                info = self.nvml.nvmlDeviceGetMemoryInfo(handle)
+                query_end = time.perf_counter_ns()
+                used.append(int(info.used))
+                queries.append([query_start, query_end])
+            offset = time.perf_counter() - self.origin
+            ended = time.perf_counter_ns()
             self.samples.append({
-                "offset_s": time.perf_counter() - self.origin,
+                "offset_s": offset,
                 "rank_used_bytes": used,
                 "sum_used_bytes": sum(used),
+                "timing": {
+                    "requested_perf_counter_ns": requested,
+                    "lock_acquired_perf_counter_ns": acquired,
+                    "sample_window_perf_counter_ns": [started, ended],
+                    "rank_query_windows_perf_counter_ns": queries,
+                },
             })
 
 
@@ -114,6 +139,9 @@ def run_phase(
         "requests": records, "memory": {
             "idle_before": before, "idle_after": after,
             "active_window_s": [begin, end], "active_sample_count": len(active),
+            "clock_anchor": sampler.clock_anchor,
+            "rank_gpu_uuids": list(uuids),
+            "rank_sample_note": "Rank queries are sequential. The sum combines readings taken at different times.",
             "rank_peak_used_bytes": [max(sample["rank_used_bytes"][rank] for sample in active)
                                      for rank in range(len(uuids))],
             "peak_sum_used_bytes": max(sample["sum_used_bytes"] for sample in active),

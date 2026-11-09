@@ -32,13 +32,22 @@ do not overwrite its original trace or equate re-analysis with a new capture.
 Nsight Systems CLI **2026.5.1.161** is now extracted into the persistent container
 workspace. The archive passed its official repository SHA-256 and size checks;
 the executable returned its expected version under the unprivileged project UID.
-This establishes installation, **not successful GPU tracing**. A CUDA/NVTX smoke
-in the pinned MiniMax image is still required when a GPU is available.
 CPU-only NVTX collection and SQLite export subsequently passed in both the
 development container and the pinned MiniMax image with GPU visibility disabled.
 The exported database contains the intended positive-duration NVTX range in
-each case. This validates the collection/export setup only, not CUDA tracing
-or model performance. [Recorded evidence](../results/profiling/nsys-cpu-nvtx-20261109.json)
+each case. [CPU-only validation](../results/profiling/nsys-cpu-nvtx-20261109.json)
+
+CUDA and NVTX tracing also passed on an A100 with host driver `580.178.04` in
+the pinned MiniMax image `sha256:614b1509bcb729c653528d448bff9850f8977fcad9d12ba56bd6dbe3d7985e87`.
+The model-free smoke replayed the existing CUDA Graph correctly after a VMM
+remap. The SQLite export contains 15 positive-duration CUDA kernel events,
+one GPU graph trace, ten NVTX ranges, and four calls each to `cuMemCreate`,
+`cuMemMap`, `cuMemUnmap`, and `cuMemRelease`. Those APIs appear in
+`CUPTI_ACTIVITY_KIND_RUNTIME` in this export. Their durations measure CPU API
+calls. The roughly 206 ms `vmm_handoff/map` NVTX region includes cold-start and
+profiler overhead, so it cannot estimate typical map cost. Full-model tracing
+remains pending in the new r7 workflow. This smoke validates compatibility
+for model-free capture only. [GPU validation](../results/profiling/nsys-vmm-gpu-20261109.json)
 
 The development environment is Torch 2.8.0+cu128, but the pinned MiniMax image
 contains Torch 2.15.0.dev20261005+cu134. The profiler version was selected for the
@@ -89,11 +98,9 @@ CUDA_VISIBLE_DEVICES="$GPU_UUID" \
 
 The observed host has `perf_event_paranoid=4`, and the unprivileged container's
 environment check reports that CPU sampling is unavailable. No host security
-setting was changed. Start with CUDA/NVTX tracing and CPU sampling disabled;
+setting was changed. The GPU smoke used CUDA/NVTX tracing with CPU sampling disabled.
 [NVIDIA documents that tracing can remain available when the CPU sampling check fails](https://docs.nvidia.com/nsight-systems/InstallationGuide/#optional-setting-up-the-cli).
 Keep Nsight collection separate from both the Torch profiler and formal timing.
-The current host driver is 580.178.04; CUDA 13.4 tracing compatibility must be
-verified against the user-mode driver actually loaded by the pinned image.
 Nsight Compute remains uninstalled: the current CUDA 13.4-era release lists a
 newer Linux driver requirement than this host, so it is not yet a validated
 diagnostic option here. [Nsight Compute requirements](https://developer.nvidia.com/tools-overview/nsight-compute/get-started-2026_3)

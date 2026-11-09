@@ -1,0 +1,524 @@
+{
+  "schema_version": 1,
+  "status": "passed",
+  "scope": "model-free CUDA VMM and CUDA Graph with external Nsight Systems; no serving performance claim",
+  "generated_utc": "2026-11-09T10:41:23.749079+00:00",
+  "nsys_version": "2026.5.1.161",
+  "image_id": "sha256:614b1509bcb729c653528d448bff9850f8977fcad9d12ba56bd6dbe3d7985e87",
+  "functional_result": {
+    "status": "passed",
+    "scope": "model-free CUDA VMM and CUDA Graph smoke",
+    "profiler_backend": "nvtx",
+    "gpu": {
+      "uuid": "GPU-21a1ae2e-55e9-4d4b-e3fc-b9692613582a",
+      "name": "NVIDIA A100-SXM4-80GB",
+      "capability": [
+        8,
+        0
+      ]
+    },
+    "torch_version": "2.15.0.dev20261005+cu134",
+    "torch_cuda_version": "13.4",
+    "started_unix_seconds": 1794220570.685272,
+    "chunk_bytes": 16777216,
+    "reserved_bytes": 67108864,
+    "source_sha256": {
+      "/experiment/scripts/profile_vmm_handoff.py": "a09a105ae80ab2cbda907c6c2bd2d92d8f0eaa133d61e903a7d2155ffc32c7b2",
+      "/experiment/elastic_kv/backing.py": "ca6cef6d086192bea20bb56dfb1effacf629534cad3e24230174d113aacde661",
+      "/experiment/native/elastic_vmm.cpp": "129253b5a4f389188bcebf8ac82341398df6e465227da4a8f133e616eb971e20",
+      "/experiment/native/libelastic_vmm.so": "b378bb4b92d93503490e0e695c5115e951764bf0095dc402c61049537fa157c3"
+    },
+    "states": [
+      {
+        "label": "reserved",
+        "mapped_chunks": [],
+        "backed_bytes": 0
+      },
+      {
+        "label": "mapped",
+        "mapped_chunks": [
+          0,
+          1
+        ],
+        "backed_bytes": 33554432
+      },
+      {
+        "label": "grown",
+        "mapped_chunks": [
+          0,
+          1,
+          2
+        ],
+        "backed_bytes": 50331648
+      },
+      {
+        "label": "dropped",
+        "mapped_chunks": [
+          0,
+          2
+        ],
+        "backed_bytes": 33554432
+      },
+      {
+        "label": "remapped",
+        "mapped_chunks": [
+          0,
+          1,
+          2
+        ],
+        "backed_bytes": 50331648
+      },
+      {
+        "label": "replayed",
+        "mapped_chunks": [
+          0,
+          1,
+          2
+        ],
+        "backed_bytes": 50331648
+      }
+    ],
+    "backing_metrics": {
+      "ensure_calls": 3,
+      "ensure_chunks": 4,
+      "ensure_ns": 1362636,
+      "precommit_calls": 0,
+      "precommit_chunks": 0,
+      "precommit_ns": 0,
+      "reclaim_calls": 1,
+      "reclaim_chunks": 1,
+      "reclaim_ns": 207832,
+      "reclaim_sync_ns": 27445,
+      "peak_backed_bytes": 50331648,
+      "global_broker_reservations": 0,
+      "global_broker_denials": 0,
+      "global_broker_retries": 0,
+      "global_broker_wait_ns": 0,
+      "global_broker_released_chunks": 0,
+      "global_broker_claim_checks": 0,
+      "global_broker_claim_denials": 0,
+      "global_broker_claim_retries": 0,
+      "global_broker_claim_wait_ns": 0,
+      "global_broker_claim_releases": 0,
+      "global_broker_claim_shrinks": 0,
+      "global_broker_claim_shrunk_bytes": 0,
+      "global_broker_peak_claim_bytes": 0,
+      "backed_bytes": 50331648,
+      "reserved_bytes": 67108864
+    },
+    "profile_regions": {
+      "reserve": {
+        "count": 1,
+        "host_elapsed_ns": [
+          569044
+        ]
+      },
+      "map": {
+        "count": 1,
+        "host_elapsed_ns": [
+          206448338
+        ]
+      },
+      "grow": {
+        "count": 1,
+        "host_elapsed_ns": [
+          961255
+        ]
+      },
+      "graph_capture": {
+        "count": 1,
+        "host_elapsed_ns": [
+          2404399
+        ]
+      },
+      "drop": {
+        "count": 1,
+        "host_elapsed_ns": [
+          229081
+        ]
+      },
+      "verify_retained_after_drop": {
+        "count": 1,
+        "host_elapsed_ns": [
+          36092133
+        ]
+      },
+      "remap": {
+        "count": 1,
+        "host_elapsed_ns": [
+          332213
+        ]
+      },
+      "graph_replay": {
+        "count": 1,
+        "host_elapsed_ns": [
+          88506
+        ]
+      },
+      "verify_after_replay": {
+        "count": 1,
+        "host_elapsed_ns": [
+          1280895
+        ]
+      },
+      "release": {
+        "count": 1,
+        "host_elapsed_ns": [
+          663354
+        ]
+      }
+    },
+    "external_trace_verified": false
+  },
+  "kernel_count": 15,
+  "kernel_duration_sum_ns": 313281,
+  "gpu_graph_trace_count": 1,
+  "gpu_graph_trace_duration_sum_ns": 4512,
+  "cuda_api_cpu_durations": {
+    "cuCtxSynchronize": {
+      "count": 1,
+      "total_cpu_ns": 5971,
+      "max_cpu_ns": 5971
+    },
+    "cuGetProcAddress_v2": {
+      "count": 474,
+      "total_cpu_ns": 182946,
+      "max_cpu_ns": 62613
+    },
+    "cuInit": {
+      "count": 2,
+      "total_cpu_ns": 7630,
+      "max_cpu_ns": 5721
+    },
+    "cuKernelGetName": {
+      "count": 16,
+      "total_cpu_ns": 5532,
+      "max_cpu_ns": 697
+    },
+    "cuLibraryGetKernel": {
+      "count": 5,
+      "total_cpu_ns": 76869,
+      "max_cpu_ns": 72462
+    },
+    "cuLibraryLoadData": {
+      "count": 4,
+      "total_cpu_ns": 39793095,
+      "max_cpu_ns": 13274481
+    },
+    "cuLogsRegisterCallback": {
+      "count": 1,
+      "total_cpu_ns": 11558,
+      "max_cpu_ns": 11558
+    },
+    "cuLogsUnregisterCallback": {
+      "count": 1,
+      "total_cpu_ns": 3004,
+      "max_cpu_ns": 3004
+    },
+    "cuMemAddressFree": {
+      "count": 1,
+      "total_cpu_ns": 10570,
+      "max_cpu_ns": 10570
+    },
+    "cuMemAddressReserve": {
+      "count": 1,
+      "total_cpu_ns": 11424,
+      "max_cpu_ns": 11424
+    },
+    "cuMemCreate": {
+      "count": 4,
+      "total_cpu_ns": 123841,
+      "max_cpu_ns": 43902
+    },
+    "cuMemGetAllocationGranularity": {
+      "count": 1,
+      "total_cpu_ns": 642,
+      "max_cpu_ns": 642
+    },
+    "cuMemMap": {
+      "count": 4,
+      "total_cpu_ns": 15712,
+      "max_cpu_ns": 4452
+    },
+    "cuMemRelease": {
+      "count": 4,
+      "total_cpu_ns": 174642,
+      "max_cpu_ns": 52757
+    },
+    "cuMemSetAccess": {
+      "count": 3,
+      "total_cpu_ns": 954642,
+      "max_cpu_ns": 729029
+    },
+    "cuMemUnmap": {
+      "count": 4,
+      "total_cpu_ns": 243592,
+      "max_cpu_ns": 80815
+    },
+    "cuMemsetD8Async": {
+      "count": 3,
+      "total_cpu_ns": 65620,
+      "max_cpu_ns": 30352
+    },
+    "cuModuleGetLoadingMode": {
+      "count": 2,
+      "total_cpu_ns": 5123,
+      "max_cpu_ns": 4785
+    },
+    "cuStreamCreate": {
+      "count": 1,
+      "total_cpu_ns": 9966,
+      "max_cpu_ns": 9966
+    },
+    "cuStreamDestroy_v2": {
+      "count": 1,
+      "total_cpu_ns": 5166,
+      "max_cpu_ns": 5166
+    },
+    "cuStreamSynchronize": {
+      "count": 3,
+      "total_cpu_ns": 54994,
+      "max_cpu_ns": 21745
+    },
+    "cudaDeviceSynchronize_v3020": {
+      "count": 8,
+      "total_cpu_ns": 90563,
+      "max_cpu_ns": 18138
+    },
+    "cudaEventCreateWithFlags_v3020": {
+      "count": 2,
+      "total_cpu_ns": 5816,
+      "max_cpu_ns": 3520
+    },
+    "cudaEventDestroy_v3020": {
+      "count": 2,
+      "total_cpu_ns": 3617,
+      "max_cpu_ns": 2024
+    },
+    "cudaEventRecordWithFlags_v11010": {
+      "count": 2,
+      "total_cpu_ns": 12946,
+      "max_cpu_ns": 6782
+    },
+    "cudaGetDeviceProperties_v12000": {
+      "count": 2,
+      "total_cpu_ns": 1209,
+      "max_cpu_ns": 746
+    },
+    "cudaGetDriverEntryPointByVersion_v12050": {
+      "count": 35,
+      "total_cpu_ns": 26573,
+      "max_cpu_ns": 3565
+    },
+    "cudaGraphDestroy_v10000": {
+      "count": 1,
+      "total_cpu_ns": 3458,
+      "max_cpu_ns": 3458
+    },
+    "cudaGraphExecDestroy_v10000": {
+      "count": 1,
+      "total_cpu_ns": 21044,
+      "max_cpu_ns": 21044
+    },
+    "cudaGraphGetNodes_v10000": {
+      "count": 1,
+      "total_cpu_ns": 1560,
+      "max_cpu_ns": 1560
+    },
+    "cudaGraphInstantiateWithFlags_v11040": {
+      "count": 1,
+      "total_cpu_ns": 57617,
+      "max_cpu_ns": 57617
+    },
+    "cudaGraphLaunch_v10000": {
+      "count": 1,
+      "total_cpu_ns": 45116,
+      "max_cpu_ns": 45116
+    },
+    "cudaHostAlloc_v3020": {
+      "count": 1,
+      "total_cpu_ns": 958653,
+      "max_cpu_ns": 958653
+    },
+    "cudaLaunchKernel_v7000": {
+      "count": 16,
+      "total_cpu_ns": 21642878,
+      "max_cpu_ns": 8004035
+    },
+    "cudaMalloc_v3020": {
+      "count": 2,
+      "total_cpu_ns": 563103,
+      "max_cpu_ns": 423242
+    },
+    "cudaMemcpyAsync_v3020": {
+      "count": 8,
+      "total_cpu_ns": 90455,
+      "max_cpu_ns": 20854
+    },
+    "cudaMemsetAsync_v3020": {
+      "count": 5,
+      "total_cpu_ns": 37016,
+      "max_cpu_ns": 13087
+    },
+    "cudaStreamBeginCapture_v10000": {
+      "count": 1,
+      "total_cpu_ns": 18021,
+      "max_cpu_ns": 18021
+    },
+    "cudaStreamCreateWithPriority_v5050": {
+      "count": 128,
+      "total_cpu_ns": 4678100,
+      "max_cpu_ns": 1004987
+    },
+    "cudaStreamEndCapture_v10000": {
+      "count": 1,
+      "total_cpu_ns": 2235,
+      "max_cpu_ns": 2235
+    },
+    "cudaStreamGetCaptureInfo_v12030": {
+      "count": 1,
+      "total_cpu_ns": 1446,
+      "max_cpu_ns": 1446
+    },
+    "cudaStreamIsCapturing_v10000": {
+      "count": 8,
+      "total_cpu_ns": 9065,
+      "max_cpu_ns": 2301
+    },
+    "cudaStreamSynchronize_v3020": {
+      "count": 8,
+      "total_cpu_ns": 165625,
+      "max_cpu_ns": 37811
+    },
+    "cudaStreamWaitEvent_v3020": {
+      "count": 2,
+      "total_cpu_ns": 7905,
+      "max_cpu_ns": 3979
+    }
+  },
+  "nvtx_regions": [
+    {
+      "name": "vmm_handoff/reserve",
+      "start_ns": 4293230040,
+      "end_ns": 4293708045,
+      "duration_ns": 478005,
+      "vmm_api_counts": {
+        "cuMemAddressReserve": 1,
+        "cuMemGetAllocationGranularity": 1
+      }
+    },
+    {
+      "name": "vmm_handoff/map",
+      "start_ns": 4293746822,
+      "end_ns": 4500176153,
+      "duration_ns": 206429331,
+      "vmm_api_counts": {
+        "cuMemCreate": 2,
+        "cuMemMap": 2,
+        "cuMemSetAccess": 1,
+        "cuMemsetD8Async": 1
+      }
+    },
+    {
+      "name": "vmm_handoff/grow",
+      "start_ns": 4500226494,
+      "end_ns": 4501178121,
+      "duration_ns": 951627,
+      "vmm_api_counts": {
+        "cuMemCreate": 1,
+        "cuMemMap": 1,
+        "cuMemSetAccess": 1,
+        "cuMemsetD8Async": 1
+      }
+    },
+    {
+      "name": "vmm_handoff/graph_capture",
+      "start_ns": 4531659662,
+      "end_ns": 4534043849,
+      "duration_ns": 2384187,
+      "vmm_api_counts": {}
+    },
+    {
+      "name": "vmm_handoff/drop",
+      "start_ns": 4534066334,
+      "end_ns": 4534287487,
+      "duration_ns": 221153,
+      "vmm_api_counts": {
+        "cuMemRelease": 1,
+        "cuMemUnmap": 1
+      }
+    },
+    {
+      "name": "vmm_handoff/verify_retained_after_drop",
+      "start_ns": 4534314851,
+      "end_ns": 4570382911,
+      "duration_ns": 36068060,
+      "vmm_api_counts": {}
+    },
+    {
+      "name": "vmm_handoff/remap",
+      "start_ns": 4570421074,
+      "end_ns": 4570741692,
+      "duration_ns": 320618,
+      "vmm_api_counts": {
+        "cuMemCreate": 1,
+        "cuMemMap": 1,
+        "cuMemSetAccess": 1,
+        "cuMemsetD8Async": 1
+      }
+    },
+    {
+      "name": "vmm_handoff/graph_replay",
+      "start_ns": 4570779787,
+      "end_ns": 4570862314,
+      "duration_ns": 82527,
+      "vmm_api_counts": {}
+    },
+    {
+      "name": "vmm_handoff/verify_after_replay",
+      "start_ns": 4570869081,
+      "end_ns": 4572141866,
+      "duration_ns": 1272785,
+      "vmm_api_counts": {}
+    },
+    {
+      "name": "vmm_handoff/release",
+      "start_ns": 4572187108,
+      "end_ns": 4572841834,
+      "duration_ns": 654726,
+      "vmm_api_counts": {
+        "cuMemAddressFree": 1,
+        "cuMemRelease": 3,
+        "cuMemUnmap": 3
+      }
+    }
+  ],
+  "raw_artifacts": {
+    "vmm-handoff.nsys-rep": {
+      "bytes": 80035,
+      "sha256": "244a48366f1e2ca2b650db8fbab729447d5cd445ec6cbfe51562bb4c900b61eb"
+    },
+    "vmm-handoff.sqlite": {
+      "bytes": 376832,
+      "sha256": "c71f28b5bc5b7d11062512072ae0bae3d91f15d4ab9c78f937740ac792d8876a"
+    },
+    "check/result.json": {
+      "bytes": 3565,
+      "sha256": "6af08e84290c456bde170ec9af1c6fe0f2585d48132884d2cf16a5e867a38273"
+    },
+    "command.json": {
+      "bytes": 1297,
+      "sha256": "bd04970c394c7e5b2b9f26c422b32b95fc474844b76b3d566466c87d0bc0e1e8"
+    },
+    "launch.log": {
+      "bytes": 17587,
+      "sha256": "32db8814603ab8656b8765636e0cb977fd0615185443637e5ca44f763ce91b8a"
+    }
+  },
+  "notes": [
+    "CUDA Driver APIs are in the export table named CUPTI_ACTIVITY_KIND_RUNTIME for this Nsight version.",
+    "CPU API duration, GPU duration and synchronized NVTX region wall time are different quantities.",
+    "One diagnostic capture contains cold initialization and profiler overhead; do not infer production throughput or typical mapping latency.",
+    "Original functional_result.external_trace_verified remains false; this independent SQLite audit establishes external tracing."
+  ]
+}
