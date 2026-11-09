@@ -116,3 +116,18 @@ request-private chunk 增长与释放、池尾 chunk、`FreeSlots` 守恒、phys
 GPU0/1/3 在容器退出后为 2 MiB / 0%，GPU2 仍为 `Unknown Error`，宿主 CUDA
 runtime 也未恢复。因此本轮不报告 serving 吞吐、TTFT、TPOT、整卡显存或 mapping
 延迟收益。
+
+## 2026-11-09 measured batch cohort 复核
+
+提交 `3c1920b7a371862bb670d84d5f8f27402de24d30` 新增了按实测 prefill/decode
+profile 形成已知未来 cohort 的 `batched` 策略、联合 resident/HiSparse placement、
+deadline guard，以及执行器的 cohort 元数据校验。在 5090 宿主机使用既有
+`lmsysorg/sglang:latest`（SGLang 0.5.17）镜像，以 `--network none`、不授予 GPU、
+源码只读挂载运行完整测试，结果为 **487 passed, 2 skipped, 157 subtests passed**。
+两个 skip 都需要真实 CUDA。日志 SHA256 为
+`8cb3f3920df1e23b3cbeab5e41d530e9078629b2f45f899129577f15cd3a708a`。
+
+这轮证明新控制面能在 SGLang 0.5.17 源码环境中导入、序列化并通过现有接入回归；
+它没有证明 GPU 上实际形成了目标 cohort，也没有产生 TTFT、TPOT、吞吐或显存收益。
+GPU0/1/3 当时整卡为 2 MiB、0%，GPU2 仍为 NVML `Unknown Error`，宿主 CUDA
+runtime 尚未恢复，因此真实 paired serving 继续留给可用加速器窗口。

@@ -1,0 +1,23 @@
+{
+  "commit": "3c1920b7a371862bb670d84d5f8f27402de24d30",
+  "image": "lmsysorg/sglang:latest",
+  "sglang_version": "0.5.17",
+  "network": "none",
+  "gpu_attached": false,
+  "source_mount": "read-only",
+  "tests": {
+    "passed": 487,
+    "skipped": 2,
+    "failed": 0,
+    "subtests_passed": 157
+  },
+  "log_sha256": "8cb3f3920df1e23b3cbeab5e41d530e9078629b2f45f899129577f15cd3a708a",
+  "claim": "SGLang 0.5.17 source/API compatibility and CPU policy validation only",
+  "not_measured": [
+    "actual serving cohort formation",
+    "TTFT",
+    "TPOT",
+    "throughput",
+    "GPU memory savings"
+  ]
+}
