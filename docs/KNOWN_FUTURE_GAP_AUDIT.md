@@ -141,6 +141,12 @@ Scheduler wrapper
 - 新增 `online` 策略：每个当前动作都通过一次有界 `future` rollout 评估，只
   承诺首动作；三点模式选择回归从 `future` 的 67.142857 ms 加权完成时间收敛到
   oracle 的 64.571429 ms，rollout 预算耗尽时回退 `future`。
+- 服务时间反馈现在按实际 `resident` / `host_backed` 模式维护 decode EWMA，并
+  让已成熟的实测值覆盖计划中的静态速率；某一模式没有样本时继续使用该模式
+  在 hint 或 kind profile 中的估计。回归覆盖模式隔离、运行中改降级后的速率
+  选择、期限排序以及实测值覆盖静态 hint。SGLang 0.5.17 隔离容器完整回归为
+  **464 passed, 2 skipped, 146 subtests passed**；2 个 skip 仍是需要真实 CUDA
+  device 的用例。
 - CUDA hit/miss 和同 trace serving A/B 仍未运行；本审计只
   确认代码契约、CPU 策略与资源记账，不把 CPU 证据外推成真实服务收益或正确性
   结论。

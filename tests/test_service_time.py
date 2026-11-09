@@ -122,6 +122,51 @@ class ServiceTimeEstimatorTest(unittest.TestCase):
         self.assertEqual(snapshot.clipped_prefill_samples, 1)
         self.assertEqual(snapshot.clipped_decode_samples, 1)
 
+    def test_decode_feedback_is_separated_by_residency_mode(self):
+        estimator = ServiceTimeEstimator(alpha=1.0, min_samples=1)
+
+        resident = estimator.observe(
+            prompt_tokens=100,
+            output_tokens=10,
+            ttft_s=0.02,
+            tpot_s=0.001,
+            residence="resident",
+        )
+
+        self.assertEqual(resident.resident_decode_tokens_per_s, 1_000.0)
+        self.assertIsNone(resident.host_backed_decode_tokens_per_s)
+        self.assertEqual(
+            estimator.rates(residence="resident")["decode_tokens_per_s"],
+            1_000.0,
+        )
+        self.assertNotIn(
+            "decode_tokens_per_s", estimator.rates(residence="host_backed")
+        )
+
+        estimator.observe(
+            prompt_tokens=100,
+            output_tokens=10,
+            ttft_s=0.02,
+            tpot_s=0.004,
+            residence="host_backed",
+        )
+
+        self.assertEqual(
+            estimator.rates(residence="resident")["decode_tokens_per_s"],
+            1_000.0,
+        )
+        self.assertEqual(
+            estimator.rates(residence="host_backed")["decode_tokens_per_s"],
+            250.0,
+        )
+        snapshot = estimator.snapshot()
+        self.assertEqual(snapshot.resident_decode_samples, 1)
+        self.assertEqual(snapshot.host_backed_decode_samples, 1)
+        self.assertEqual(
+            snapshot.as_dict()["decode_tokens_per_s_by_residence"],
+            {"resident": 1_000.0, "host_backed": 250.0},
+        )
+
     def test_rejects_invalid_sample_without_changing_rates(self):
         estimator = ServiceTimeEstimator()
 
@@ -136,6 +181,9 @@ class ServiceTimeEstimatorTest(unittest.TestCase):
 
         estimator.record_rejected_sample()
         self.assertEqual(estimator.snapshot().rejected_samples, 1)
+
+        with self.assertRaisesRegex(ValueError, "residence"):
+            estimator.rates(residence="auto")
 
     def test_seed_values_are_validated_and_transformable_to_hint_fields(self):
         estimator = ServiceTimeEstimator(

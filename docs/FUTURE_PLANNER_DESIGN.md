@@ -216,7 +216,11 @@ EWMA、样本门槛、样本数、截断数和拒绝数。该反馈默认关闭�
 in-flight 请求被回收后，为后续派发请求附带最新速率。
 每个结果行同时记录 `service_time_prefill_tokens_per_s_hint` 与
 `service_time_decode_tokens_per_s_hint`，从而可以核对某个请求实际收到的是
-冷启动默认值还是某次 EWMA 快照。
+冷启动默认值还是某次 EWMA 快照。decode 反馈进一步按 `resident` 与
+`host_backed` 分开维护；结果行记录 `service_time_decode_feedback_residence`，
+摘要同时输出两组的 EWMA 和样本数。某一模式尚未达到样本门槛时，不拿另一模式
+的混合速率覆盖规划器给出的模式相关静态值，避免“完整驻留请求被降级成 HiSparse
+后，仍用 resident 速率估算热集持续时间”这种系统性低估。
 
 达到样本门槛后，实测速率不仅参与队列排序，也进入 VMM 准入和请求级
 resident/HiSparse 决策。当前请求和 lookahead 内未来请求都按

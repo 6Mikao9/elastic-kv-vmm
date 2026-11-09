@@ -16,6 +16,7 @@ DEFAULT_DECODE_TOKENS_PER_S = 20_000.0
 DEFAULT_MIN_SAMPLES = 3
 MIN_SERVICE_RATE = 1e-3
 MAX_SERVICE_RATE = 1e9
+RESIDENCE_MODES = ("resident", "host_backed")
 
 
 def estimate_service_duration_ms(
@@ -78,6 +79,10 @@ class ServiceTimeSnapshot:
     rejected_samples: int
     alpha: float
     min_samples: int
+    resident_decode_tokens_per_s: float | None
+    host_backed_decode_tokens_per_s: float | None
+    resident_decode_samples: int
+    host_backed_decode_samples: int
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -90,6 +95,14 @@ class ServiceTimeSnapshot:
             "rejected_samples": self.rejected_samples,
             "alpha": self.alpha,
             "min_samples": self.min_samples,
+            "decode_tokens_per_s_by_residence": {
+                "resident": self.resident_decode_tokens_per_s,
+                "host_backed": self.host_backed_decode_tokens_per_s,
+            },
+            "decode_samples_by_residence": {
+                "resident": self.resident_decode_samples,
+                "host_backed": self.host_backed_decode_samples,
+            },
         }
 
 
@@ -97,7 +110,12 @@ class ServiceTimeEstimator:
     """Maintain separate EWMA rates for prefill and decode service time.
 
     A measured rate is emitted only after ``min_samples`` valid completions.
-    Until then callers should retain their existing conservative defaults.
+    Decode feedback is also tracked separately for full-GPU residency and the
+    native HiSparse/host-backed path.  A mixed overall decode estimate is not a
+    safe forecast after a request changes placement because sparse gathers can
+    have a different service rate.  Callers that know the requested placement
+    use ``rates(residence=...)``; until that placement has enough samples they
+    retain the planner's placement-specific rate.
     Samples below ``MIN_SERVICE_RATE`` or above ``MAX_SERVICE_RATE`` are clipped
     and counted so malformed or pathological timings cannot dominate the
     estimate.
@@ -137,6 +155,10 @@ class ServiceTimeEstimator:
         self._clipped_prefill_samples = 0
         self._clipped_decode_samples = 0
         self._rejected_samples = 0
+        self._decode_by_residence = {mode: None for mode in RESIDENCE_MODES}
+        self._decode_samples_by_residence = {
+            mode: 0 for mode in RESIDENCE_MODES
+        }
         self._lock = threading.Lock()
 
     @staticmethod
@@ -152,8 +174,9 @@ class ServiceTimeEstimator:
         output_tokens: int,
         ttft_s: float,
         tpot_s: float,
+        residence: str | None = None,
     ) -> ServiceTimeSnapshot:
-        """Update both directions from one successful completion."""
+        """Update service rate, optionally separating the decode placement."""
 
         for name, value in (
             ("prompt_tokens", prompt_tokens),
@@ -169,12 +192,21 @@ class ServiceTimeEstimator:
                 or value <= 0
             ):
                 raise ValueError(f"{name} must be finite and positive")
+        if residence is not None and residence not in RESIDENCE_MODES:
+            raise ValueError("residence must be resident or host_backed")
 
         prefill_sample, prefill_clipped = _clip_rate(prompt_tokens / float(ttft_s))
         decode_sample, decode_clipped = _clip_rate(1.0 / float(tpot_s))
         with self._lock:
             self._prefill = _ewma(self._prefill, prefill_sample, self._alpha)
             self._decode = _ewma(self._decode, decode_sample, self._alpha)
+            if residence is not None:
+                self._decode_by_residence[residence] = _ewma(
+                    self._decode_by_residence[residence],
+                    decode_sample,
+                    self._alpha,
+                )
+                self._decode_samples_by_residence[residence] += 1
             self._prefill_samples += 1
             self._decode_samples += 1
             self._clipped_prefill_samples += int(prefill_clipped)
@@ -187,19 +219,30 @@ class ServiceTimeEstimator:
         with self._lock:
             self._rejected_samples += 1
 
-    def rates(self) -> dict[str, float]:
-        """Return ready feedback fields without leaking an immature EWMA."""
+    def rates(self, *, residence: str | None = None) -> dict[str, float]:
+        """Return ready feedback without leaking an immature or cross-mode EWMA."""
 
+        if residence is not None and residence not in RESIDENCE_MODES:
+            raise ValueError("residence must be resident or host_backed")
         with self._lock:
             result: dict[str, float] = {}
             if self._prefill is not None and (
                 self._prefill_seeded or self._prefill_samples >= self._min_samples
             ):
                 result["prefill_tokens_per_s"] = self._prefill
-            if self._decode is not None and (
-                self._decode_seeded or self._decode_samples >= self._min_samples
-            ):
-                result["decode_tokens_per_s"] = self._decode
+            if residence is None:
+                if self._decode is not None and (
+                    self._decode_seeded
+                    or self._decode_samples >= self._min_samples
+                ):
+                    result["decode_tokens_per_s"] = self._decode
+            else:
+                decode = self._decode_by_residence[residence]
+                if decode is not None and (
+                    self._decode_samples_by_residence[residence]
+                    >= self._min_samples
+                ):
+                    result["decode_tokens_per_s"] = decode
             return result
 
     def snapshot(self) -> ServiceTimeSnapshot:
@@ -217,6 +260,14 @@ class ServiceTimeEstimator:
             rejected_samples=self._rejected_samples,
             alpha=self._alpha,
             min_samples=self._min_samples,
+            resident_decode_tokens_per_s=self._decode_by_residence["resident"],
+            host_backed_decode_tokens_per_s=self._decode_by_residence[
+                "host_backed"
+            ],
+            resident_decode_samples=self._decode_samples_by_residence["resident"],
+            host_backed_decode_samples=self._decode_samples_by_residence[
+                "host_backed"
+            ],
         )
 
 

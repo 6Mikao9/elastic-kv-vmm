@@ -142,6 +142,14 @@ deadline ordering, static residency and live elastic residency using the same
 requests and report capacity delay, demotions, deadline misses, TTFT/TPOT and
 whole-device memory separately.
 
+Closed-loop service-time feedback now separates decode observations by the
+request's actual `resident` or `host_backed` placement. Runtime demotion no
+longer leaves a host-backed request carrying a resident-only EWMA, and an
+immature mode falls back to the planner's placement-specific rate instead of a
+mixed estimate. Per-request evidence records which feedback placement was used,
+while the summary exports both mode-specific rates and sample counts. This is a
+CPU-validated policy correction; real serving validation remains required.
+
 Future-aware admission now reserves interval peaks instead of summing every item
 inside the horizon, skips deadline protection when positive post-current slack
 remains, and recomputes service duration for backlogged requests. TP prefill-plan

@@ -226,21 +226,23 @@ def _predicted_duration_ms(
         output_tokens=submission.output_tokens,
         fallback_ms=fallback_ms,
         prefill_tokens_per_s=(
-            hint.prefill_tokens_per_s
-            if hint.prefill_tokens_per_s is not None
+            prefill_tokens_per_s
+            if prefill_tokens_per_s is not None
             else (
-                config.prefill_rate_tokens_per_s(submission.kind)
-                or prefill_tokens_per_s
+                hint.prefill_tokens_per_s
+                if hint.prefill_tokens_per_s is not None
+                else config.prefill_rate_tokens_per_s(submission.kind)
             )
         ),
         decode_tokens_per_s=(
-            hint.decode_tokens_per_s
-            if hint.decode_tokens_per_s is not None
+            decode_tokens_per_s
+            if decode_tokens_per_s is not None
             else (
-                config.decode_rate_tokens_per_s(
+                hint.decode_tokens_per_s
+                if hint.decode_tokens_per_s is not None
+                else config.decode_rate_tokens_per_s(
                     submission.kind, residence
                 )
-                or decode_tokens_per_s
             )
         ),
     )

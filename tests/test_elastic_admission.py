@@ -662,7 +662,7 @@ class ElasticAdmissionTest(unittest.TestCase):
         )
         self.assertEqual(sparse.sparse_bytes, 100)
 
-    def test_kind_profile_feeds_duration_after_hint_and_before_global_rate(self):
+    def test_measured_rate_overrides_hint_and_kind_profile_for_duration(self):
         config = ElasticKVConfig(
             memory_budget_bytes=10_000,
             kv_bytes_per_token=2,
@@ -682,8 +682,6 @@ class ElasticAdmissionTest(unittest.TestCase):
             request,
             active_bytes=0,
             config=config,
-            prefill_tokens_per_s=100_000,
-            decode_tokens_per_s=100_000,
         )
         explicit = submission(
             "explicit",
@@ -697,10 +695,18 @@ class ElasticAdmissionTest(unittest.TestCase):
         hint_decision = decide_elastic_admission(
             explicit, active_bytes=0, config=config
         )
+        measured_decision = decide_elastic_admission(
+            explicit,
+            active_bytes=0,
+            config=config,
+            prefill_tokens_per_s=100_000,
+            decode_tokens_per_s=100_000,
+        )
 
         self.assertEqual(profile_decision.service_time_current_duration_ms, 150)
         self.assertTrue(profile_decision.service_time_feedback_applied)
         self.assertEqual(hint_decision.service_time_current_duration_ms, 15)
+        self.assertEqual(measured_decision.service_time_current_duration_ms, 2.0)
 
     def test_kind_profiles_survive_live_planner_projection(self):
         planner = PlannerConfig(

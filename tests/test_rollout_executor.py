@@ -186,6 +186,77 @@ class RolloutExecutorTest(unittest.TestCase):
             4_000.0,
         )
 
+    def test_measured_decode_rates_follow_the_runtime_residency_mode(self):
+        tpot_by_id = {
+            "a-resident": 0.001,
+            "b-host": 0.004,
+            "c-resident": 0.001,
+            "d-host": 0.004,
+        }
+        submissions = [
+            RolloutSubmission(
+                request_id=request_id,
+                planned_arrival_ms=0,
+                submit_at_ms=0,
+                estimated_finish_ms=100,
+                kind="tool",
+                prompt_tokens=32,
+                output_tokens=8,
+                hint={
+                    "release_after_ms": 0,
+                    "expected_output_tokens": 8,
+                    "weight": 1.0,
+                    "kind": "tool",
+                    "residence": residence,
+                },
+            )
+            for request_id, residence in (
+                ("a-resident", "resident"),
+                ("b-host", "host_backed"),
+                ("c-resident", "resident"),
+                ("d-host", "host_backed"),
+            )
+        ]
+        seen = {}
+
+        def generate(url, spec, timeout, stream):
+            request_id = spec["request_id"]
+            seen[request_id] = spec["future_hint"]
+            return {
+                "_started_perf_s": time.perf_counter(),
+                "end_to_end_s": 0.01,
+                "output_tokens": 8,
+                "ttft_s": 0.008,
+                "tpot_s": tpot_by_id[request_id],
+            }
+
+        result = execute_rollout(
+            "http://server/generate",
+            submissions,
+            generator=generate,
+            max_inflight=1,
+            poll_interval_ms=1,
+            max_submit_lateness_ms=10_000,
+            clock=FakeClock(),
+            service_time_estimator=ServiceTimeEstimator(
+                alpha=1.0,
+                min_samples=1,
+            ),
+        )
+
+        def payload(request_id):
+            return seen[request_id]["actions"][0]["payload"]
+
+        self.assertNotIn("decode_tokens_per_s", payload("a-resident"))
+        self.assertNotIn("decode_tokens_per_s", payload("b-host"))
+        self.assertEqual(payload("c-resident")["decode_tokens_per_s"], 1_000.0)
+        self.assertEqual(payload("d-host")["decode_tokens_per_s"], 250.0)
+        telemetry = result["summary"]["service_time_estimator"]
+        self.assertEqual(
+            telemetry["decode_samples_by_residence"],
+            {"resident": 2, "host_backed": 2},
+        )
+
     def test_runtime_budget_demotes_only_the_new_request(self):
         base = submission()
         first = RolloutSubmission(
@@ -544,6 +615,72 @@ class RolloutExecutorTest(unittest.TestCase):
         )
 
         self.assertEqual(seen, ["z-long", "a-short"])
+
+    def test_measured_mode_rate_overrides_static_hint_for_deadline_order(self):
+        def timed(request_id, residence):
+            return RolloutSubmission(
+                request_id=request_id,
+                planned_arrival_ms=0,
+                submit_at_ms=0,
+                estimated_finish_ms=100,
+                kind="tool",
+                prompt_tokens=100,
+                output_tokens=100,
+                hint={
+                    "release_after_ms": 0,
+                    "deadline_after_ms": 5_000,
+                    "expected_output_tokens": 100,
+                    "weight": 1.0,
+                    "kind": "tool",
+                    "residence": residence,
+                    "prefill_tokens_per_s": 10_000.0,
+                    "decode_tokens_per_s": 10_000.0,
+                },
+                deadline_ms=5_000,
+            )
+
+        estimator = ServiceTimeEstimator(alpha=1.0, min_samples=1)
+        estimator.observe(
+            prompt_tokens=100,
+            output_tokens=100,
+            ttft_s=0.01,
+            tpot_s=0.1,
+            residence="resident",
+        )
+        estimator.observe(
+            prompt_tokens=100,
+            output_tokens=100,
+            ttft_s=0.01,
+            tpot_s=0.001,
+            residence="host_backed",
+        )
+        seen = []
+
+        def generate(url, spec, timeout, stream):
+            seen.append(spec["request_id"])
+            return {
+                "_started_perf_s": time.perf_counter(),
+                "end_to_end_s": 0.001,
+                "output_tokens": 100,
+                "ttft_s": 0.01,
+                "tpot_s": 0.001,
+            }
+
+        execute_rollout(
+            "http://server/generate",
+            [
+                timed("a-host", "host_backed"),
+                timed("z-resident", "resident"),
+            ],
+            generator=generate,
+            max_inflight=1,
+            queue_policy="deadline",
+            poll_interval_ms=1,
+            max_submit_lateness_ms=10_000,
+            service_time_estimator=estimator,
+        )
+
+        self.assertEqual(seen, ["z-resident", "a-host"])
 
     def test_executes_at_planned_time_and_measures_deadline(self):
         clock = FakeClock()
