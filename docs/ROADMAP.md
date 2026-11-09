@@ -150,6 +150,15 @@ mixed estimate. Per-request evidence records which feedback placement was used,
 while the summary exports both mode-specific rates and sample counts. This is a
 CPU-validated policy correction; real serving validation remains required.
 
+Low-water promotion now ranks the TP-common candidates by the same immutable
+request value used for demotion: imminent deadlines and high-weight work come
+before ordinary requests, transfer cost breaks ties, and every rank uses the
+worst-rank cost. The previous behavior selected the lexicographically smallest
+request id. Promotion telemetry records candidate count, hinted/invalid values,
+deadline-guarded selections and the chosen retention evidence. Prefix reuse can
+raise a donor's priority using verified active consumers and the bounded future
+demand forecast.
+
 Future-aware admission now reserves interval peaks instead of summing every item
 inside the horizon, skips deadline protection when positive post-current slack
 remains, and recomputes service duration for backlogged requests. TP prefill-plan

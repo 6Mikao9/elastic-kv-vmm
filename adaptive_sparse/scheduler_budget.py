@@ -37,6 +37,7 @@ from .runtime_value import (
     forecast_prefix_reuse,
     merge_demotion_values,
     rank_demotions,
+    rank_promotions,
     runtime_values,
 )
 from .runtime_value import evidence as runtime_value_evidence
@@ -525,6 +526,11 @@ class SchedulerBudget:
                       "prefix_reuse_donors": 0,
                       "prefix_reuse_active_consumers": 0,
                       "prefix_reuse_future_consumers": 0,
+                       "promotion_candidates": 0,
+                       "promotion_value_hints": 0,
+                       "promotion_value_invalid": 0,
+                       "deadline_guarded_promotions": 0,
+                       "last_promotion_runtime_values": {},
                       "deadline_last_resort_actions": 0,
                       "migration_bandwidth_bytes_per_s": self.migration_bandwidth.snapshot(),
                       "migration_bandwidth_samples": self.migration_bandwidth.sample_counts(),
@@ -656,6 +662,56 @@ class SchedulerBudget:
         if fair_pressure:
             self.stats["global_broker_fair_pressure_observations"] += 1
         return minimum_available, fair_pressure
+
+    def _attach_prefix_reuse_values(
+        self,
+        request_values,
+        requests,
+        coordinator,
+        future_prefix_demand=None,
+    ):
+        """Annotate donation value with verified live and imminent consumers."""
+
+        demand = future_prefix_demand or {}
+        registry = getattr(coordinator, "_ekv_shared_prefixes", None)
+        for request in requests:
+            rid = getattr(request, "rid", None)
+            value = request_values.get(rid)
+            row = getattr(getattr(request, "kv", None), "req_pool_idx", None)
+            if value is None or not isinstance(row, int) or isinstance(row, bool):
+                continue
+            active_consumers = (
+                registry.active_donor_consumers(row) if registry is not None else 0
+            )
+            future_consumers = 0
+            if (
+                registry is not None
+                and value.prefix_group is not None
+                and value.shared_prefix_tokens > 0
+            ):
+                future_consumers = demand.get(
+                    (value.prefix_group, value.shared_prefix_tokens), 0
+                )
+                if future_consumers and not registry.prefers_geometry_donor(
+                    row,
+                    group=value.prefix_group,
+                    tokens=value.shared_prefix_tokens,
+                ):
+                    future_consumers = 0
+            if not active_consumers and not future_consumers:
+                continue
+            request_values[rid] = attach_prefix_reuse(
+                value,
+                PrefixReuseDemand(
+                    tokens=value.shared_prefix_tokens,
+                    active_consumers=active_consumers,
+                    future_consumers=future_consumers,
+                ),
+            )
+            self.stats["prefix_reuse_donors"] += 1
+            self.stats["prefix_reuse_active_consumers"] += active_consumers
+            self.stats["prefix_reuse_future_consumers"] += future_consumers
+        return request_values
 
     def observe_future_prefill(self, plan, effective_headroom=0, *, tp_fallback=False,
                                boundary="prefill"):
@@ -842,7 +898,15 @@ class SchedulerBudget:
                 and (stable if self.low or self.promote_step else True)
             ))
             if forced_up or can_promote:
-                self.promote(batch, coordinator, exchange, synchronize, forced_up, now)
+                self.promote(
+                    batch,
+                    coordinator,
+                    exchange,
+                    synchronize,
+                    forced_up,
+                    now,
+                    future_prefix_demand=future_prefix_demand,
+                )
             return
         if not force and not (
                 pressure and all(item[2] for item in states)):
@@ -881,47 +945,12 @@ class SchedulerBudget:
                                           "predicted_chunks": sorted(chunks)}
 
         request_values, value_stats = runtime_values(batch.reqs, now_s=now)
-        future_prefix_demand = future_prefix_demand or {}
-        registry = getattr(coordinator, "_ekv_shared_prefixes", None)
-        for request in batch.reqs:
-            rid = getattr(request, "rid", None)
-            value = request_values.get(rid)
-            row = getattr(getattr(request, "kv", None), "req_pool_idx", None)
-            if value is None or not isinstance(row, int) or isinstance(row, bool):
-                continue
-            active_consumers = (
-                registry.active_donor_consumers(row) if registry is not None else 0
-            )
-            future_consumers = 0
-            if (
-                registry is not None
-                and value.prefix_group is not None
-                and value.shared_prefix_tokens > 0
-            ):
-                future_consumers = future_prefix_demand.get(
-                    (value.prefix_group, value.shared_prefix_tokens), 0
-                )
-                if future_consumers and not (
-                    registry.prefers_geometry_donor(
-                        row,
-                        group=value.prefix_group,
-                        tokens=value.shared_prefix_tokens,
-                    )
-                ):
-                    future_consumers = 0
-            if not active_consumers and not future_consumers:
-                continue
-            request_values[rid] = attach_prefix_reuse(
-                value,
-                PrefixReuseDemand(
-                    tokens=value.shared_prefix_tokens,
-                    active_consumers=active_consumers,
-                    future_consumers=future_consumers,
-                ),
-            )
-            self.stats["prefix_reuse_donors"] += 1
-            self.stats["prefix_reuse_active_consumers"] += active_consumers
-            self.stats["prefix_reuse_future_consumers"] += future_consumers
+        request_values = self._attach_prefix_reuse_values(
+            request_values,
+            batch.reqs,
+            coordinator,
+            future_prefix_demand,
+        )
         self.stats["runtime_value_hints"] += value_stats["hinted"]
         self.stats["runtime_value_invalid"] += value_stats["invalid"]
         self.stats["runtime_value_guarded"] += sum(
@@ -1101,7 +1130,17 @@ class SchedulerBudget:
         LOG.info("Adaptive demotion: boundary=%s forced=%s group_size=%d released_bytes_by_rank=%s",
                  "prefill" if prefill else "decode", force, len(chosen), releases)
 
-    def promote(self, batch, coordinator, exchange, synchronize, forced, now):
+    def promote(
+        self,
+        batch,
+        coordinator,
+        exchange,
+        synchronize,
+        forced,
+        now,
+        *,
+        future_prefix_demand=None,
+    ):
         pool = coordinator.mem_pool_device
         tracker = pool.adaptive_vmm
         physical = coordinator.token_to_kv_pool_allocator.hisparse_attn_allocator
@@ -1136,12 +1175,44 @@ class SchedulerBudget:
                     ceiling and tracker.backing.backed_bytes + len(missing) * tracker.chunk_bytes > ceiling):
                 continue
             requests[request.rid] = request
-        candidates = set(requests)
-        for rank_ids in exchange(tuple(sorted(requests))):
-            candidates.intersection_update(rank_ids)
-        if not candidates:
+        if not requests:
             return
-        request = requests[min(candidates)]
+        request_values, value_stats = runtime_values(requests.values(), now_s=now)
+        request_values = self._attach_prefix_reuse_values(
+            request_values,
+            requests.values(),
+            coordinator,
+            future_prefix_demand,
+        )
+        costs = {
+            rid: self.transfer_cost(req, pool) for rid, req in requests.items()
+        }
+        ranking_values = exchange({
+            rid: merge_demotion_values(
+                (request_values[rid],), guard_ms=self.deadline_guard_ms
+            )
+            for rid in requests
+        })
+        ranked = rank_promotions(
+            exchange(costs),
+            ranking_values,
+            guard_ms=self.deadline_guard_ms,
+        )
+        if not ranked:
+            return
+        request = requests[ranked[0]]
+        selected_value = request_values[request.rid]
+        self.stats["promotion_candidates"] += len(ranked)
+        self.stats["promotion_value_hints"] += value_stats["hinted"]
+        self.stats["promotion_value_invalid"] += value_stats["invalid"]
+        self.stats["deadline_guarded_promotions"] += int(
+            selected_value.deadline_guarded(self.deadline_guard_ms)
+        )
+        self.stats["last_promotion_runtime_values"] = {
+            request.rid: runtime_value_evidence(
+                selected_value, guard_ms=self.deadline_guard_ms
+            )
+        }
         started = time.monotonic()
         broker_plan = None
         plan_broker = getattr(coordinator, "_ekv_broker_promotion_plan", None)

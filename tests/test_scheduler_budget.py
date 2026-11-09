@@ -843,3 +843,97 @@ class SchedulerBudgetTest(unittest.TestCase):
         plan.assert_called_once_with(request)
         commit_broker.assert_called_once_with(request, 7)
         self.assertIn(1, ctrl._ekv_resident)
+
+    def test_promotion_uses_hinted_value_instead_of_request_id_order(self):
+        def request(request_id, row, weight):
+            action = B(
+                action_type="elastic.future",
+                action_version="2",
+                payload={
+                    "release_after_ms": 0,
+                    "deadline_after_ms": 1000,
+                    "deadline_clock": "perf_counter",
+                    "deadline_absolute_ms": 3000,
+                    "expected_output_tokens": 100,
+                    "weight": weight,
+                    "residence": "host_backed",
+                },
+            )
+            return B(
+                rid=request_id,
+                kv=B(
+                    req_pool_idx=row,
+                    kv_committed_len=8,
+                    kv_allocated_len=8,
+                ),
+                kv_hints=B(actions=[action]),
+                finished=lambda: False,
+                hisparse_staging=False,
+            )
+
+        class PageList(list):
+            def __getitem__(self, key):
+                value = super().__getitem__(key)
+                return PageList(value) if isinstance(key, slice) else value
+
+            def tolist(self):
+                return list(self)
+
+        low_value = request("a-low", 1, 1)
+        high_value = request("z-high", 2, 16)
+        policy = SchedulerBudget(0, 0, 0, 0)
+        policy.residency_since = {"a-low": (False, 0), "z-high": (False, 0)}
+        backing = B(backed_bytes=0, mapped_chunks=set())
+        tracker = B(
+            backing=backing,
+            refs={},
+            chunk_bytes=1,
+            chunks=lambda page: {page},
+        )
+        physical = B(
+            free_pages=PageList(range(8)),
+            available_size=lambda: 100,
+        )
+        ctrl = B(
+            _ekv_resident=set(),
+            mem_pool_device=B(
+                adaptive_vmm=tracker,
+                page_size=2,
+                layer_num=1,
+                bytes_per_token_k=1,
+                bytes_per_token_v=1,
+            ),
+            token_to_kv_pool_allocator=B(hisparse_attn_allocator=physical),
+            req_device_buffer_size={1: 4, 2: 4},
+            padded_buffer_size=4,
+            device_buffer_size=4,
+        )
+
+        def commit(prepared, publish, synchronize):
+            publish(int(prepared.rsplit("-", 1)[1]))
+            return 0
+
+        with patch(
+            "adaptive_sparse.scheduler_budget.prepare_promote",
+            side_effect=lambda coordinator, req, synchronize: (
+                f"prepared-{req.kv.req_pool_idx}"
+            ),
+        ) as prepare, patch(
+            "adaptive_sparse.scheduler_budget.commit_promote",
+            side_effect=commit,
+        ):
+            policy.promote(
+                B(reqs=[low_value, high_value]),
+                ctrl,
+                lambda value: (value, value),
+                lambda: None,
+                False,
+                2.0,
+            )
+
+        self.assertEqual(prepare.call_args.args[1].rid, "z-high")
+        self.assertEqual(ctrl._ekv_resident, {2})
+        self.assertEqual(policy.stats["promotion_candidates"], 2)
+        self.assertEqual(policy.stats["promotion_value_hints"], 2)
+        evidence = policy.stats["last_promotion_runtime_values"]["z-high"]
+        self.assertEqual(evidence["weight"], 16.0)

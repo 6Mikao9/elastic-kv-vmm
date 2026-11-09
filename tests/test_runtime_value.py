@@ -8,6 +8,7 @@ from adaptive_sparse.runtime_value import (
     forecast_prefix_reuse,
     merge_demotion_values,
     rank_demotions,
+    rank_promotions,
     runtime_values,
 )
 from adaptive_sparse.sglang_future_hook import ACTION_TYPE, ACTION_VERSION
@@ -117,6 +118,56 @@ class RuntimeValueTest(unittest.TestCase):
             {item.request_id for item in value.request_values},
             {"ordinary", "deadline"},
         )
+
+    def test_promotion_prefers_urgent_high_value_then_low_cost(self):
+        rank_costs = [
+            {"ordinary": 10, "weighted": 30, "urgent": 50},
+            {"ordinary": 12, "weighted": 25, "urgent": 45},
+        ]
+        rank_values = [{
+            "ordinary": merge_demotion_values(
+                [RuntimeRequestValue("ordinary")], guard_ms=500
+            ),
+            "weighted": merge_demotion_values(
+                [RuntimeRequestValue("weighted", weight=16)], guard_ms=500
+            ),
+            "urgent": merge_demotion_values(
+                [RuntimeRequestValue("urgent", deadline_remaining_ms=20)],
+                guard_ms=500,
+            ),
+        }]
+
+        self.assertEqual(
+            rank_promotions(rank_costs, rank_values, guard_ms=500),
+            ["urgent", "weighted", "ordinary"],
+        )
+
+    def test_promotion_cost_is_only_a_tie_breaker(self):
+        values = [{
+            "expensive": merge_demotion_values(
+                [RuntimeRequestValue("expensive", weight=16)], guard_ms=500
+            ),
+            "cheap": merge_demotion_values(
+                [RuntimeRequestValue("cheap")], guard_ms=500
+            ),
+            "same-a": merge_demotion_values(
+                [RuntimeRequestValue("same-a", weight=4)], guard_ms=500
+            ),
+            "same-b": merge_demotion_values(
+                [RuntimeRequestValue("same-b", weight=4)], guard_ms=500
+            ),
+        }]
+        costs = [{
+            "expensive": 2,
+            "cheap": 1,
+            "same-a": 9,
+            "same-b": 3,
+        }]
+
+        ranked = rank_promotions(costs, values, guard_ms=500)
+
+        self.assertEqual(ranked[:2], ["expensive", "same-b"])
+        self.assertEqual(ranked[-1], "cheap")
 
     def test_retention_score_is_bounded_and_monotone(self):
         ordinary = RuntimeRequestValue("ordinary")

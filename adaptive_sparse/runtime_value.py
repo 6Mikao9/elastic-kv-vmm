@@ -214,6 +214,55 @@ def rank_demotions(
     return sorted(common, key=key)
 
 
+def rank_promotions(
+    rank_costs: Sequence[Mapping[Hashable, int]],
+    rank_values: Sequence[Mapping[Hashable, DemotionRankValue]] | None = None,
+    *,
+    guard_ms: int = DEFAULT_DEADLINE_GUARD_MS,
+) -> list[Hashable]:
+    """Rank common TP candidates for promotion back to full residency.
+
+    Promotion has the opposite objective from demotion: value comes first so an
+    imminent deadline or an important long request does not lose the scarce
+    migration window to a lexicographically smaller request id.  Cost is a
+    deterministic tie-breaker, using the worst rank cost so every TP rank makes
+    the same choice.
+    """
+
+    costs = tuple(rank_costs)
+    if not costs:
+        return []
+    common = set(costs[0])
+    for rank in costs[1:]:
+        common.intersection_update(rank)
+
+    value_ranks = tuple(rank_values or ())
+    merged_values: dict[Hashable, DemotionRankValue] = {}
+    for request_id in common:
+        observations = [
+            rank[request_id] for rank in value_ranks if request_id in rank
+        ]
+        if not observations:
+            merged_values[request_id] = DemotionRankValue(1.0, False, ())
+            continue
+        merged_values[request_id] = DemotionRankValue(
+            max(value.retention_score for value in observations),
+            any(value.deadline_guarded for value in observations),
+            tuple(
+                item
+                for value in observations
+                for item in value.request_values
+            ),
+        )
+
+    def key(request_id: Hashable):
+        transfer = max(0, max(rank[request_id] for rank in costs))
+        value = merged_values[request_id]
+        return (-value.deadline_guarded, -value.retention_score, transfer, str(request_id))
+
+    return sorted(common, key=key)
+
+
 def _request_id(request: Any) -> str | None:
     request_id = getattr(request, "rid", None)
     return request_id if isinstance(request_id, str) and request_id else None
