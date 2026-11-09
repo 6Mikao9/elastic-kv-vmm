@@ -124,6 +124,76 @@ class ProfileCalibrationTest(unittest.TestCase):
             ["1:resident"],
         )
 
+    def test_calibrates_kind_specific_decode_profiles_with_thresholds(self):
+        rows = [
+            *[
+                {
+                    "request_id": f"chat-{index}",
+                    "runtime_residence": "resident",
+                    "kind": "chat",
+                    "tpot_s": 0.002,
+                }
+                for index in range(2)
+            ],
+            *[
+                {
+                    "request_id": f"tool-{index}",
+                    "runtime_residence": "resident",
+                    "kind": "tool",
+                    "tpot_s": 0.001,
+                }
+                for index in range(2)
+            ],
+            {
+                "request_id": "rare",
+                "runtime_residence": "resident",
+                "kind": "rare",
+                "tpot_s": 0.0005,
+            },
+        ]
+        stats = {
+            "decode_batch_sizes_by_request": {
+                row["request_id"]: {"4": 2} for row in rows
+            }
+        }
+
+        result = calibrate_profiles(rows, stats, min_samples=2)
+
+        self.assertEqual(
+            result["decode_batch_profiles"],
+            {
+                "4": {
+                    "resident_tokens_per_ms": 4.0,
+                    "kind_profiles": {
+                        "chat": {"resident_tokens_per_ms": 2.0},
+                        "tool": {"resident_tokens_per_ms": 4.0},
+                    },
+                }
+            },
+        )
+        self.assertEqual(
+            result["evidence"]["decode"]["kind_below_min_samples"],
+            ["4:resident:rare"],
+        )
+        planner = PlannerConfig(
+            memory_budget_bytes=1024,
+            kv_bytes_per_token=1,
+            prefill_workspace_bytes_per_token=0,
+            decode_batch_profiles=result["decode_batch_profiles"],
+        )
+        self.assertEqual(
+            planner.decode_rate_for_batch("chat", ResidencyMode.RESIDENT, 4),
+            0.5,
+        )
+        self.assertEqual(
+            planner.decode_rate_for_batch("tool", ResidencyMode.RESIDENT, 4),
+            1.0,
+        )
+        self.assertEqual(
+            planner.decode_rate_for_batch("rare", ResidencyMode.RESIDENT, 4),
+            1.0,
+        )
+
     def test_rejects_invalid_threshold_and_histogram_shape(self):
         with self.assertRaisesRegex(ValueError, "min_samples"):
             calibrate_profiles([], {}, min_samples=0)

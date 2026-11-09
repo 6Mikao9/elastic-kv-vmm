@@ -99,7 +99,9 @@ TTFT/TPOT 和 `future_stats` 转成规划器可直接读取的 `decode_batch_pro
 `prefill_batch_profiles`。它只采用宽度唯一的 decode 观测和完整原生 prefill cohort，
 排除 mixed-width/incomplete-cohort 样本；样本数不足的组合只保留为证据。推荐用
 `scripts/calibrate_future_profiles.py --min-samples 3 --require-available` 生成下一轮
-workload 的 profile，避免把一次偶然命中写成稳定吞吐。
+workload 的 profile，避免把一次偶然命中写成稳定吞吐。decode profile 会保留
+`(residence, kind, batch size)` 的嵌套覆盖；某类型样本不足时自动使用同 batch 的
+aggregate 值，避免把少量观测固化成服务差异。
 
 ## 本次修复
 

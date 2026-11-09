@@ -200,14 +200,8 @@ class KindServiceProfile:
 
 
 @dataclass(frozen=True, slots=True)
-class DecodeBatchProfile:
-    """Measured aggregate decode throughput at one co-active batch size.
-
-    The values describe all streams in the batch, not one request. The planner
-    divides by the measured batch size before estimating an individual decode
-    duration. A missing mode inherits the ordinary per-kind rate, so operators
-    can publish only the measurements they actually have.
-    """
+class KindDecodeBatchProfile:
+    """Measured aggregate decode rate for one kind at one batch size."""
 
     resident_tokens_per_ms: float | None = None
     sparse_tokens_per_ms: float | None = None
@@ -226,7 +220,7 @@ class DecodeBatchProfile:
                 raise ValueError(f"{name} must be a finite positive number or None")
         if self.resident_tokens_per_ms is None and self.sparse_tokens_per_ms is None:
             raise ValueError(
-                "decode batch profile requires resident or sparse throughput"
+                "kind decode batch profile requires resident or sparse throughput"
             )
 
     def rate(self, mode: ResidencyMode) -> float | None:
@@ -234,7 +228,7 @@ class DecodeBatchProfile:
             return self.resident_tokens_per_ms
         return self.sparse_tokens_per_ms
 
-    def as_dict(self) -> dict[str, float]:
+    def as_dict(self) -> dict[str, object]:
         return {
             key: value
             for key, value in (
@@ -243,6 +237,113 @@ class DecodeBatchProfile:
             )
             if value is not None
         }
+
+
+def normalize_kind_decode_batch_profiles(
+    value: object,
+) -> tuple[tuple[str, KindDecodeBatchProfile], ...]:
+    """Validate per-kind overrides nested under one batch profile."""
+
+    raw_profiles: Iterable[tuple[object, object]]
+    if isinstance(value, Mapping):
+        raw_profiles = value.items()
+    elif isinstance(value, (tuple, list)):
+        raw_profiles = value
+    else:
+        raise ValueError(
+            "kind_profiles in a decode batch profile must be a mapping or pair sequence"
+        )
+    profiles: dict[str, KindDecodeBatchProfile] = {}
+    for item in raw_profiles:
+        if not isinstance(item, (tuple, list)) or len(item) != 2:
+            raise ValueError(
+                "kind decode batch profiles must be kind/profile pairs"
+            )
+        kind, raw_profile = item
+        if not isinstance(kind, str) or not kind or len(kind) > 64:
+            raise ValueError(
+                "kind decode batch profile keys must be short non-empty strings"
+            )
+        if kind in profiles:
+            raise ValueError(f"duplicate kind decode batch profile: {kind!r}")
+        if isinstance(raw_profile, KindDecodeBatchProfile):
+            profile = raw_profile
+        elif isinstance(raw_profile, Mapping):
+            profile = KindDecodeBatchProfile(**dict(raw_profile))
+        else:
+            raise ValueError(
+                f"decode batch profile for kind {kind!r} must be an object"
+            )
+        profiles[kind] = profile
+    return tuple(sorted(profiles.items()))
+
+
+@dataclass(frozen=True, slots=True)
+class DecodeBatchProfile:
+    """Measured aggregate decode throughput at one co-active batch size.
+
+    The values describe all streams in the batch, not one request. The planner
+    divides by the measured batch size before estimating an individual decode
+    duration. A missing mode inherits the ordinary per-kind rate, so operators
+    can publish only the measurements they actually have.
+    """
+
+    resident_tokens_per_ms: float | None = None
+    sparse_tokens_per_ms: float | None = None
+    kind_profiles: (
+        tuple[tuple[str, KindDecodeBatchProfile], ...]
+        | Mapping[str, KindDecodeBatchProfile | Mapping[str, object]]
+    ) = ()
+
+    def __post_init__(self) -> None:
+        for name in ("resident_tokens_per_ms", "sparse_tokens_per_ms"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise ValueError(f"{name} must be a finite positive number or None")
+        if self.resident_tokens_per_ms is None and self.sparse_tokens_per_ms is None:
+            raise ValueError(
+                "decode batch profile requires resident or sparse throughput"
+            )
+        object.__setattr__(
+            self,
+            "kind_profiles",
+            normalize_kind_decode_batch_profiles(self.kind_profiles),
+        )
+
+    def rate(self, mode: ResidencyMode, kind: str | None = None) -> float | None:
+        if kind is not None:
+            for candidate, profile in self.kind_profiles:
+                if candidate == kind:
+                    measured = profile.rate(mode)
+                    if measured is not None:
+                        return measured
+                    break
+        if mode is ResidencyMode.RESIDENT:
+            return self.resident_tokens_per_ms
+        return self.sparse_tokens_per_ms
+
+    def as_dict(self) -> dict[str, object]:
+        result: dict[str, object] = {
+            key: value
+            for key, value in (
+                ("resident_tokens_per_ms", self.resident_tokens_per_ms),
+                ("sparse_tokens_per_ms", self.sparse_tokens_per_ms),
+            )
+            if value is not None
+        }
+        if self.kind_profiles:
+            result["kind_profiles"] = {
+                kind: profile.as_dict()
+                for kind, profile in self.kind_profiles
+            }
+        return result
 
 
 def normalize_kind_profiles(
@@ -521,7 +622,7 @@ class PlannerConfig:
         profile = self.decode_batch_profile(batch_size)
         if profile is None:
             return self.decode_rate(kind, mode)
-        aggregate_rate = profile.rate(mode)
+        aggregate_rate = profile.rate(mode, kind)
         if aggregate_rate is None:
             return self.decode_rate(kind, mode)
         return aggregate_rate / batch_size

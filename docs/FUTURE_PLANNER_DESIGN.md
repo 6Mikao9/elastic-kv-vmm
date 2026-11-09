@@ -373,15 +373,24 @@ backing 的引用、写保护和生命周期实现通过真实测试。
     },
     "4": {
       "resident_tokens_per_ms": 64.0,
-      "sparse_tokens_per_ms": 48.0
+      "sparse_tokens_per_ms": 48.0,
+      "kind_profiles": {
+        "chat": {"resident_tokens_per_ms": 52.0},
+        "tool": {
+          "resident_tokens_per_ms": 72.0,
+          "sparse_tokens_per_ms": 54.0
+        }
+      }
     }
   }
 }
 ```
 
 规划器把 aggregate rate 除以 batch size，再估计单个请求的 decode duration。只有
-完全匹配的 batch size 和 residency mode 才使用实测值；缺失项回退到原来的每请求
-线性速率，不做插值。admission 和 rollout submission 都记录本次估计采用的
+完全匹配的 batch size 和 residency mode 才使用实测值；同一 batch/mode 下若有
+达到样本门槛的 `kind_profiles`，请求类型覆盖值优先。类型覆盖缺少当前 mode 或请求
+没有已知 kind 时，回退到该 batch 的 aggregate profile；batch 完全不匹配时再回退到
+原来的每请求线性速率，不做插值。admission 和 rollout submission 都记录本次估计采用的
 `decode_batch_size`，rollout hint 的 `decode_tokens_per_s` 也使用同一值，便于检查
 计划和执行之间的单位与假设。
 
@@ -422,6 +431,9 @@ python scripts/calibrate_future_profiles.py \
 成员 TTFT 的中位数计算 aggregate tokens/ms。低于 `--min-samples` 的组合只保留在
 `evidence` 中，不会进入 profile，也不会对 batch size 做插值。生成的 JSON 可直接作为
 `PlannerConfig` 的两个 profile 参数；没有真实测量时继续使用逐请求线性回退。
+decode 标定还按 `(residence, kind, batch size)` 建立嵌套覆盖。只有同一组合达到
+`--min-samples` 才写入 `kind_profiles`；未知或缺失的 kind 仍只贡献 aggregate profile。
+缺少达标类型的证据时，规划器继续使用 aggregate 值。
 
 ### 4.1.3 已实现：已知未来 cohort 的保守等待策略
 

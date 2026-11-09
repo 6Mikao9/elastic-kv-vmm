@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import statistics
 from collections.abc import Iterable, Mapping
+from typing import cast
 
 
 def _positive_int(value: object, name: str) -> int:
@@ -71,6 +72,7 @@ def calibrate_profiles(
 
     normalized_rows: list[Mapping[str, object]] = []
     decode_samples: dict[tuple[str, int], list[float]] = {}
+    kind_decode_samples: dict[tuple[str, str, int], list[float]] = {}
     decode_counts = {
         "candidate_requests": 0,
         "accepted_requests": 0,
@@ -108,9 +110,14 @@ def calibrate_profiles(
         decode_samples.setdefault((residence, batch_size), []).append(
             aggregate_tokens_per_ms
         )
+        kind = row.get("kind")
+        if isinstance(kind, str) and kind and len(kind) <= 64:
+            kind_decode_samples.setdefault(
+                (residence, kind, batch_size), []
+            ).append(aggregate_tokens_per_ms)
         decode_counts["accepted_requests"] += 1
 
-    decode_profiles: dict[str, dict[str, float]] = {}
+    decode_profiles: dict[str, dict[str, object]] = {}
     decode_evidence: dict[str, dict[str, object]] = {}
     for (residence, batch_size), values in sorted(
         decode_samples.items(), key=lambda item: (item[0][1], item[0][0])
@@ -127,6 +134,31 @@ def calibrate_profiles(
         decode_evidence[f"{batch_size}:{residence}"] = {
             "batch_size": batch_size,
             "residence": residence,
+            "samples": len(values),
+            "aggregate_tokens_per_ms": _median(values),
+        }
+
+    kind_decode_evidence: dict[str, dict[str, object]] = {}
+    for (residence, kind, batch_size), values in sorted(
+        kind_decode_samples.items(),
+        key=lambda item: (item[0][2], item[0][0], item[0][1]),
+    ):
+        if len(values) < min_samples:
+            continue
+        batch_profile = decode_profiles[str(batch_size)]
+        raw_kind_profiles = cast(
+            dict[str, dict[str, float]],
+            batch_profile.setdefault("kind_profiles", {}),
+        )
+        raw_kind_profiles[kind] = {
+            "resident_tokens_per_ms"
+            if residence == "resident"
+            else "sparse_tokens_per_ms": _median(values)
+        }
+        kind_decode_evidence[f"{batch_size}:{residence}:{kind}"] = {
+            "batch_size": batch_size,
+            "residence": residence,
+            "kind": kind,
             "samples": len(values),
             "aggregate_tokens_per_ms": _median(values),
         }
@@ -211,9 +243,17 @@ def calibrate_profiles(
             "decode": {
                 **decode_counts,
                 "profiles": decode_evidence,
+                "kind_profiles": kind_decode_evidence,
                 "below_min_samples": sorted(
                     f"{batch_size}:{residence}"
                     for (residence, batch_size), values in decode_samples.items()
+                    if len(values) < min_samples
+                ),
+                "kind_below_min_samples": sorted(
+                    f"{batch_size}:{residence}:{kind}"
+                    for (residence, kind, batch_size), values in (
+                        kind_decode_samples.items()
+                    )
                     if len(values) < min_samples
                 ),
             },

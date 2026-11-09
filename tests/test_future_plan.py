@@ -875,12 +875,94 @@ class FuturePlanTest(unittest.TestCase):
                  (1, {"resident_tokens_per_ms": 2})),
                 "duplicate decode batch profile",
             ),
+            (
+                ((1, {
+                    "resident_tokens_per_ms": 1,
+                    "kind_profiles": {1: {"resident_tokens_per_ms": 2}},
+                }),),
+                "keys must be short non-empty strings",
+            ),
+            (
+                ((1, {
+                    "resident_tokens_per_ms": 1,
+                    "kind_profiles": (("tool", {"resident_tokens_per_ms": 2}),
+                                     ("tool", {"resident_tokens_per_ms": 3})),
+                }),),
+                "duplicate kind decode batch profile",
+            ),
+            (
+                ((1, {
+                    "resident_tokens_per_ms": 1,
+                    "kind_profiles": {"tool": {}},
+                }),),
+                "requires resident or sparse",
+            ),
         )
         for profiles, message in invalid:
             with self.subTest(profiles=profiles), self.assertRaisesRegex(
                 ValueError, message
             ):
                 PlannerConfig(**common, decode_batch_profiles=profiles)
+
+    def test_kind_decode_profiles_override_exact_batch_with_safe_fallback(self):
+        config = replace(
+            self.config,
+            decode_batch_profiles={
+                4: {
+                    "resident_tokens_per_ms": 8,
+                    "sparse_tokens_per_ms": 4,
+                    "kind_profiles": {
+                        "chat": {"resident_tokens_per_ms": 6},
+                        "tool": {
+                            "resident_tokens_per_ms": 10,
+                            "sparse_tokens_per_ms": 3,
+                        },
+                    },
+                }
+            },
+        )
+
+        restored = PlannerConfig(**config.as_dict())
+
+        self.assertEqual(
+            restored.decode_rate_for_batch("chat", ResidencyMode.RESIDENT, 4),
+            1.5,
+        )
+        self.assertEqual(
+            restored.decode_rate_for_batch("tool", ResidencyMode.RESIDENT, 4),
+            2.5,
+        )
+        self.assertEqual(
+            restored.decode_rate_for_batch(
+                "tool", ResidencyMode.HI_SPARSE, 4
+            ),
+            0.75,
+        )
+        self.assertEqual(
+            restored.decode_rate_for_batch(
+                "generic", ResidencyMode.RESIDENT, 4
+            ),
+            2.0,
+        )
+        self.assertEqual(
+            restored.decode_rate_for_batch("chat", ResidencyMode.HI_SPARSE, 4),
+            1.0,
+        )
+        self.assertEqual(
+            restored.decode_rate_for_batch("chat", ResidencyMode.RESIDENT, 3),
+            config.resident_decode_tokens_per_ms,
+        )
+        self.assertEqual(restored.as_dict(), config.as_dict())
+        self.assertEqual(
+            restored.as_dict()["decode_batch_profiles"]["4"]["kind_profiles"],
+            {
+                "chat": {"resident_tokens_per_ms": 6.0},
+                "tool": {
+                    "resident_tokens_per_ms": 10.0,
+                    "sparse_tokens_per_ms": 3.0,
+                },
+            },
+        )
 
     def test_batched_policy_waits_only_when_measured_cohort_is_faster(self):
         config = replace(
