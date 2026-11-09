@@ -56,3 +56,12 @@ For pressure treatments, check that the intended demotions and physical releases
 actually happened. A treatment with zero actions is not evidence for migration
 performance. VMM lifetime backing peaks include probes and warmup, whereas the
 NVML phase peaks use only each measured active window.
+
+The audit also reports NVML sampling coverage for every warmup and measured
+phase. It includes the active-window boundary gaps, the maximum gap, and the
+count and total duration of gaps exceeding five requested sample intervals.
+These are observation gaps, not GPU idle durations. They do not change the
+artifact consistency checks or establish resource exclusivity. In r6 resident,
+multi-second gaps and GPU-query timeouts require a separate measurement-quality
+review even though the artifact checks pass; do not discard selected repeats
+or treat the sampled peak as a continuously observed maximum.

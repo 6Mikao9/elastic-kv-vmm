@@ -89,7 +89,7 @@ def audit_vmm(directory, outer, manifest, ranks):
     return "verified"
 
 
-def audit_nvml(phase, ranks, label):
+def audit_nvml(phase, ranks, label, sample_interval_s):
     detail = phase["memory"]
     begin, end = detail["active_window_s"]
     require(all(type(value) in (int, float) and math.isfinite(value)
@@ -116,14 +116,29 @@ def audit_nvml(phase, ranks, label):
             ]
             and detail["peak_sum_used_bytes"] == max(sample["sum_used_bytes"] for sample in active),
             f"NVML active samples or stored peaks differ for {label}")
+    points = [begin, *(sample["offset_s"] for sample in active), end]
+    gaps = [right - left for left, right in zip(points, points[1:])]
+    long_gaps = [gap for gap in gaps if gap > 5 * sample_interval_s]
+    return {
+        "workload": phase["workload"],
+        "repeat": phase["repeat"],
+        "active_sample_count": len(active),
+        "max_gap_s": max(gaps),
+        "gaps_over_5x_interval": len(long_gaps),
+        "gaps_over_5x_interval_sum_s": math.fsum(long_gaps),
+    }
 
 
 def phase_identity(performance):
     identity = {}
+    sampling = {}
     for kind in ("warmups", "phases"):
+        sampling[kind] = []
         for phase in performance[kind]:
             label = f"{kind}/{phase['workload']}/{phase['repeat']}"
-            audit_nvml(phase, performance["tp_size"], label)
+            sampling[kind].append(audit_nvml(
+                phase, performance["tp_size"], label, performance["sample_interval_s"],
+            ))
             concurrency = phase["concurrency"]
             require(type(concurrency) is int and 1 <= concurrency <= len(phase["requests"]),
                     f"Invalid concurrency for {phase['workload']}/{phase['repeat']}")
@@ -144,7 +159,7 @@ def phase_identity(performance):
             identity[kind, phase["workload"], phase["repeat"]] = (
                 concurrency, sorted(requests),
             )
-    return identity
+    return identity, sampling
 
 
 def audit(directory, expected_repeats):
@@ -159,11 +174,16 @@ def audit(directory, expected_repeats):
             "Expected a 0.05 s NVML sample interval and 0.3 s idle pause")
     probes = audit_correctness(directory, outer, manifest)
     vmm = audit_vmm(directory, outer, manifest, case["tp_size"])
-    return case, phase_identity(performance), probes, {
+    identity, sampling = phase_identity(performance)
+    return case, identity, probes, {
         "directory": str(directory),
         "result_artifacts": "verified",
         "vmm_rank_evidence": vmm,
         "gpu_runtime_and_resource_evidence": "not_verified",
+        "nvml_sampling_quality": {
+            "sample_interval_s": performance["sample_interval_s"],
+            **sampling,
+        },
     }
 
 
@@ -197,7 +217,9 @@ def main(argv=None):
             "GPU runtime/resource evidence are not verified. Token hashes validate recorded "
             "output IDs only and do not establish KV byte correctness. VMM cleanup is checked "
             "at the benchmark idle checkpoint. Later per-rank files can include pending "
-            "reclamation after semantic probes."
+            "reclamation after semantic probes. NVML gaps include both active-window edges. "
+            "They describe sampling coverage only, without rejecting artifacts or establishing "
+            "GPU exclusivity or idle time."
         ),
     }, indent=2))
     return 0

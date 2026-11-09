@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.audit_hisparse_results import audit, main, read_json
+from scripts.audit_hisparse_results import audit, audit_nvml, main, read_json
 
 
 NATIVE = Path(__file__).resolve().parents[1] / "results/final-native-greedy"
@@ -86,6 +86,36 @@ class HiSparseResultsAuditTest(unittest.TestCase):
                   lambda data: data["phases"][0]["memory"].update(peak_sum_used_bytes=0))
         with self.assertRaisesRegex(ValueError, "stored peaks differ for phases"):
             audit(self.arm, 3)
+
+    def test_nvml_sampling_gaps_include_both_window_boundaries(self):
+        phase = {
+            "workload": "long_serial", "repeat": 0, "phase_wall_s": 1.0,
+            "memory": {
+                "active_window_s": [0.0, 1.0],
+                "samples": [
+                    {"offset_s": offset, "rank_used_bytes": [1] * 4, "sum_used_bytes": 4}
+                    for offset in (0.4, 0.5, 0.7)
+                ],
+                "active_sample_count": 3, "rank_peak_used_bytes": [1] * 4,
+                "peak_sum_used_bytes": 4,
+            },
+        }
+        coverage = audit_nvml(phase, 4, "phases/long_serial/0", 0.05)
+        self.assertEqual(coverage["gaps_over_5x_interval"], 2)
+        self.assertAlmostEqual(coverage["max_gap_s"], 0.4)
+        self.assertAlmostEqual(coverage["gaps_over_5x_interval_sum_s"], 0.7)
+
+    def test_historical_nvml_sampling_quality_reports_each_phase(self):
+        _, _, _, report = audit(self.arm, 3)
+        quality = report["nvml_sampling_quality"]
+        self.assertEqual(quality["sample_interval_s"], 0.05)
+        self.assertEqual(len(quality["warmups"]), 5)
+        self.assertEqual(len(quality["phases"]), 15)
+        for phase in quality["warmups"] + quality["phases"]:
+            self.assertGreater(phase["max_gap_s"], 0)
+            self.assertLess(phase["max_gap_s"], 0.1)
+            self.assertEqual(phase["gaps_over_5x_interval"], 0)
+            self.assertEqual(phase["gaps_over_5x_interval_sum_s"], 0)
 
     def setup_vmm(self, *, pending_reclamation=False):
         snapshots = [
