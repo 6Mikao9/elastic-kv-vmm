@@ -18,7 +18,12 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from adaptive_sparse.future_plan import POLICIES
-from adaptive_sparse.sglang_future_hook import find_stats_paths, load_stats
+from adaptive_sparse.sglang_future_hook import (
+    cohort_completion_evidence,
+    find_stats_paths,
+    load_stats,
+    planned_cohort_sizes,
+)
 from benchmarks.client import digest_ids, prompt_ids, write_json
 from scripts.run_case import HOST, PORT, ROOT, leader_exit, on_sigterm, stop_server
 
@@ -410,6 +415,11 @@ def main():
         default=0,
         help="submit planned requests early and hard-gate their prefill",
     )
+    parser.add_argument(
+        "--future-require-complete-cohorts",
+        action="store_true",
+        help="fail unless every planned future cohort reaches one complete prefill batch",
+    )
     args = parser.parse_args()
     validate_server_endpoint(parser, host=args.host, port=args.port)
     base_url = server_base_url(args.host, args.port)
@@ -460,6 +470,11 @@ def main():
             parser.error("future preannouncement requires emitted future hints")
         if args.future_policy == "off":
             parser.error("future preannouncement requires future policy deadline")
+    if args.future_require_complete_cohorts:
+        if args.future_plan is None and args.future_workload is None:
+            parser.error("complete future cohorts requires a future plan or workload")
+        if args.future_no_hints or args.future_policy == "off":
+            parser.error("complete future cohorts requires emitted future hints")
     if not 0 < args.future_service_time_ewma_alpha <= 1:
         parser.error("future service-time EWMA alpha must be in (0, 1]")
     if args.future_plan is None and args.future_workload is None:
@@ -586,6 +601,7 @@ def main():
     output.mkdir(parents=True, exist_ok=False)
     future_plan_mode = args.future_plan is not None or args.future_workload is not None
     planned_submissions = None
+    expected_future_cohorts: dict[str, int] = {}
     future_plan_manifest = None
     future_plan_config = None
     effective_future_policy = args.future_planning_policy
@@ -620,6 +636,12 @@ def main():
                 parser.error(f"invalid future planner_config: {error}")
         if any(item.prompt_tokens + item.output_tokens > 16384 for item in planned_submissions):
             parser.error("future plan request exceeds the MiniMax context length")
+        try:
+            expected_future_cohorts = planned_cohort_sizes(planned_submissions)
+        except ValueError as error:
+            parser.error(f"invalid future cohort membership: {error}")
+        if args.future_require_complete_cohorts and not expected_future_cohorts:
+            parser.error("complete future cohorts found no cohorts in the plan")
     needs_planned_resident_rows = bool(
         planned_submissions
         and any(item.hint.get("residence") == "resident" for item in planned_submissions)
@@ -840,6 +862,7 @@ def main():
         "future_queue_policy": args.future_queue_policy,
         "future_elastic_residency_budget": args.future_elastic_residency_budget,
         "future_preannounce_lead_ms": args.future_preannounce_lead_ms,
+        "future_require_complete_cohorts": args.future_require_complete_cohorts,
         "sha256": {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in sources},
     })
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -874,6 +897,7 @@ def main():
                "future_queue_policy": args.future_queue_policy,
                "future_elastic_residency_budget": args.future_elastic_residency_budget,
                "future_preannounce_lead_ms": args.future_preannounce_lead_ms,
+               "future_require_complete_cohorts": args.future_require_complete_cohorts,
                "status": "running", "probes": []}
     server = None
     step = "startup"
@@ -1113,6 +1137,15 @@ def main():
                 or future_stats.get("hard_release_gate_errors", 0)
             ):
                 raise RuntimeError("future hard release gate was not observed")
+            if args.future_require_complete_cohorts:
+                cohort_completion = cohort_completion_evidence(
+                    expected_future_cohorts, future_stats
+                )
+                results["future_cohort_completion"] = cohort_completion
+                if not cohort_completion["passed"]:
+                    raise RuntimeError(
+                        "future cohorts did not complete exactly as planned"
+                    )
             results["future_stats"] = future_stats
         results["status"] = "complete"
     except BaseException as error:

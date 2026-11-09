@@ -93,6 +93,15 @@ unless telemetry shows gate ticks and at least one held request with no gate
 errors. The gate preserves the original absolute deadline and restores a
 released request to its prior waiting-queue position.
 
+For a `batched` plan whose measured result will be used as a
+`prefill_batch_profiles` sample, add `--require-complete-cohorts`. The runner
+derives the expected cohort IDs and sizes from the executable plan, then
+requires telemetry to name every planned cohort in `complete_cohort_ids`. A
+partial native batch, gate timeout, metadata conflict, gate error, missing
+cohort, duplicate count without matching IDs, or a plan with no cohorts fails
+the smoke. `results.json` keeps the full `cohort_completion` evidence,
+including `missing_cohort_ids`, rather than reducing the check to a boolean.
+
 `results.json` separates planned and actual submit/finish times, records deadline
 hit/miss against the original absolute deadline, and reports throughput over the
 full makespan including deliberate idle as well as over the serving window. The
@@ -120,6 +129,9 @@ and the pre/post-admission byte ledger are preserved in `results.json`.
   memory checks still determine the final prefill batch.
 - The hook computes remaining slack from SGLang's scheduler receive time and
   never crosses the engine's native priority tier.
+- `--require-complete-cohorts` proves that the planned groups reached complete
+  native prefill batches. It does not by itself prove that the measured batch
+  profile generalizes to other token mixes, models or hardware.
 - SGLang 0.5.2 and 0.5.17 use the guarded compatibility transport described in
   [the compatibility boundary](KV_HINTS_COMPAT.md). The V5 eager and CUDA Graph
   integration smokes both exercised VMM backing and future queue planning in

@@ -456,6 +456,14 @@ radix、grammar、LoRA 与显存容量。因此这里不会通过模拟或 monke
 `complete_cohort_batches` 的对局结果，不能把客户端 skew、规划器假设或“成员已到齐”
 当成原生同批吞吐已验证的依据。
 
+smoke 入口进一步提供了 fail-closed 的 `--require-complete-cohorts`
+（MiniMax 路径为 `--future-require-complete-cohorts`）。执行器先从可执行 plan
+恢复每个 cohort ID 的预期成员数，并在结束 telemetry 中要求这些 ID 全部出现在
+`complete_cohort_ids`。任何 partial batch、到齐等待 timeout、metadata conflict、
+gate error、缺失 ID 或空 cohort plan 都会让实验失败。`cohort_completion` 证据会
+与 `missing_cohort_ids` 一起写入结果，避免仅凭总计数通过。只有这类运行可以作为
+`prefill_batch_profiles` 的有效测量样本。
+
 ### 4.2 受控 rollout 的可执行计划
 
 `plan_rollout()` 把离线策略结果转换成 orchestrator 可执行的动作。每个 action

@@ -71,6 +71,7 @@ _stats = {
     "hard_release_gate_errors": 0,
 }
 _last_cohort_batch: dict[str, object] | None = None
+_complete_cohort_ids: set[str] = set()
 _last_held_cohorts: list[dict[str, object]] = []
 _last_held_releases: list[dict[str, object]] = []
 _cohort_first_seen_s: dict[str, float] = {}
@@ -636,6 +637,7 @@ def observe_prefill_batch(batch: Any) -> None:
         _stats["cohort_members_observed"] += observed
         if complete:
             _stats["complete_cohort_batches"] += 1
+            _complete_cohort_ids.add(cohort_id)
         else:
             _stats["partial_cohort_batches"] += 1
         _last_cohort_batch = {
@@ -649,6 +651,82 @@ def observe_prefill_batch(batch: Any) -> None:
             "complete": complete,
             "reason": None if complete else "native_prefill_selected_partial_members",
         }
+
+
+def planned_cohort_sizes(submissions: Iterable[Any]) -> dict[str, int]:
+    """Return and validate the cohort membership of an executable plan."""
+
+    expected: dict[str, int] = {}
+    members: dict[str, int] = {}
+    for submission in submissions:
+        cohort_id = getattr(submission, "cohort_id", None)
+        if cohort_id is None:
+            continue
+        size = getattr(submission, "prefill_batch_size", None)
+        if not isinstance(cohort_id, str) or not cohort_id:
+            raise ValueError("planned cohort ids must be non-empty strings")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 2:
+            raise ValueError("planned cohort sizes must be integers of at least 2")
+        previous = expected.setdefault(cohort_id, size)
+        if previous != size:
+            raise ValueError(f"cohort {cohort_id}: inconsistent planned size")
+        members[cohort_id] = members.get(cohort_id, 0) + 1
+    for cohort_id, size in expected.items():
+        if members[cohort_id] != size:
+            count = members[cohort_id]
+            noun = "submission" if count == 1 else "submissions"
+            raise ValueError(
+                f"cohort {cohort_id}: planned size {size} has "
+                f"{count} {noun}"
+            )
+    return expected
+
+
+def cohort_completion_evidence(
+    expected_sizes: dict[str, int],
+    stats: dict[str, object],
+) -> dict[str, object]:
+    """Summarize whether every planned cohort reached one complete batch."""
+
+    for cohort_id, size in expected_sizes.items():
+        if not isinstance(cohort_id, str) or not cohort_id:
+            raise ValueError("expected cohort ids must be non-empty strings")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 2:
+            raise ValueError("expected cohort sizes must be integers of at least 2")
+    raw_complete_ids = stats.get("complete_cohort_ids", [])
+    if not isinstance(raw_complete_ids, list) or any(
+        not isinstance(cohort_id, str) for cohort_id in raw_complete_ids
+    ):
+        raise ValueError("complete cohort ids must be a list of strings")
+    complete_ids = set(raw_complete_ids)
+    expected_ids = set(expected_sizes)
+    missing_ids = sorted(expected_ids - complete_ids)
+    complete = int(stats.get("complete_cohort_batches", 0))
+    partial = int(stats.get("partial_cohort_batches", 0))
+    timeouts = int(stats.get("cohort_gate_timeouts", 0))
+    conflicts = int(stats.get("cohort_metadata_conflicts", 0))
+    errors = int(stats.get("cohort_gate_errors", 0))
+    passed = bool(expected_sizes) and (
+        complete >= len(expected_sizes)
+        and not missing_ids
+        and partial == 0
+        and timeouts == 0
+        and conflicts == 0
+        and errors == 0
+    )
+    return {
+        "passed": passed,
+        "expected_cohorts": expected_sizes,
+        "expected_cohort_count": len(expected_sizes),
+        "expected_request_count": sum(expected_sizes.values()),
+        "complete_cohort_ids": sorted(complete_ids),
+        "missing_cohort_ids": missing_ids,
+        "complete_cohort_batches": complete,
+        "partial_cohort_batches": partial,
+        "cohort_gate_timeouts": timeouts,
+        "cohort_metadata_conflicts": conflicts,
+        "cohort_gate_errors": errors,
+    }
 
 
 def _prefill_batch(result: Any) -> Any:
@@ -826,6 +904,7 @@ def _restore_prefill_queue(
 def snapshot_stats() -> dict[str, object]:
     snapshot: dict[str, object] = dict(_stats)
     snapshot["last_cohort_batch"] = _last_cohort_batch
+    snapshot["complete_cohort_ids"] = sorted(_complete_cohort_ids)
     snapshot["last_held_cohorts"] = list(_last_held_cohorts)
     snapshot["last_held_releases"] = list(_last_held_releases)
     snapshot["stats_identity"] = dict(_stats_identity)

@@ -20,7 +20,12 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from adaptive_sparse.future_plan import POLICIES
-from adaptive_sparse.sglang_future_hook import find_stats_paths, load_stats
+from adaptive_sparse.sglang_future_hook import (
+    cohort_completion_evidence,
+    find_stats_paths,
+    load_stats,
+    planned_cohort_sizes,
+)
 
 HOST = "127.0.0.1"
 PORT = 31180
@@ -194,6 +199,11 @@ def main(argv: list[str] | None = None) -> int:
         default=0,
         help="submit planned requests early and hard-gate their prefill",
     )
+    parser.add_argument(
+        "--require-complete-cohorts",
+        action="store_true",
+        help="fail unless every planned cohort reaches one complete native prefill batch",
+    )
     args = parser.parse_args(argv)
     if not args.model_path.is_dir():
         parser.error("--model-path must be an existing directory")
@@ -251,6 +261,11 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--preannounce-lead-ms requires emitted future hints")
         if args.future_policy == "off":
             parser.error("--preannounce-lead-ms requires --future-policy deadline")
+    if args.require_complete_cohorts:
+        if args.plan is None and args.workload is None:
+            parser.error("--require-complete-cohorts needs --plan or --workload")
+        if args.no_hints or args.future_policy == "off":
+            parser.error("--require-complete-cohorts requires emitted future hints")
     if not 0 < args.service_time_ewma_alpha <= 1:
         parser.error("--service-time-ewma-alpha must be in (0, 1]")
     if (args.plan is not None or args.workload is not None) and not args.no_hints and args.future_policy == "off":
@@ -265,6 +280,7 @@ def main(argv: list[str] | None = None) -> int:
     result_path = output / "results.json"
 
     planned_submissions = None
+    expected_cohorts: dict[str, int] = {}
     plan_manifest = None
     plan_config = None
     effective_planning_policy = args.planning_policy
@@ -317,6 +333,12 @@ def main(argv: list[str] | None = None) -> int:
             json.dumps(plan_manifest or {"submissions": []}, indent=2, sort_keys=True),
             encoding="utf-8",
         )
+        try:
+            expected_cohorts = planned_cohort_sizes(planned_submissions)
+        except ValueError as error:
+            parser.error(f"invalid planned cohort membership: {error}")
+        if args.require_complete_cohorts and not expected_cohorts:
+            parser.error("--require-complete-cohorts found no cohorts in the plan")
 
     env = dict(os.environ)
     env.update(
@@ -454,6 +476,13 @@ def main(argv: list[str] | None = None) -> int:
             else None
         )
         if planned_submissions is not None:
+            cohort_completion = (
+                cohort_completion_evidence(expected_cohorts, hook_stats or {})
+                if expected_cohorts
+                and args.future_policy != "off"
+                and not args.no_hints
+                else None
+            )
             checks = {
                 "requests_completed": planned_result["summary"]["completed"],
                 "submit_timing_within_tolerance": (
@@ -486,6 +515,10 @@ def main(argv: list[str] | None = None) -> int:
                         and hook_stats.get("hard_release_gate_holds", 0) > 0
                         and hook_stats.get("hard_release_gate_errors", 0) == 0
                     )
+            if args.require_complete_cohorts:
+                checks["complete_cohorts"] = bool(
+                    cohort_completion and cohort_completion["passed"]
+                )
             if args.require_residency_evidence:
                 checks["residency_evidence"] = bool(
                     planned_result["residency_evidence"]
@@ -519,6 +552,8 @@ def main(argv: list[str] | None = None) -> int:
                 "queue_policy": args.queue_policy,
                 "elastic_residency_budget": args.elastic_residency_budget,
                 "preannounce_lead_ms": args.preannounce_lead_ms,
+                "require_complete_cohorts": args.require_complete_cohorts,
+                "cohort_completion": cohort_completion,
             }
             result_path.write_text(
                 json.dumps(result, indent=2, sort_keys=True), encoding="utf-8"

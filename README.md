@@ -303,6 +303,13 @@ so a lost transport request falls back to native
 scheduling and records a timeout. The hook supports both the SGLang 0.5.2 batch
 return and 0.5.17 `NextBatchPlan` return. Profile values still need paired runs
 against real SGLang co-batch traces.
+`--require-complete-cohorts` turns that requirement into a smoke gate: the runner
+recovers every planned cohort ID and size, requires each ID in
+`complete_cohort_ids`, and fails on partial batches, arrival timeouts, metadata
+conflicts or gate errors. MiniMax exposes the same check through
+`--future-require-complete-cohorts`. This prevents a `batched` plan from silently
+degrading into separate prefills while still producing a nominally successful
+run.
 `search_exact` distinguishes a completed search from a capped incumbent. Use
 `online` to evaluate each immediate action by completing the deployable
 `future` heuristic from that branch, then commit only the first action. Its

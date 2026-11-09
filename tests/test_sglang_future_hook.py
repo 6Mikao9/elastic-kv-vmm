@@ -11,8 +11,10 @@ from adaptive_sparse import sglang_future_hook as hook
 from adaptive_sparse.future_residency import decide_resident_claim
 from adaptive_sparse.sglang_future_hook import (
     apply_to_waiting_queue,
+    cohort_completion_evidence,
     observe_prefill_batch,
     order_requests,
+    planned_cohort_sizes,
     snapshot_stats,
     withhold_incomplete_cohorts,
     withhold_unreleased_requests,
@@ -40,7 +42,9 @@ class SGLangFutureHookTest(unittest.TestCase):
         hook._cohort_first_seen_s.clear()
         hook._cohort_arrival_complete.clear()
         hook._cohort_timed_out.clear()
+        hook._complete_cohort_ids.clear()
         hook._stats_identity.clear()
+        hook._last_cohort_batch = None
         hook._last_held_cohorts = []
         hook._last_held_releases = []
         hook._hard_release_gate = False
@@ -58,6 +62,80 @@ class SGLangFutureHookTest(unittest.TestCase):
             hook.deadline_remaining_ms(hint, now_s=1.02, age_ms=500),
             30,
         )
+
+    def test_cohort_completion_requires_every_planned_group(self):
+        expected = {"batch-0": 2, "batch-1": 3}
+        passed = cohort_completion_evidence(
+            expected,
+            {
+                "complete_cohort_batches": 2,
+                "complete_cohort_ids": ["batch-0", "batch-1"],
+                "partial_cohort_batches": 0,
+                "cohort_gate_timeouts": 0,
+                "cohort_metadata_conflicts": 0,
+                "cohort_gate_errors": 0,
+            },
+        )
+        self.assertTrue(passed["passed"])
+        self.assertEqual(passed["expected_request_count"], 5)
+
+        missing = cohort_completion_evidence(
+            expected,
+            {
+                "complete_cohort_batches": 1,
+                "complete_cohort_ids": ["batch-0"],
+                "partial_cohort_batches": 0,
+                "cohort_gate_timeouts": 0,
+                "cohort_metadata_conflicts": 0,
+                "cohort_gate_errors": 0,
+            },
+        )
+        self.assertFalse(missing["passed"])
+
+        timed_out = cohort_completion_evidence(
+            expected,
+            {
+                "complete_cohort_batches": 2,
+                "complete_cohort_ids": ["batch-0", "batch-1"],
+                "partial_cohort_batches": 0,
+                "cohort_gate_timeouts": 1,
+                "cohort_metadata_conflicts": 0,
+                "cohort_gate_errors": 0,
+            },
+        )
+        self.assertFalse(timed_out["passed"])
+
+        wrong_identity = cohort_completion_evidence(
+            expected,
+            {
+                "complete_cohort_batches": 2,
+                "complete_cohort_ids": ["batch-0", "batch-0-other"],
+                "partial_cohort_batches": 0,
+                "cohort_gate_timeouts": 0,
+                "cohort_metadata_conflicts": 0,
+                "cohort_gate_errors": 0,
+            },
+        )
+        self.assertFalse(wrong_identity["passed"])
+        self.assertEqual(wrong_identity["missing_cohort_ids"], ["batch-1"])
+
+    def test_planned_cohort_sizes_validate_membership(self):
+        submissions = [
+            SimpleNamespace(cohort_id="batch-0", prefill_batch_size=2),
+            SimpleNamespace(cohort_id="batch-0", prefill_batch_size=2),
+            SimpleNamespace(cohort_id=None, prefill_batch_size=1),
+        ]
+        self.assertEqual(planned_cohort_sizes(submissions), {"batch-0": 2})
+
+        with self.assertRaisesRegex(ValueError, "1 submission"):
+            planned_cohort_sizes(submissions[:1])
+        with self.assertRaisesRegex(ValueError, "inconsistent planned size"):
+            planned_cohort_sizes(
+                [
+                    *submissions[:2],
+                    SimpleNamespace(cohort_id="batch-0", prefill_batch_size=3),
+                ]
+            )
 
     def test_absolute_deadline_orders_without_scheduler_receive_time(self):
         long = request(
@@ -229,6 +307,7 @@ class SGLangFutureHookTest(unittest.TestCase):
             - partial["complete_cohort_batches"],
             1,
         )
+        self.assertIn("batch-0", complete["complete_cohort_ids"])
         self.assertTrue(complete["last_cohort_batch"]["complete"])
         self.assertEqual(
             complete["last_cohort_batch"]["request_ids"],
