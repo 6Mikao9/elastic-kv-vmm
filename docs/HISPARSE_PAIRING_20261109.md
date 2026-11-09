@@ -12,3 +12,42 @@ The historical reference is the completed native-greedy run in [final-native-gre
 ## Summary and plot guards
 
 [The summary script](../scripts/summarize_hisparse.py) validates completed outer and performance results, capacities, inference options, matching declared warmup and replay settings, full per-arm phase coverage, request counts and NVML samples. Its CLI groups arms by sampling mode and accepts separate workload sets. [The plot script](../scripts/plot_hisparse.py) additionally requires matched inference signatures, the same raw SM80 source hash, matching phase sets and concurrency, and equal request IDs, prompt hashes and token counts per phase. Plot the five-workload and 12K-only cohorts separately. A passing plot guard verifies workload pairing and the recorded inference signature. It does not verify GPU topology, identical timing windows, or all source hashes.
+
+## Independent acceptance before reporting
+
+The runner can finish while recording `semantic_smoke_passed: false`. A complete
+outer result alone is therefore insufficient. Run the independent
+[artifact audit](../scripts/audit_hisparse_results.py) before summarizing a formal
+cohort. Its default is three repeats; use separate invocations for the five
+standard workloads and the 12K-only controls.
+
+```bash
+python -B scripts/audit_hisparse_results.py \
+  results/final-native-greedy results/matrix-20261109-r6/static \
+  results/matrix-20261109-r6/resident
+
+python -B scripts/audit_hisparse_results.py \
+  results/matrix-20261109-r6/pressure-native \
+  results/matrix-20261109-r6/pressure-static \
+  results/matrix-20261109-r6/pressure-group-1 \
+  results/matrix-20261109-r6/pressure-group-2
+```
+
+The audit requires four distinct passing semantic cases, the three complete
+token-ID probes with recomputed hashes, one warmup per workload, and complete
+measured phases. It checks warmup, measured and correctness-probe input identities
+across arms; it does not require identical generated tokens. It also checks
+request latency arithmetic, NVML sample ordering and window duration, and
+recomputes both per-rank peaks and the synchronized total peak. VMM-enabled arms
+must provide all four rank files and idle snapshots rather than silently losing
+their backing evidence.
+
+The historical native artifacts pass this audit. Its report explicitly leaves
+model/image/source provenance and external GPU runtime evidence unverified.
+Review those against the frozen source, container identity, controller and
+per-arm GPU observations. Token hashes validate stored output records, not KV
+byte correctness; the separate migration/decode shadow remains necessary.
+For pressure treatments, check that the intended demotions and physical releases
+actually happened. A treatment with zero actions is not evidence for migration
+performance. VMM lifetime backing peaks include probes and warmup, whereas the
+NVML phase peaks use only each measured active window.
