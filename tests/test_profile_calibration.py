@@ -124,6 +124,60 @@ class ProfileCalibrationTest(unittest.TestCase):
             ["1:resident"],
         )
 
+    def test_exports_observed_activation_workspace_evidence(self):
+        result = calibrate_profiles(
+            [],
+            {
+                "activation_prefill_bytes_per_token_max_observed": 9,
+                "activation_prefill_bytes_per_token_samples": 4,
+            },
+            min_samples=3,
+        )
+
+        self.assertTrue(result["available"])
+        self.assertEqual(
+            result["activation_workspace"],
+            {
+                "bytes_per_token": 9,
+                "samples": 4,
+                "aggregation": "observed-maximum",
+            },
+        )
+        self.assertFalse(
+            result["evidence"]["activation"]["below_min_samples"]
+        )
+
+    def test_holds_activation_profile_below_the_sample_threshold(self):
+        result = calibrate_profiles(
+            [],
+            {
+                "activation_prefill_bytes_per_token_max_observed": 9,
+                "activation_prefill_bytes_per_token_samples": 2,
+            },
+            min_samples=3,
+        )
+
+        self.assertFalse(result["available"])
+        self.assertIsNone(result["activation_workspace"])
+        self.assertTrue(
+            result["evidence"]["activation"]["below_min_samples"]
+        )
+
+    def test_rejects_malformed_activation_workspace_evidence(self):
+        with self.assertRaisesRegex(ValueError, "bytes per token"):
+            calibrate_profiles(
+                [],
+                {"activation_prefill_bytes_per_token_max_observed": True},
+            )
+        with self.assertRaisesRegex(ValueError, "sample count"):
+            calibrate_profiles(
+                [],
+                {
+                    "activation_prefill_bytes_per_token_max_observed": 1,
+                    "activation_prefill_bytes_per_token_samples": 0,
+                },
+            )
+
     def test_calibrates_kind_specific_decode_profiles_with_thresholds(self):
         rows = [
             *[

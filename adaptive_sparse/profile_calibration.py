@@ -25,6 +25,41 @@ def _positive_float(value: object, name: str) -> float:
     return float(value)
 
 
+def _observed_activation_profile(
+    stats: Mapping[str, object],
+    *,
+    min_samples: int,
+) -> tuple[dict[str, object] | None, dict[str, object] | None]:
+    raw_rate = stats.get("activation_prefill_bytes_per_token_max_observed")
+    if raw_rate is None:
+        return None, None
+    if isinstance(raw_rate, bool) or not isinstance(raw_rate, int) or raw_rate < 0:
+        raise ValueError(
+            "observed activation bytes per token must be a nonnegative integer"
+        )
+    raw_samples = stats.get("activation_prefill_bytes_per_token_samples")
+    if (
+        isinstance(raw_samples, bool)
+        or not isinstance(raw_samples, int)
+        or raw_samples < 1
+    ):
+        raise ValueError("observed activation sample count must be positive")
+    samples = raw_samples
+    evidence = {
+        "bytes_per_token": raw_rate,
+        "samples": samples,
+        "aggregation": "observed-maximum",
+        "below_min_samples": samples < min_samples,
+    }
+    if samples < min_samples:
+        return None, evidence
+    return {
+        "bytes_per_token": raw_rate,
+        "samples": samples,
+        "aggregation": "observed-maximum",
+    }, evidence
+
+
 def _request_histogram(
     by_request: Mapping[object, object], request_id: str
 ) -> dict[int, int]:
@@ -66,6 +101,9 @@ def calibrate_profiles(
     min_samples = _positive_int(min_samples, "min_samples")
     if not isinstance(stats, Mapping):
         raise TypeError("rollout stats must be an object")
+    activation_profile, activation_evidence = _observed_activation_profile(
+        stats, min_samples=min_samples
+    )
     raw_by_request = stats.get("decode_batch_sizes_by_request", {})
     if not isinstance(raw_by_request, Mapping):
         raise TypeError("decode batch sizes by request must be an object")
@@ -236,9 +274,10 @@ def calibrate_profiles(
 
     return {
         "min_samples": min_samples,
-        "available": bool(decode_profiles or prefill_profiles),
+        "available": bool(decode_profiles or prefill_profiles or activation_profile),
         "decode_batch_profiles": decode_profiles,
         "prefill_batch_profiles": prefill_profiles,
+        "activation_workspace": activation_profile,
         "evidence": {
             "decode": {
                 **decode_counts,
@@ -266,5 +305,6 @@ def calibrate_profiles(
                     if len(values) < min_samples
                 ),
             },
+            "activation": activation_evidence,
         },
     }

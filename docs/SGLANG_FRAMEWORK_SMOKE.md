@@ -103,6 +103,13 @@ TTFT/TPOT 和 `future_stats` 转成规划器可直接读取的 `decode_batch_pro
 workload 的 profile，避免把一次偶然命中写成稳定吞吐。decode profile 会保留
 `(residence, kind, batch size)` 的嵌套覆盖；某类型样本不足时自动使用同 batch 的
 aggregate 值，避免把少量观测固化成服务差异。
+激活策略现在同时记录实测 prefill 峰值增长对应的保守 bytes/token 最大值和样本数。
+标定器只在该样本数达到 `--min-samples` 时输出 `activation_workspace`，其
+`bytes_per_token` 可直接填入下一轮的
+`EKV_FUTURE_PREFILL_ACTIVATION_BYTES_PER_TOKEN`；低于门槛时保留在
+`evidence.activation`，不会把单次 allocator 峰值写成稳定预算。采样是
+best-effort：只有正增长和有 token/batch 形状的观测才计数，telemetry 读取失败会
+计入误差计数，但不会打断真实 prefill。
 
 ## 本次修复
 

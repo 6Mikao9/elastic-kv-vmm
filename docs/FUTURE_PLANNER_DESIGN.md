@@ -434,6 +434,12 @@ python scripts/calibrate_future_profiles.py \
 decode 标定还按 `(residence, kind, batch size)` 建立嵌套覆盖。只有同一组合达到
 `--min-samples` 才写入 `kind_profiles`；未知或缺失的 kind 仍只贡献 aggregate profile。
 缺少达标类型的证据时，规划器继续使用 aggregate 值。
+activation policy 还会把每次真实 prefill 的峰值增长按选中 token 数换算为向上取整的
+bytes/token，并在进程 telemetry 中保留全局最大值与样本数。标定器达到
+`--min-samples` 后输出 `activation_workspace.bytes_per_token`，可直接作为下一轮的
+`EKV_FUTURE_PREFILL_ACTIVATION_BYTES_PER_TOKEN`。最大值是保守校准，不是在线自动扩容，也不
+替代 PyTorch activation allocator。采样只接受正增长和有效 token/batch 形状；
+telemetry 读取错误仅进入诊断计数，不会让真实 prefill 失败。
 
 ### 4.1.3 已实现：已知未来 cohort 的保守等待策略
 

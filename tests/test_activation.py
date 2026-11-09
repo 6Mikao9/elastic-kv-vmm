@@ -30,6 +30,74 @@ def _sglang_modules(*, ScheduleBatch, ModelRunner, Scheduler=None):
 
 
 class ActivationTest(unittest.TestCase):
+    def test_records_conservative_activation_workspace_rates(self):
+        counters = {}
+        activation._record_activation_workspace_sample(
+            counters, growth_bytes=10, batch_tokens=4, batch_size=2
+        )
+        activation._record_activation_workspace_sample(
+            counters, growth_bytes=7, batch_tokens=3, batch_size=1
+        )
+        activation._record_activation_workspace_sample(
+            counters, growth_bytes=1, batch_tokens=0, batch_size=0
+        )
+
+        self.assertEqual(
+            counters["activation_peak_tokens_4_batch_2_bytes"], 10
+        )
+        self.assertEqual(
+            counters["activation_peak_tokens_3_batch_1_bytes"], 7
+        )
+        self.assertEqual(
+            counters["activation_prefill_bytes_per_token_max_observed"], 3
+        )
+        self.assertEqual(
+            counters["activation_prefill_bytes_per_token_samples"], 2
+        )
+
+    def test_skips_nonpositive_activation_workspace_samples(self):
+        counters = {}
+        for growth_bytes, batch_tokens, batch_size in (
+            (0, 4, 2),
+            (8, 0, 2),
+            (8, 4, 0),
+        ):
+            activation._record_activation_workspace_sample(
+                counters,
+                growth_bytes=growth_bytes,
+                batch_tokens=batch_tokens,
+                batch_size=batch_size,
+            )
+
+        self.assertEqual(
+            counters["activation_prefill_bytes_per_token_samples_skipped"], 3
+        )
+        self.assertNotIn(
+            "activation_prefill_bytes_per_token_samples", counters
+        )
+
+    def test_activation_workspace_observation_is_best_effort(self):
+        class BrokenBatch:
+            batch_size = 2
+
+            @property
+            def input_ids(self):
+                raise RuntimeError("telemetry unavailable")
+
+        counters = {
+            "activation_prefill_peak_growth_bytes_last": 8,
+        }
+        activation._observe_activation_workspace_sample(
+            counters, batch=BrokenBatch()
+        )
+
+        self.assertEqual(
+            counters["activation_prefill_bytes_per_token_sample_errors"], 1
+        )
+        self.assertNotIn(
+            "activation_prefill_bytes_per_token_samples", counters
+        )
+
     def tearDown(self):
         # install_activation_hooks() changes process-wide SGLang hooks and
         # module state. Prevent a telemetry test from enabling pressure probes

@@ -148,6 +148,15 @@ backend teardown because activation and in-flight access quiescence cannot be
 proved. This mode coordinates admission against concurrent VMM growth; it does
 not make the activation allocation itself VMM-backed.
 
+When activation measurement is enabled, prefill telemetry also records the
+observed maximum activation growth in bytes per selected token and its sample
+count. `scripts/calibrate_future_profiles.py` exports that conservative value as
+`activation_workspace` only after `--min-samples` is met, for use in the next
+run's `EKV_FUTURE_PREFILL_ACTIVATION_BYTES_PER_TOKEN`. It remains a calibrated
+budget input rather than a live allocator hook. Sampling is best-effort: only
+positive growth from a positive token/batch shape contributes a sample, and a
+telemetry read failure is counted without failing the prefill.
+
 Set `--elastic-future-stats-path` (or `EKV_FUTURE_STATS_PATH`) to atomically
 export scheduler hook counters from `adaptive_sparse.sglang_future_hook`; these
 are separate from the VMM adapter's `--elastic-stats-path` file. Once scheduler

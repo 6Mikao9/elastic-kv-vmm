@@ -46,6 +46,56 @@ def _minimum(counters, key, value):
     counters[key] = min(counters.get(key, value), value)
 
 
+def _record_activation_workspace_sample(
+    counters, *, growth_bytes, batch_tokens, batch_size
+):
+    """Record a conservative per-token activation estimate.
+
+    The exact token/batch key preserves shape-specific observations. The
+    global maximum can feed future-prefill admission without under-reserving a
+    previously observed shape.
+    """
+
+    for value, name in (
+        (growth_bytes, "growth_bytes"),
+        (batch_tokens, "batch_tokens"),
+        (batch_size, "batch_size"),
+    ):
+        if type(value) is not int or value < 0:
+            raise ValueError(f"{name} must be a nonnegative integer")
+    if batch_size < 1 or batch_tokens < 1 or growth_bytes < 1:
+        _add(counters, "activation_prefill_bytes_per_token_samples_skipped")
+        return
+    key = f"activation_peak_tokens_{batch_tokens}_batch_{batch_size}_bytes"
+    counters[key] = max(counters.get(key, 0), growth_bytes)
+    rate = -(-growth_bytes // batch_tokens)
+    counters["activation_prefill_bytes_per_token_max_observed"] = max(
+        counters.get("activation_prefill_bytes_per_token_max_observed", 0),
+        rate,
+    )
+    _add(counters, "activation_prefill_bytes_per_token_samples")
+
+
+def _observe_activation_workspace_sample(counters, *, batch):
+    """Best-effort calibration; observability must not fail inference."""
+
+    try:
+        tokens = _batch_prefill_tokens(batch)
+        growth_bytes = counters.get("activation_prefill_peak_growth_bytes_last")
+        batch_size = getattr(batch, "batch_size", None)
+        if tokens is None or growth_bytes is None or batch_size is None:
+            _add(counters, "activation_prefill_bytes_per_token_samples_skipped")
+            return
+        _record_activation_workspace_sample(
+            counters,
+            growth_bytes=growth_bytes,
+            batch_tokens=tokens,
+            batch_size=batch_size,
+        )
+    except Exception:
+        _add(counters, "activation_prefill_bytes_per_token_sample_errors")
+
+
 def _request_prompt_tokens(request):
     ids = getattr(request, "origin_input_ids", None)
     if ids is None:
@@ -81,6 +131,24 @@ def _request_prompt_tokens(request):
     return max(1, total - min(matched, total))
 
 
+def _batch_prefill_tokens(batch):
+    """Return selected extend tokens across supported SGLang staging APIs."""
+
+    for attribute in ("input_ids", "prefill_input_ids_cpu"):
+        ids = getattr(batch, attribute, None)
+        if ids is None:
+            continue
+        numel = getattr(ids, "numel", None)
+        try:
+            tokens = numel() if callable(numel) else len(ids)
+            tokens = int(tokens)
+        except Exception:
+            continue
+        if tokens >= 0:
+            return tokens
+    return None
+
+
 def estimate_prefill_workspace(waiting_queue, *, bytes_per_token, max_bytes):
     if bytes_per_token < 0 or max_bytes < 0:
         raise ValueError("prefill workspace limits must be nonnegative")
@@ -112,18 +180,8 @@ def estimate_prefill_batch_workspace(batch, *, bytes_per_token, max_bytes):
     # Newer SGLang stages extend tokens in ``prefill_input_ids_cpu`` and leaves
     # ``input_ids`` as None until forward resolves the pinned CPU tensor on the
     # compute stream. 0.5.2 keeps the flattened extend tensor in ``input_ids``.
-    for attribute in ("input_ids", "prefill_input_ids_cpu"):
-        ids = getattr(batch, attribute, None)
-        if ids is None:
-            continue
-        numel = getattr(ids, "numel", None)
-        try:
-            tokens = numel() if callable(numel) else len(ids)
-            tokens = int(tokens)
-        except (TypeError, ValueError):
-            continue
-        if tokens < 0:
-            continue
+    tokens = _batch_prefill_tokens(batch)
+    if tokens is not None:
         return PrefillWorkspaceEstimate(
             bytes=min(max_bytes, tokens * bytes_per_token),
             prompt_tokens=tokens,
@@ -443,10 +501,14 @@ def install_activation_hooks():
                             counters.get("activation_prefill_peak_growth_bytes", 0),
                             peak - allocated_before,
                         )
+                        counters["activation_prefill_peak_growth_bytes_last"] = (
+                            peak - allocated_before
+                        )
                         batch = args[0] if args else kwargs.get("forward_batch")
                         if batch is not None:
-                            key = f"activation_peak_tokens_{batch.input_ids.numel()}_batch_{batch.batch_size}_bytes"
-                            counters[key] = max(counters.get(key, 0), peak - allocated_before)
+                            _observe_activation_workspace_sample(
+                                counters, batch=batch
+                            )
                         _add(counters, "activation_prefill_calls")
                 except BaseException:
                     _abandon_prefill_claim(claim, "forward_error")
