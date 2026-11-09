@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "status": "passed",
+  "generated_utc": "2026-11-09T11:29:07.619317+00:00",
+  "scope": "Pinned SGLang bound CPU calls and exported Torch annotations; no successful KV path or model/GPU inference",
+  "functional_result": {
+    "status": "passed",
+    "scope": "Actual pinned SGLang bound calls, profiler ranges and original pre-kernel exceptions; no GPU or successful swap path",
+    "torch_version": "2.15.0.dev20261005+cu134",
+    "coordinator_sha256": "cfe012ce100ee86dcc5080ca5168d51fd4abd83e8c62ee72d3606b5feafc282e",
+    "helper_sha256": "5f789e023e4e7d42f1ebf1f1bf067114ec37924eb75dccb0eb9d6d91820bfae2",
+    "smoke_sha256": "a3559af0b8be8933ea58c536b9f20fc1be7f8948cc5b946174de6be9767df070",
+    "trace_sha256": "acc1bc58df893f2aeb8963fe631b3dc67fda031491f6157041b3af10d2b9452b",
+    "original_exceptions": {
+      "map_last_loc_to_buffer": {
+        "type": "AttributeError",
+        "message": "'HiSparseCoordinator' object has no attribute '_skip_first_backup'"
+      },
+      "swap_in_selected_blocks": {
+        "type": "AssertionError",
+        "message": "MiniMax M3 selected 256 tokens, but the HiSparse device buffer holds only 128."
+      }
+    },
+    "signatures": {
+      "map_last_loc_to_buffer": "(self, seq_lens: 'torch.Tensor', out_cache_loc: 'torch.Tensor', req_pool_indices: 'torch.Tensor', seq_lens_cpu: 'torch.Tensor', req_pool_indices_cpu: 'torch.Tensor') -> 'None'",
+      "swap_in_selected_blocks": "(self, req_pool_indices: 'torch.Tensor', seq_lens: 'torch.Tensor', top_k_blocks: 'torch.Tensor', layer_id: 'int', sparse_block_size: 'int') -> 'torch.Tensor'"
+    },
+    "events": [
+      {
+        "name": "ekv/native/map_latest",
+        "cpu_time_total_us": 572.252
+      },
+      {
+        "name": "ekv/native/swap",
+        "cpu_time_total_us": 27.538999999999987
+      }
+    ],
+    "cuda_initialized": false
+  },
+  "exported_annotations": [
+    {
+      "name": "ekv/native/map_latest",
+      "category": "user_annotation",
+      "cpu_wall_us": 572.252
+    },
+    {
+      "name": "ekv/native/swap",
+      "category": "user_annotation",
+      "cpu_wall_us": 27.539
+    }
+  ],
+  "gpu_activity_events": 0,
+  "raw_artifacts": {
+    "capture/result.json": {
+      "bytes": 1561,
+      "sha256": "c03cd4736d7f444eb6a2a17404b525638e77080efd83122a106dcc0540c90658"
+    },
+    "capture/trace.json": {
+      "bytes": 3692,
+      "sha256": "acc1bc58df893f2aeb8963fe631b3dc67fda031491f6157041b3af10d2b9452b"
+    },
+    "command.json": {
+      "bytes": 696,
+      "sha256": "ce0c3dbdf1b88a9ec7a2abf04cd6140f297bfa4c0c953127c9d92fb0d8225b42"
+    },
+    "state.json": {
+      "bytes": 70,
+      "sha256": "9af7263a5da063a33e824208f6dffa3c3a0972dd18383896a3152c9e5e9ca1d2"
+    },
+    "launch.log": {
+      "bytes": 2108,
+      "sha256": "ad0af3921544175bab8dfc4965171e4938a33f9a893d17a3372b0d94bf9da364"
+    }
+  },
+  "notes": [
+    "GPU initialization was disabled. Profiler device enumeration warnings in the container are preserved in launch.log.",
+    "Input failures are deliberate and occur before native kernel launch; original and instrumented exception type/message match.",
+    "This validates the binding and reader annotation category, not successful GPU swap, mapping, migration or throughput.",
+    "The fresh-process runner enables instrumentation before imports. Runtime environment hot-switching is not supported."
+  ]
+}

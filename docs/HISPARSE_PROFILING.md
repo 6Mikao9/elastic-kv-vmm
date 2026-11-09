@@ -52,6 +52,22 @@ real Torch CPU capture checked nesting and original exception propagation.
 These checks do not validate a marked full-model GPU capture. The r6/r7/r8
 frozen comparison source predates these additions and remains unchanged.
 
+The [pinned-class smoke](../tests/smoke_profile_ranges_pinned.py) subsequently
+passed inside the actual MiniMax image (Torch 2.15.0.dev20261005+cu134), with
+GPU visibility disabled. It verifies the coordinator source hash, method
+signatures, idempotent installation and real bound calls. Deliberately invalid
+CPU inputs fail before any kernel; the original exception type and message
+survive instrumentation, and the exported Chrome trace contains exactly one
+positive `user_annotation` event for each native scope. CUDA remains
+uninitialized. [Evidence and raw artifact hashes](../results/profiling/scope-pinned-bound-20261109.json)
+cover this CPU entry-path check only. Successful native KV operations, mixed
+dispatch, and GPU launch attribution still require the real GPU runs.
+
+```bash
+CUDA_VISIBLE_DEVICES= PYTHONPATH=. python -B tests/smoke_profile_ranges_pinned.py \
+  --output-dir /reports/scope-pinned-bound
+```
+
 ## Nsight Systems installation, 2026-11-09
 
 Nsight Systems CLI **2026.5.1.161** is now extracted into the persistent container
