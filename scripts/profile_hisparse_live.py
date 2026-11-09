@@ -16,6 +16,8 @@ CUDA_API_CATEGORIES = ("cuda_driver", "cuda_runtime")
 WAIT_CALLS = re.compile(r"Synchronize|StreamWaitEvent")
 DEFAULT_OUTPUT_TOKEN_CAP = 16
 MAX_OUTPUT_TOKEN_CAP = 32
+DEFAULT_OUTPUT_LENGTH_POLICY = "clip"
+OUTPUT_LENGTH_POLICIES = (DEFAULT_OUTPUT_LENGTH_POLICY, "proportional")
 
 
 def interval_union_us(intervals):
@@ -137,15 +139,30 @@ def control_profile(opener, base_url, endpoint, payload=None):
             raise RuntimeError(f"{endpoint} rejected: {status.get('message', 'unknown error')}")
 
 
-def capture(base_url, output, workload, opener, output_token_cap=DEFAULT_OUTPUT_TOKEN_CAP):
+def capture(base_url, output, workload, opener, output_token_cap=DEFAULT_OUTPUT_TOKEN_CAP,
+            *, output_length_policy=DEFAULT_OUTPUT_LENGTH_POLICY):
+    if type(output_token_cap) is not int or not 1 <= output_token_cap <= MAX_OUTPUT_TOKEN_CAP:
+        raise ValueError(f"profile output token cap must be an integer from 1 to {MAX_OUTPUT_TOKEN_CAP}")
+    if output_length_policy not in OUTPUT_LENGTH_POLICIES:
+        raise ValueError(f"unknown profile output length policy: {output_length_policy!r}")
+
     from benchmarks.client import run_requests, write_json
     from benchmarks.hisparse_client import WORKLOADS, spec, verify
 
+    if workload not in WORKLOADS:
+        raise ValueError(f"unknown profile workload: {workload!r}")
+    concurrency, shapes = WORKLOADS[workload]
+    if output_length_policy == "proportional":
+        longest = max(outputs for _, outputs in shapes)
+        scale = min(output_token_cap, longest)
+        shapes = [(inputs, max(1, (outputs * scale + longest - 1) // longest))
+                  for inputs, outputs in shapes]
+    else:
+        shapes = [(inputs, min(outputs, output_token_cap)) for inputs, outputs in shapes]
+    specs = [spec(f"measured/{workload}/0", index, inputs, outputs)
+             for index, (inputs, outputs) in enumerate(shapes)]
     trace_dir = (Path(output) / "profile_traces").resolve()
     trace_dir.mkdir()
-    concurrency, shapes = WORKLOADS[workload]
-    specs = [spec(f"measured/{workload}/0", index, inputs, min(outputs, output_token_cap))
-             for index, (inputs, outputs) in enumerate(shapes)]
 
     def phase():
         records, _, _ = run_requests(base_url + "/generate", specs, concurrency,
@@ -180,6 +197,7 @@ def capture(base_url, output, workload, opener, output_token_cap=DEFAULT_OUTPUT_
         "workload": workload,
         "concurrency": concurrency,
         "output_token_cap": output_token_cap,
+        "output_length_policy": output_length_policy,
         "requests": captured,
         "ranks": inspect_traces(trace_dir),
         "limitations": (

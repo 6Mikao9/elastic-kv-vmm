@@ -107,6 +107,25 @@ the recorded request shapes, not the workload name, when interpreting results.
 These captures run with CUDA Graph, scheduler overlap and radix caching
 disabled. They cannot establish the benefit of enabling those features.
 
+New diagnostic runs can opt into `--profile-output-length-policy proportional`.
+This scales output lengths by a common factor, rounds upward to whole tokens,
+and never increases an original length. With `mixed12k_unequal` and cap 32,
+the original outputs `64, 64, 128, 64` become `16, 16, 32, 16`; the original
+prompt IDs and input lengths are retained. This preserves the longer request
+in the shortened diagnostic. Exact ratios can change through rounding, and
+this short capture still does not reproduce the complete benchmark lifetime.
+The default `clip` policy is unchanged. Explicit policy flags require profiling
+and cannot silently alter regular performance runs. The manifest, outer result
+and profile summary record the policy, with captured request shapes recorded
+in the latter two. Apply the same workload, cap and policy to every arm in a
+matched diagnostic comparison:
+
+```bash
+# Add to each arm's existing, otherwise matched diagnostic command.
+--profile-workload mixed12k_unequal --profile-output-token-cap 32 \
+  --profile-output-length-policy proportional
+```
+
 ## Nsight Systems installation, 2026-11-09
 
 Nsight Systems CLI **2026.5.1.161** is now extracted into the persistent container

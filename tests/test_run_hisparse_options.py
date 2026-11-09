@@ -20,6 +20,7 @@ from scripts.run_hisparse_smoke import (
     server_base_url,
     shared_prefix_environment,
     shared_prefix_manifest,
+    validate_profile_output_options,
     validate_resident_hint_options,
     validate_resident_broker_options,
     validate_shared_prefix_reuse_options,
@@ -29,6 +30,35 @@ from scripts.run_hisparse_smoke import (
 
 
 class ResidentHintRunnerOptionsTest(unittest.TestCase):
+    def test_profile_output_defaults_and_opt_in(self):
+        parser = argparse.ArgumentParser()
+        for workload, cap, policy, expected in (
+            (None, None, None, (None, None)),
+            ("mixed", None, None, (16, "clip")),
+            ("mixed12k_unequal", 32, "proportional", (32, "proportional")),
+        ):
+            with self.subTest(workload=workload, cap=cap, policy=policy):
+                args = argparse.Namespace(profile_workload=workload, profile_output_token_cap=cap,
+                                          profile_output_length_policy=policy)
+                validate_profile_output_options(parser, args)
+                self.assertEqual((args.profile_output_token_cap, args.profile_output_length_policy),
+                                 expected)
+
+    def test_profile_output_options_require_a_profile_and_valid_cap(self):
+        parser = argparse.ArgumentParser()
+        for workload, cap, policy, message in (
+            (None, None, "clip", "requires --profile-workload"),
+            (None, 32, None, "token cap requires profiling"),
+            ("mixed", 33, None, "value from 1 to 32"),
+        ):
+            with self.subTest(workload=workload, cap=cap, policy=policy):
+                args = argparse.Namespace(profile_workload=workload, profile_output_token_cap=cap,
+                                          profile_output_length_policy=policy)
+                stderr = StringIO()
+                with redirect_stderr(stderr), self.assertRaises(SystemExit):
+                    validate_profile_output_options(parser, args)
+                self.assertIn(message, stderr.getvalue())
+
     def test_profile_ranges_cannot_leak_into_performance_runs(self):
         environment = {"EKV_PROFILE_RANGES": "1", "CUDA_VISIBLE_DEVICES": "GPU-test"}
         configure_profile_environment(environment, None)

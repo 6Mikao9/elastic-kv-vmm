@@ -91,7 +91,8 @@ class HiSparseProfileTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "multiple devices"):
             inspect_traces(self.output)
 
-    def run_capture(self, *, fail_phase=False, fail_stop=False):
+    def run_capture(self, *, fail_phase=False, fail_stop=False, workload="mixed",
+                    shapes=None, cap=12, policy=None, expected=(8, 12, 8, 12)):
         calls = []
         trace_dir = self.output / "profile_traces"
         payloads = []
@@ -121,8 +122,10 @@ class HiSparseProfileTest(unittest.TestCase):
 
         client = SimpleNamespace(run_requests=fake_run_requests,
                                  write_json=lambda path, value: path.write_text(json.dumps(value)))
+        shapes = shapes or [(128, 8), (8192, 128)] * 2
+        options = {"output_length_policy": policy} if policy is not None else {}
         workloads = SimpleNamespace(
-            WORKLOADS={"mixed": (4, [(128, 8), (8192, 128)] * 2)},
+            WORKLOADS={workload: (4, shapes)},
             spec=lambda key, index, inputs, outputs: {
                 "request_id": f"hisparse/{key}/{index}", "input_tokens": inputs,
                 "requested_output_tokens": outputs,
@@ -140,22 +143,27 @@ class HiSparseProfileTest(unittest.TestCase):
                     if fail_phase:
                         with self.assertLogs("scripts.profile_hisparse_live", "WARNING") as logs:
                             with self.assertRaisesRegex(RuntimeError, "generation failed"):
-                                capture(base_url, self.output, "mixed", opener,
-                                        output_token_cap=12)
+                                capture(base_url, self.output, workload, opener,
+                                        output_token_cap=cap, **options)
                         self.assertIn("cleanup also failed", logs.output[0])
                     else:
-                        report = capture(base_url, self.output, "mixed", opener,
-                                         output_token_cap=12)
+                        report = capture(base_url, self.output, workload, opener,
+                                         output_token_cap=cap, **options)
                         self.assertEqual(len(report["ranks"]), 4)
                         self.assertEqual(len(report["requests"]), 4)
-                        self.assertEqual(report["output_token_cap"], 12)
+                        self.assertEqual(report["output_token_cap"], cap)
+                        self.assertEqual(report["output_length_policy"], policy or "clip")
+                        self.assertEqual([row["output_tokens"] for row in report["requests"]],
+                                         list(expected))
             finally:
                 server.shutdown()
                 thread.join()
         self.assertEqual(calls, ["/generate", "/start_profile", "/generate", "/stop_profile"])
         self.assertEqual(phase_specs[0], phase_specs[1])
         self.assertEqual([spec["requested_output_tokens"] for spec in phase_specs[0]],
-                         [8, 12, 8, 12])
+                         list(expected))
+        self.assertEqual([spec["input_tokens"] for spec in phase_specs[0]],
+                         [inputs for inputs, _ in shapes])
         self.assertEqual(payloads, [{"output_dir": str(trace_dir.resolve()),
                                      "activities": ["CPU", "GPU"], "merge_profiles": False,
                                      "with_stack": False, "record_shapes": False}])
@@ -163,6 +171,27 @@ class HiSparseProfileTest(unittest.TestCase):
 
     def test_capture(self):
         self.run_capture()
+
+    def test_proportional_capture_preserves_unequal_lengths(self):
+        self.run_capture(workload="mixed12k_unequal", cap=32, policy="proportional",
+                         shapes=[(128, 64), (12288, 64), (12288, 128), (128, 64)],
+                         expected=(16, 16, 32, 16))
+
+    def test_proportional_capture_rounds_up(self):
+        self.run_capture(cap=10, policy="proportional", shapes=[(128, 9), (8192, 32)] * 2,
+                         expected=(3, 10, 3, 10))
+
+    def test_proportional_capture_does_not_increase_lengths(self):
+        self.run_capture(cap=32, policy="proportional", shapes=[(128, 1), (8192, 2)] * 2,
+                         expected=(1, 2, 1, 2))
+
+    def test_capture_rejects_invalid_options_before_creating_traces(self):
+        for cap in (0, 33, True, 16.0):
+            with self.subTest(cap=cap), self.assertRaisesRegex(ValueError, "token cap"):
+                capture("", self.output, "mixed", None, output_token_cap=cap)
+        with self.assertRaisesRegex(ValueError, "unknown profile output length policy"):
+            capture("", self.output, "mixed", None, output_length_policy="unknown")
+        self.assertFalse((self.output / "profile_traces").exists())
 
     def test_failed_generation_stops_profile_and_preserves_original_error(self):
         self.run_capture(fail_phase=True, fail_stop=True)

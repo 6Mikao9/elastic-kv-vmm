@@ -25,7 +25,12 @@ from adaptive_sparse.sglang_future_hook import (
     planned_cohort_sizes,
 )
 from benchmarks.client import digest_ids, prompt_ids, write_json
-from scripts.profile_hisparse_live import DEFAULT_OUTPUT_TOKEN_CAP, MAX_OUTPUT_TOKEN_CAP
+from scripts.profile_hisparse_live import (
+    DEFAULT_OUTPUT_LENGTH_POLICY,
+    DEFAULT_OUTPUT_TOKEN_CAP,
+    MAX_OUTPUT_TOKEN_CAP,
+    OUTPUT_LENGTH_POLICIES,
+)
 from scripts.run_case import HOST, PORT, ROOT, leader_exit, on_sigterm, stop_server
 
 
@@ -42,6 +47,18 @@ def configure_profile_environment(environment, workload):
     if workload:
         environment["SGLANG_PROFILE_V2"] = "0"
         environment["EKV_PROFILE_RANGES"] = "1"
+
+
+def validate_profile_output_options(parser, args):
+    if args.profile_output_token_cap is not None:
+        if not args.profile_workload or not 1 <= args.profile_output_token_cap <= MAX_OUTPUT_TOKEN_CAP:
+            parser.error(f"profile output token cap requires profiling and a value from 1 to {MAX_OUTPUT_TOKEN_CAP}")
+    elif args.profile_workload:
+        args.profile_output_token_cap = DEFAULT_OUTPUT_TOKEN_CAP
+    if args.profile_output_length_policy is not None and not args.profile_workload:
+        parser.error("profile output length policy requires --profile-workload")
+    if args.profile_workload and args.profile_output_length_policy is None:
+        args.profile_output_length_policy = DEFAULT_OUTPUT_LENGTH_POLICY
 
 
 def validate_server_endpoint(parser, *, host, port):
@@ -361,6 +378,8 @@ def main():
                         help="capture one warmed CPU/CUDA phase on TP4 in a diagnostic run")
     parser.add_argument("--profile-output-token-cap", type=int,
                         help=f"cap each profile request at this many output tokens (default: {DEFAULT_OUTPUT_TOKEN_CAP})")
+    parser.add_argument("--profile-output-length-policy", choices=OUTPUT_LENGTH_POLICIES,
+                        help="clip each output or scale the workload proportionally (default: clip)")
     parser.add_argument("--forced-replay", action="store_true",
                         help="Controlled benchmark with synthetic fixed generated token IDs")
     parser.add_argument("--warmup-once", action="store_true")
@@ -635,11 +654,7 @@ def main():
     if args.vmm_backing and not library.is_file():
         parser.error("compile native/libelastic_vmm.so before using VMM")
     gpu_uuids = os.environ.get("EKV_BENCH_GPU_UUIDS", "").split(",")
-    if args.profile_output_token_cap is not None:
-        if not args.profile_workload or not 1 <= args.profile_output_token_cap <= MAX_OUTPUT_TOKEN_CAP:
-            parser.error(f"profile output token cap requires profiling and a value from 1 to {MAX_OUTPUT_TOKEN_CAP}")
-    elif args.profile_workload:
-        args.profile_output_token_cap = DEFAULT_OUTPUT_TOKEN_CAP
+    validate_profile_output_options(parser, args)
     if args.profile_workload:
         from benchmarks.hisparse_client import WORKLOADS
 
@@ -892,6 +907,8 @@ def main():
         "live_profile_diagnostic": args.profile_workload,
         "ekv_profile_ranges": environment.get("EKV_PROFILE_RANGES") == "1",
         "profile_output_token_cap": args.profile_output_token_cap,
+        **({"profile_output_length_policy": args.profile_output_length_policy}
+           if args.profile_workload else {}),
         "forced_replay": args.forced_replay,
         "warmup_once": args.warmup_once,
         "semantic_probes": args.semantic_probes,
@@ -984,6 +1001,9 @@ def main():
                "future_require_complete_cohorts": args.future_require_complete_cohorts,
                "live_profile_diagnostic": args.profile_workload,
                "status": "running", "probes": []}
+    if args.profile_workload:
+        results["profile_output_token_cap"] = args.profile_output_token_cap
+        results["profile_output_length_policy"] = args.profile_output_length_policy
     server = None
     step = "startup"
     previous = signal.signal(signal.SIGTERM, on_sigterm)
@@ -1098,8 +1118,10 @@ def main():
             from scripts.profile_hisparse_live import capture
 
             step = "live_profile"
-            capture(base_url, output, args.profile_workload, opener,
-                    output_token_cap=args.profile_output_token_cap)
+            profile = capture(base_url, output, args.profile_workload, opener,
+                              output_token_cap=args.profile_output_token_cap,
+                              output_length_policy=args.profile_output_length_policy)
+            results["profile_requests"] = profile["requests"]
         if args.logical_shadow:
             step = "logical_shadow_validation"
             if args.validation_rounds:
