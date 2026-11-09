@@ -50,6 +50,12 @@ rows; it no longer synchronizes or launches a native call independently for
 every consumer in the layer. Partial rows are overwritten only in their shared
 lanes, preserving the native result elsewhere.
 
+The process-local registry also indexes live sources by exact fingerprint and
+by `(group, tokens)` geometry. A consumer therefore examines only the matching
+group instead of scanning every resident source. Source replacement, staging,
+promotion and removal update the indexes at the same safe boundary, and a
+mismatched fingerprint still forces native fallback rather than sharing pages.
+
 Promotion restores the metadata source after the complete GPU mapping has been
 published. The scheduler's VMM reclaim path remains authoritative: direct reuse
 never extends a source lease, and a Top-K lookup from the same layer remains

@@ -302,6 +302,12 @@ class SharedPrefixRegistry:
     def __init__(self) -> None:
         self._claims: dict[int, PrefixClaim] = {}
         self._sources: dict[int, SharedPrefixSource] = {}
+        self._source_keys: dict[int, tuple[str, int, bytes]] = {}
+        self._sources_by_fingerprint: dict[
+            tuple[str, int, bytes], set[int]
+        ] = {}
+        self._sources_by_geometry: dict[tuple[str, int], set[int]] = {}
+        self._sources_by_group: dict[str, set[int]] = {}
         self.stats = {
             "claims": 0,
             "sources_registered": 0,
@@ -323,13 +329,21 @@ class SharedPrefixRegistry:
 
     def register_source(self, row: int, request: Any, claim: PrefixClaim) -> None:
         self._validate_row(row)
+        self._discard_source_index(row)
         self._claims[row] = claim
         replaced = row in self._sources
         self._sources[row] = SharedPrefixSource(row, request, claim)
+        key = (claim.group, claim.tokens, claim.fingerprint)
+        geometry = (claim.group, claim.tokens)
+        self._source_keys[row] = key
+        self._sources_by_fingerprint.setdefault(key, set()).add(row)
+        self._sources_by_geometry.setdefault(geometry, set()).add(row)
+        self._sources_by_group.setdefault(claim.group, set()).add(row)
         if not replaced:
             self.stats["sources_registered"] += 1
 
     def remove_source(self, row: int) -> None:
+        self._discard_source_index(row)
         if self._sources.pop(row, None) is not None:
             self.stats["sources_removed"] += 1
 
@@ -349,24 +363,21 @@ class SharedPrefixRegistry:
         if claim is None:
             return None
         self.stats["lookups"] += 1
-        inconsistent = False
-        matches = []
-        for source in self._sources.values():
-            if source.row == row or source.claim.group != claim.group:
-                continue
-            if source.claim.tokens != claim.tokens:
-                inconsistent = True
-                continue
-            if source.claim.fingerprint != claim.fingerprint:
-                inconsistent = True
-                continue
-            if getattr(source.request, "hisparse_staging", False):
-                self.stats["staging_sources"] += 1
-                continue
-            matches.append(source)
-        if matches:
+        source = self._canonical_source(
+            (claim.group, claim.tokens, claim.fingerprint), exclude_row=row
+        )
+        if source is not None:
             self.stats["shared_hits"] += 1
-            return min(matches, key=lambda candidate: candidate.row)
+            return source
+        group_rows = self._sources_by_group.get(claim.group, ())
+        inconsistent = any(
+            source_row != row
+            and (
+                self._sources[source_row].claim.tokens != claim.tokens
+                or self._sources[source_row].claim.fingerprint != claim.fingerprint
+            )
+            for source_row in group_rows
+        )
         if inconsistent:
             self.stats["inconsistent_group"] += 1
         else:
@@ -391,13 +402,9 @@ class SharedPrefixRegistry:
         for consumer_row, claim in self._claims.items():
             if consumer_row == row or consumer_row in self._sources:
                 continue
-            selected = min((
-                candidate for candidate in self._sources.values()
-                if candidate.claim.group == claim.group
-                and candidate.claim.tokens == claim.tokens
-                and candidate.claim.fingerprint == claim.fingerprint
-                and not getattr(candidate.request, "hisparse_staging", False)
-            ), key=lambda candidate: candidate.row, default=None)
+            selected = self._canonical_source(
+                (claim.group, claim.tokens, claim.fingerprint)
+            )
             if selected is not None and selected.row == row:
                 consumers += 1
         self.stats["donor_consumers"] += consumers
@@ -417,13 +424,54 @@ class SharedPrefixRegistry:
         if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 1:
             raise ValueError("shared prefix tokens must be positive")
         self.stats["geometry_donor_lookups"] += 1
-        selected = min((
-            source for source in self._sources.values()
-            if source.claim.group == group
-            and source.claim.tokens == tokens
-            and not getattr(source.request, "hisparse_staging", False)
-        ), key=lambda source: source.row, default=None)
+        selected = self._canonical_source((group, tokens), geometry=True)
         return selected is not None and selected.row == row
+
+    def _canonical_source(
+        self,
+        key: tuple[str, int, bytes] | tuple[str, int],
+        *,
+        geometry: bool = False,
+        exclude_row: int | None = None,
+    ) -> SharedPrefixSource | None:
+        index = self._sources_by_geometry if geometry else self._sources_by_fingerprint
+        rows = index.get(key)
+        if not rows:
+            return None
+        for row in sorted(rows):
+            if row == exclude_row:
+                continue
+            source = self._sources.get(row)
+            if source is None:
+                raise RuntimeError("shared-prefix source index is inconsistent")
+            if getattr(source.request, "hisparse_staging", False):
+                self.stats["staging_sources"] += 1
+                continue
+            return source
+        return None
+
+    def _discard_source_index(self, row: int) -> None:
+        key = self._source_keys.pop(row, None)
+        source = self._sources.get(row)
+        if source is None:
+            return
+        if key is not None:
+            rows = self._sources_by_fingerprint.get(key)
+            if rows is not None:
+                rows.discard(row)
+                if not rows:
+                    self._sources_by_fingerprint.pop(key, None)
+        geometry = (source.claim.group, source.claim.tokens)
+        rows = self._sources_by_geometry.get(geometry)
+        if rows is not None:
+            rows.discard(row)
+            if not rows:
+                self._sources_by_geometry.pop(geometry, None)
+        rows = self._sources_by_group.get(source.claim.group)
+        if rows is not None:
+            rows.discard(row)
+            if not rows:
+                self._sources_by_group.pop(source.claim.group, None)
 
     def snapshot(self) -> dict[str, int]:
         result = dict(self.stats)

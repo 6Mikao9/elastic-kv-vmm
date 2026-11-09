@@ -237,6 +237,41 @@ class SharedPrefixTest(unittest.TestCase):
         self.assertIsNone(registry.resolve(1))
         self.assertEqual(registry.snapshot()["active_claims"], 2)
 
+    def test_source_replacement_updates_both_lookup_indexes(self):
+        registry = SharedPrefixRegistry()
+        source_request = request([1, 2, 3, 4])
+        original = make_prefix_claim(
+            source_request, group="system", shared_tokens=3
+        )
+        registry.register_source(0, source_request, original)
+        registry.register_claim(1, original)
+        self.assertEqual(registry.resolve(1).row, 0)
+        self.assertIsNone(registry.resolve(0))
+        self.assertEqual(registry.snapshot()["missing_sources"], 1)
+        self.assertTrue(
+            registry.prefers_geometry_donor(0, group="system", tokens=3)
+        )
+
+        replacement = make_prefix_claim(
+            request([9, 8, 7, 6]), group="system", shared_tokens=3
+        )
+        registry.register_source(0, request([9, 8, 7, 6]), replacement)
+        self.assertIsNone(registry.resolve(1))
+        self.assertEqual(
+            registry.snapshot()["inconsistent_group"], 1
+        )
+        self.assertTrue(
+            registry.prefers_geometry_donor(0, group="system", tokens=3)
+        )
+
+        registry.register_claim(2, replacement)
+        self.assertEqual(registry.resolve(2).row, 0)
+        registry.remove_source(0)
+        self.assertIsNone(registry.resolve(2))
+        self.assertFalse(
+            registry.prefers_geometry_donor(0, group="system", tokens=3)
+        )
+
     def test_only_exact_live_host_backed_consumers_count_for_donor(self):
         registry = SharedPrefixRegistry()
         source_request = request([1, 2, 3, 4])
