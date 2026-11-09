@@ -401,7 +401,9 @@ request/cohort ID 和 mixed prefill/decode 标记，用于恢复 occupancy 变�
 `--require-decode-occupancy` 可以要求至少观察到真实 decode batch；batch size
 不一致本身仍作为测量证据保留，不会伪装成失败或性能收益。`decode_trace` 的时间是
 单个 server process 的 `monotonic` 时间，不能直接和另一进程的客户端时间戳相减，
-跨进程对齐仍需显式时钟校准。
+跨进程对齐仍需显式时钟校准。分析器还用相邻调度事件的时间差恢复每个请求在各真实
+batch size 上驻留的时长，并输出时间加权的 exact fraction；最后一个事件没有下一次
+观察，因而不被虚构时长补全。
 
 ### 4.1.3 已实现：已知未来 cohort 的保守等待策略
 

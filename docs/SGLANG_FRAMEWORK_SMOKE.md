@@ -90,7 +90,9 @@ runner 现在会落盘逐请求 TTFT、TPOT、总延迟、输出 token/s、整�
 `decode_batch_size` 与 SGLang hook 观测到的真实 batch-size histogram 对齐，并导出
 最近 4096 个 decode batch 的有界事件序列。`--require-decode-occupancy` 要求运行
 至少出现一次真实 decode 观测，适合接入回归；实际 batch size 与计划不同会记录为
-结构证据，不会直接改写成吞吐结论。
+结构证据，不会直接改写成吞吐结论。相邻事件之间的单调时钟差会用于计算每个请求在
+真实 batch size 上的驻留时长和时间加权 exact fraction；最后一个未闭合事件明确
+不计入时长。
 
 ## 本次修复
 

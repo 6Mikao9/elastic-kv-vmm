@@ -22,12 +22,20 @@ class DecodeOccupancyTest(unittest.TestCase):
                     {
                         "observed_at_s": 10.0,
                         "batch_size": 4,
+                        "request_ids": ["mixed"],
                         "mixed_prefill_decode": False,
                     },
                     {
                         "observed_at_s": 10.125,
                         "batch_size": 2,
+                        "request_ids": ["matching", "mixed"],
                         "mixed_prefill_decode": True,
+                    },
+                    {
+                        "observed_at_s": 10.25,
+                        "batch_size": 2,
+                        "request_ids": ["matching"],
+                        "mixed_prefill_decode": False,
                     },
                 ],
             },
@@ -40,6 +48,10 @@ class DecodeOccupancyTest(unittest.TestCase):
         self.assertFalse(by_id["mixed"]["exactly_matches_plan"])
         self.assertTrue(by_id["matching"]["exactly_matches_plan"])
         self.assertIsNone(by_id["missing"]["weighted_mean_batch_size"])
+        self.assertEqual(by_id["mixed"]["trace_attributed_duration_s"], 0.25)
+        self.assertEqual(by_id["mixed"]["trace_exact_duration_s"], 0.125)
+        self.assertEqual(by_id["mixed"]["trace_exact_time_fraction"], 0.5)
+        self.assertEqual(by_id["matching"]["trace_exact_time_fraction"], 1.0)
         self.assertEqual(
             result["summary"],
             {
@@ -53,17 +65,33 @@ class DecodeOccupancyTest(unittest.TestCase):
                 "requests_fully_matching": 1,
                 "requests_with_mismatch": 1,
                 "complete_request_coverage": False,
+                "requests_with_trace_occupancy": 2,
+                "requests_with_trace_mismatch": 1,
+                "trace_exact_time_fraction": 2 / 3,
             },
         )
         self.assertEqual(
             result["trace"],
             {
-                "event_count": 2,
+                "event_count": 3,
                 "mixed_event_count": 1,
-                "batch_size_histogram": {"2": 1, "4": 1},
+                "batch_size_histogram": {"2": 2, "4": 1},
                 "start_s": 10.0,
-                "end_s": 10.125,
-                "duration_s": 0.125,
+                "end_s": 10.25,
+                "duration_s": 0.25,
+                "attributed_duration_s": 0.25,
+                "request_occupancy": [
+                    {
+                        "request_id": "matching",
+                        "attributed_duration_s": 0.125,
+                        "batch_size_durations_s": {"2": 0.125},
+                    },
+                    {
+                        "request_id": "mixed",
+                        "attributed_duration_s": 0.25,
+                        "batch_size_durations_s": {"2": 0.125, "4": 0.125},
+                    },
+                ],
             },
         )
 
@@ -91,6 +119,25 @@ class DecodeOccupancyTest(unittest.TestCase):
                     "decode_trace": [
                         {"observed_at_s": None, "batch_size": 1}
                     ],
+                },
+            )
+        with self.assertRaisesRegex(ValueError, "invalid request IDs"):
+            compare_decode_occupancy(
+                [{"request_id": "bad", "decode_batch_size": 1}],
+                {
+                    "decode_trace": [
+                        {"observed_at_s": 1.0, "batch_size": 1, "request_ids": "bad"}
+                    ]
+                },
+            )
+        with self.assertRaisesRegex(ValueError, "nondecreasing"):
+            compare_decode_occupancy(
+                [{"request_id": "bad", "decode_batch_size": 1}],
+                {
+                    "decode_trace": [
+                        {"observed_at_s": 2.0, "batch_size": 1},
+                        {"observed_at_s": 1.0, "batch_size": 1},
+                    ]
                 },
             )
 

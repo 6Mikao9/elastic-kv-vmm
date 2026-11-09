@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import math
 from collections.abc import Iterable, Mapping
 
@@ -46,12 +47,15 @@ def _trace_summary(value: object) -> dict[str, object]:
             "start_s": None,
             "end_s": None,
             "duration_s": None,
+            "attributed_duration_s": 0.0,
+            "request_occupancy": [],
         }
     if not isinstance(value, list):
         raise TypeError("decode trace must be a list")
     times: list[float] = []
     sizes: dict[int, int] = {}
     mixed = 0
+    normalized_events: list[tuple[float, int, tuple[str, ...]]] = []
     for index, event in enumerate(value):
         if not isinstance(event, Mapping):
             raise TypeError(f"decode trace event {index} must be an object")
@@ -68,6 +72,38 @@ def _trace_summary(value: object) -> dict[str, object]:
         size = _positive_integer(event.get("batch_size"), "decode trace batch size")
         sizes[size] = sizes.get(size, 0) + 1
         mixed += int(event.get("mixed_prefill_decode") is True)
+        raw_request_ids = event.get("request_ids", [])
+        if not isinstance(raw_request_ids, list) or any(
+            not isinstance(request_id, str) or not request_id
+            for request_id in raw_request_ids
+        ):
+            raise ValueError(
+                f"decode trace event {index} has invalid request IDs"
+            )
+        normalized_events.append(
+            (
+                float(observed_at_s),
+                size,
+                tuple(sorted(set(raw_request_ids))),
+            )
+        )
+    if any(
+        current[0] < previous[0]
+        for previous, current in itertools.pairwise(normalized_events)
+    ):
+        raise ValueError("decode trace observation times must be nondecreasing")
+
+    durations_by_request: dict[str, dict[int, float]] = {}
+    attributed_duration_s = 0.0
+    for current, following in itertools.pairwise(normalized_events):
+        duration_s = following[0] - current[0]
+        if duration_s <= 0:
+            continue
+        attributed_duration_s += duration_s
+        size = current[1]
+        for request_id in current[2]:
+            by_size = durations_by_request.setdefault(request_id, {})
+            by_size[size] = by_size.get(size, 0.0) + duration_s
     start = min(times) if times else None
     end = max(times) if times else None
     return {
@@ -79,6 +115,18 @@ def _trace_summary(value: object) -> dict[str, object]:
         "start_s": start,
         "end_s": end,
         "duration_s": None if start is None else end - start,
+        "attributed_duration_s": attributed_duration_s,
+        "request_occupancy": [
+            {
+                "request_id": request_id,
+                "attributed_duration_s": sum(by_size.values()),
+                "batch_size_durations_s": {
+                    str(size): duration
+                    for size, duration in sorted(by_size.items())
+                },
+            }
+            for request_id, by_size in sorted(durations_by_request.items())
+        ],
     }
 
 
@@ -99,6 +147,11 @@ def compare_decode_occupancy(
     if not isinstance(raw_by_request, Mapping):
         raise TypeError("decode batch sizes by request must be an object")
 
+    trace = _trace_summary(stats.get("decode_trace"))
+    trace_by_request = {
+        str(record["request_id"]): record
+        for record in trace["request_occupancy"]
+    }
     records: list[dict[str, object]] = []
     seen_ids: set[str] = set()
     for index, row in enumerate(rows):
@@ -117,6 +170,19 @@ def compare_decode_occupancy(
         observed_events = sum(histogram.values())
         exact_events = histogram.get(planned, 0)
         weighted_size = sum(size * count for size, count in histogram.items())
+        trace_occupancy = trace_by_request.get(request_id)
+        trace_attributed_s = (
+            0.0
+            if trace_occupancy is None
+            else float(trace_occupancy["attributed_duration_s"])
+        )
+        trace_exact_s = (
+            0.0
+            if trace_occupancy is None
+            else float(
+                trace_occupancy["batch_size_durations_s"].get(str(planned), 0.0)
+            )
+        )
         dominant_size = (
             None
             if not histogram
@@ -143,6 +209,13 @@ def compare_decode_occupancy(
                 "exactly_matches_plan": (
                     observed_events > 0 and exact_events == observed_events
                 ),
+                "trace_attributed_duration_s": trace_attributed_s,
+                "trace_exact_duration_s": trace_exact_s,
+                "trace_exact_time_fraction": (
+                    None
+                    if trace_attributed_s == 0
+                    else trace_exact_s / trace_attributed_s
+                ),
             }
         )
 
@@ -155,6 +228,17 @@ def compare_decode_occupancy(
         if record["observed_events"] == 0
     ]
     unplanned_ids = sorted(set(raw_by_request) - seen_ids)
+    traced = [
+        record
+        for record in records
+        if record["trace_attributed_duration_s"] > 0
+    ]
+    traced_duration_s = sum(
+        float(record["trace_attributed_duration_s"]) for record in traced
+    )
+    exact_duration_s = sum(
+        float(record["trace_exact_duration_s"]) for record in traced
+    )
     return {
         "available": bool(observed),
         "requests": records,
@@ -177,6 +261,15 @@ def compare_decode_occupancy(
                 for record in records
             ),
             "complete_request_coverage": len(observed) == len(records),
+            "requests_with_trace_occupancy": len(traced),
+            "requests_with_trace_mismatch": sum(
+                record["trace_exact_time_fraction"] < 1 for record in traced
+            ),
+            "trace_exact_time_fraction": (
+                None
+                if traced_duration_s == 0
+                else exact_duration_s / traced_duration_s
+            ),
         },
-        "trace": _trace_summary(stats.get("decode_trace")),
+        "trace": trace,
     }
