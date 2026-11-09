@@ -1181,10 +1181,25 @@ class FuturePlanTest(unittest.TestCase):
         by_id = {item.request_id: item for item in result.admissions}
 
         self.assertEqual(by_id["first"].start_ms, 0)
-        self.assertNotEqual(
-            by_id["first"].cohort_id,
-            by_id["second"].cohort_id,
+        self.assertIsNone(by_id["first"].cohort_id)
+        self.assertIsNone(by_id["second"].cohort_id)
+
+    def test_batched_ready_set_stays_serial_without_exact_cohort_profile(self):
+        config = replace(
+            self.config,
+            max_batch_requests=2,
+            batch_window_ms=0,
         )
+        workload = (
+            RequestProfile("first", 0, 100, 20),
+            RequestProfile("second", 0, 100, 20),
+        )
+
+        result = simulate(workload, config, "batched")
+
+        self.assertEqual(result.deadline_misses, 0)
+        self.assertEqual({item.prefill_batch_size for item in result.admissions}, {1})
+        self.assertEqual({item.cohort_id for item in result.admissions}, {None})
 
     def test_batched_joint_placement_can_mix_resident_and_hisparse(self):
         config = replace(
@@ -1213,6 +1228,57 @@ class FuturePlanTest(unittest.TestCase):
         self.assertEqual(by_id["sparse"].mode, ResidencyMode.HI_SPARSE)
         self.assertEqual(len(result.admissions), 2)
         self.assertLessEqual(result.peak_memory_bytes, config.memory_budget_bytes)
+
+    def test_batched_deadline_deferral_advances_a_safe_ready_subset(self):
+        config = PlannerConfig(
+            memory_budget_bytes=100_000,
+            kv_bytes_per_token=1000,
+            prefill_workspace_bytes_per_token=0,
+            sparse_hot_tokens=10,
+            prefill_tokens_per_ms=1,
+            resident_decode_tokens_per_ms=1,
+            sparse_decode_tokens_per_ms=1,
+            max_active_requests=3,
+            max_batch_requests=3,
+            batch_window_ms=10,
+            lookahead_ms=10,
+        )
+        workload = (
+            RequestProfile(
+                "foreground",
+                arrival_ms=0,
+                prompt_tokens=5,
+                output_tokens=5,
+                priority=2,
+                residence_hint="resident",
+            ),
+            RequestProfile(
+                "long-background",
+                arrival_ms=0,
+                prompt_tokens=60,
+                output_tokens=100,
+                priority=1,
+                residence_hint="resident",
+            ),
+            RequestProfile(
+                "deadline",
+                arrival_ms=5,
+                prompt_tokens=5,
+                output_tokens=10,
+                priority=3,
+                deadline_ms=20,
+                residence_hint="resident",
+            ),
+        )
+
+        result = simulate(workload, config, "batched")
+        by_id = {item.request_id: item for item in result.admissions}
+
+        self.assertEqual(result.deadline_misses, 0)
+        self.assertEqual(by_id["foreground"].start_ms, 0)
+        self.assertLessEqual(by_id["deadline"].finish_ms, 20)
+        self.assertIsNone(by_id["foreground"].cohort_id)
+        self.assertIsNone(by_id["long-background"].cohort_id)
 
     def test_batched_config_round_trips_and_rejects_invalid_values(self):
         config = replace(

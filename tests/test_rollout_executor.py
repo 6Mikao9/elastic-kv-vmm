@@ -1839,6 +1839,7 @@ class RolloutExecutorTest(unittest.TestCase):
                 sparse_hot_tokens=10,
                 max_active_requests=2,
                 max_batch_requests=2,
+                prefill_batch_profiles={2: 20},
             ),
             "batched",
         )

@@ -453,7 +453,14 @@ telemetry 读取错误仅进入诊断计数，不会让真实 prefill 失败。
 加权完成时间和 makespan 都不差，且至少一项严格改善时才等待。若某个当前本可满足
 的 hard deadline 会因等待变成 miss，则立即执行；未来请求自己的 deadline 也会在
 cohort 时长下重新检查。没有可用 profile、等待不能让端到端估计变好、显存不足或
-deadline 不安全时，策略不会等待。
+deadline 不安全时，策略不会等待。没有 exact-size prefill 或 resident decode
+batch profile 时，同时 ready 的请求也按 singleton cohort 依次推进，不能仅凭
+“可以一起提交”虚构 batch 吞吐。
+
+deadline 保护会先比较整个 ready cohort。若一个大请求混入后会让临近 hard deadline
+无法满足，而较小的 ready 前缀仍可立即安全执行，策略先推进该前缀并保留其余请求；
+只有任何非空 ready 子集都会阻塞未来 deadline 时才真正空等。这避免“为了等待一个
+deadline 请求而让所有 ready 工作一起停摆”的次生 makespan 回归。
 
 cohort 的 placement 联合求解，可以在字节预算内选择 resident、HiSparse 或混合
 组合，并沿用同一份 physical-prefix credit。一次 admission 产生的所有成员共享
@@ -461,7 +468,8 @@ cohort 的 placement 联合求解，可以在字节预算内选择 resident、Hi
 后加入者不会反过来改写已经模拟完成的请求时序。rollout JSON 保存这些字段，旧计划
 缺少字段时按单请求批大小 1 读取。执行器会拒绝同一 cohort 中 start、prefill size
 或 decode size 不一致的计划，也会拒绝声明 batch size 大于 1 却没有 cohort ID
-的计划。SGLang 原生 `PrefillAdder` 和显存 admission 仍是最终权威；本策略只控制
+的计划；singleton 不携带 cohort ID。SGLang 原生 `PrefillAdder` 和显存 admission
+仍是最终权威；本策略只控制
 受控 rollout 的提交时刻与 hint，不会绕过原生容量检查。真实收益仍需在同一模型、
 同一硬件上采集 batch-size-specific prefill/decode 曲线后配对验证。
 

@@ -1768,6 +1768,30 @@ def _wait_for_batch_improves(
     return True
 
 
+def _has_measured_batch_signal(
+    requests: Sequence[RequestProfile],
+    modes: Sequence[ResidencyMode],
+    active: Sequence[_Active],
+    config: PlannerConfig,
+) -> bool:
+    """Return whether an exact measured profile supports this cohort."""
+
+    if len(requests) <= 1:
+        return True
+    if any(
+        batch_size == len(requests)
+        for batch_size, _ in config.prefill_batch_profiles
+    ):
+        return True
+    total_batch_size = min(
+        config.max_active_requests, len(active) + len(requests)
+    )
+    profile = config.decode_batch_profile(total_batch_size)
+    return profile is not None and any(
+        profile.rate(mode) is not None for mode in modes
+    )
+
+
 def _ready_batch(
     pending: Sequence[RequestProfile],
     active: Sequence[_Active],
@@ -1822,6 +1846,33 @@ def _ready_batch(
         selected_assignment = assignment
     if selected_assignment is None:
         return (), (), ()
+
+    # Serialization is the conservative model when no exact cohort profile
+    # exists.  Forming a larger cohort would delay each member's decode until
+    # every earlier member has prefetched without any measured throughput gain.
+    # Keep any smaller prefix that does have an exact profile; otherwise
+    # execute one request and let the event loop add newly-ready work later.
+    if len(selected) > 1:
+        for subset_size in range(len(selected), 1, -1):
+            candidate = tuple(selected[:subset_size])
+            assignment = _assign_batch_modes(candidate, active, config)
+            if assignment is None:
+                continue
+            candidate_modes, candidate_reasons = assignment
+            if not _has_measured_batch_signal(
+                candidate, candidate_modes, active, config
+            ):
+                continue
+            selected = list(candidate)
+            selected_assignment = (candidate_modes, candidate_reasons)
+            break
+        else:
+            selected = selected[:1]
+            selected_assignment = _assign_batch_modes(
+                tuple(selected), active, config
+            )
+            if selected_assignment is None:
+                return (), (), ()
     return tuple(selected), *selected_assignment
 
 
@@ -1928,36 +1979,79 @@ def _simulate_batched(
                 ),
                 key=_batched_order,
             )
-            waited = False
-            for candidate in near_future:
-                protects_deadline = _defer_batch_for_imminent_work(
-                    base,
-                    modes,
-                    active,
-                    (candidate,),
-                    now_ms,
-                    config,
-                )
-                batching_improves = (
-                    len(base) < config.max_batch_requests
+            batching_candidate = next(
+                (
+                    candidate
+                    for candidate in near_future
+                    if len(base) < config.max_batch_requests
                     and _wait_for_batch_improves(
                         base, candidate, active, now_ms, config
                     )
-                )
-                if protects_deadline or batching_improves:
-                    now_ms = candidate.arrival_ms
-                    waited = True
-                    break
-            if waited:
+                ),
+                None,
+            )
+            if batching_candidate is not None:
+                now_ms = batching_candidate.arrival_ms
                 continue
+
+            if near_future and _defer_batch_for_imminent_work(
+                base,
+                modes,
+                active,
+                near_future,
+                now_ms,
+                config,
+            ):
+                # A long ready request can make the whole cohort temporarily
+                # unsafe for an imminent hard deadline.  Waiting is correct
+                # when even the highest-priority ready request would block the
+                # future work.  Otherwise, advance a safe subset now and keep
+                # the harmful members queued for a later cohort.
+                safe_subset = None
+                for subset_size in range(len(base) - 1, 0, -1):
+                    candidate = base[:subset_size]
+                    candidate_assignment = _assign_batch_modes(
+                        candidate, active, config
+                    )
+                    if candidate_assignment is None:
+                        continue
+                    candidate_modes, candidate_reasons = candidate_assignment
+                    if not _has_measured_batch_signal(
+                        candidate, candidate_modes, active, config
+                    ):
+                        continue
+                    if _defer_batch_for_imminent_work(
+                        candidate,
+                        candidate_modes,
+                        active,
+                        near_future,
+                        now_ms,
+                        config,
+                    ):
+                        continue
+                    safe_subset = (
+                        candidate,
+                        candidate_modes,
+                        candidate_reasons,
+                    )
+                    break
+                if safe_subset is None:
+                    now_ms = near_future[0].arrival_ms
+                    continue
+                base, modes, reasons = safe_subset
 
         prefill = _prefill_batch_duration(base, modes, active, config)
         decode_batch_size = min(
             config.max_active_requests,
             len(active) + len(base),
         )
-        cohort_id = f"cohort-{cohort_index:04d}-{now_ms}"
-        cohort_index += 1
+        cohort_id = (
+            f"cohort-{cohort_index:04d}-{now_ms}"
+            if len(base) > 1
+            else None
+        )
+        if cohort_id is not None:
+            cohort_index += 1
         aggregate, shared_credit = _placement_memory(
             (
                 *_active_placements(active),

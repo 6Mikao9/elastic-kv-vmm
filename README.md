@@ -317,11 +317,14 @@ satisfiable imminent hard deadline enough to turn it into a miss, provided the
 held work can itself still meet its protected deadlines. Cohort construction
 then excludes a member whose addition would create such a miss. Missing prefill
 measurements retain the prior serial prefill model; missing decode measurements
-retain the per-request linear model.
+retain the per-request linear model. A multi-request cohort is emitted only when
+an exact prefill size or exact resident decode batch size has measured evidence;
+otherwise simultaneously-ready requests advance as singleton cohorts.
 `max_batch_requests` caps the cohort and must not exceed
-`max_active_requests`. Every admission records `prefill_batch_size` and a
-`cohort_id`, and the executor rejects a cohort whose members disagree on start
-time, prefill size or decode size. The executor treats each cohort as one
+`max_active_requests`. Every admission records `prefill_batch_size`; a
+multi-request cohort also records a `cohort_id`, while singleton admissions omit
+it. The executor rejects a cohort whose members disagree on start time, prefill
+size or decode size. The executor treats each cohort as one
 dispatch group: it reserves worker and in-flight capacity for every member,
 checks their budget together, installs one client-side release barrier, and
 fails the run when observed generator-entry skew exceeds the configured
@@ -451,7 +454,7 @@ The summarizer rejects incomplete runs, mismatched input prompts, missing probe 
 
 ## Integration points and limitations
 
-The adapter replaces `MHATokenToKVPool._create_buffers` and the plain `TokenToKVPoolAllocator` selected by `ModelRunner.init_memory_pool`. It guards unsupported configurations at startup and preserves the existing attention interface. The source SGLang installation is not modified on disk.
+The adapter replaces `MHATokenToKVPool._create_buffers` and the plain `TokenToKVPoolAllocator` selected by `ModelRunner.init_memory_pool`. It guards unsupported configurations at startup and preserves the existing attention interface. Newer SGLang `enable_unified_memory` configurations fail closed because they can select another pool before the V5 ownership check. The launcher prints the installed component list after startup hooks are applied. The source SGLang installation is not modified on disk.
 
 See the [integration map](docs/INTEGRATION.md) for changed components, Graph lifetimes, prefill pressure coordination and the remaining work for mixed state pools and cross-instance admission.
 

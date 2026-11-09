@@ -248,6 +248,11 @@ excludes members whose addition would create a miss; the checked-in controlled
 trace now reaches zero deadline misses in both `future` and `batched` arms.
 Missing measured cohort profiles still retain serial prefill and linear decode,
 so the next serving step remains a paired SGLang run with real cohort profiles.
+It also advances a safe ready prefix instead of idling the entire cohort for an
+imminent deadline, and it never forms a multi-request cohort without an exact
+measured prefill or resident-decode profile. On the checked-in controlled trace,
+`batched` now matches `future` at zero deadline misses, 757.68 ms weighted
+completion, and 1,988 ms makespan; previously it reached 772.95 ms and 2,196 ms.
 
 Physical chunk co-occupancy is an implementation issue to optimize, not
 prefix sharing: the 240 MiB/rank joint-reclaim example used independent
