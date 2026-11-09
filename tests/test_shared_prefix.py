@@ -11,7 +11,10 @@ from adaptive_sparse.shared_prefix import (
     resolve_shared_block_locations,
     resolve_shared_block_locations_batched,
 )
-from adaptive_sparse.request_residency import install_request_residency
+from adaptive_sparse.request_residency import (
+    _swap_shared_prefix_rows,
+    install_request_residency,
+)
 
 
 def request(tokens, **values):
@@ -31,6 +34,51 @@ def request(tokens, **values):
 
 
 class SharedPrefixTest(unittest.TestCase):
+    def test_native_swap_masks_shared_lanes_and_preserves_other_outputs(self):
+        registry = SharedPrefixRegistry()
+        donor = request([1, 2, 3, 4, 5, 6])
+        claim = make_prefix_claim(donor, group="system", shared_tokens=6)
+        registry.register_source(0, donor, claim)
+        for row in (1, 2, 3):
+            registry.register_claim(row, claim)
+
+        def native_swap(*, req_pool_indices, seq_lens, top_k_blocks, layer_id,
+                        sparse_block_size):
+            self.assertEqual(layer_id, 7)
+            self.assertEqual(sparse_block_size, 2)
+            self.assertEqual(req_pool_indices.tolist(), [4, 2, 3])
+            self.assertEqual(top_k_blocks.tolist(), [[0, 2], [-1, 2], [3, -1]])
+            positions = top_k_blocks[..., None] * 2 + torch.arange(2)
+            valid = (top_k_blocks[..., None] >= 0) & (positions < seq_lens[:, None, None])
+            return (100 * req_pool_indices[:, None, None] + positions).masked_fill(
+                ~valid, -1
+            ).flatten(1).to(torch.int32)
+
+        ctrl = SimpleNamespace(
+            _ekv_shared_prefixes=registry,
+            _ekv_residency_stats={},
+            swap_in_selected_blocks=mock.Mock(side_effect=native_swap),
+        )
+        result = _swap_shared_prefix_rows(
+            ctrl, torch.arange(1, 7).reshape(1, 6), torch.arange(7) + 10,
+            torch.arange(1, 5), torch.full((4,), 6),
+            torch.tensor([[0, 1], [0, 2], [3, -1], [0, 2]], dtype=torch.int32),
+            [1, 2, 3, 4], 7, 2,
+        )
+        ctrl.swap_in_selected_blocks.assert_called_once()
+        self.assertEqual(result.tolist(), [
+            [11, 12, 13, 14],       # all-direct, no native swap
+            [11, 12, 204, 205],     # shared lane plus native newest-token block
+            [-1, -1, -1, -1],       # invalid selections remain native
+            [400, 401, 404, 405],   # no donor, unmodified native inputs
+        ])
+        stats = ctrl._ekv_residency_stats
+        self.assertEqual(stats["shared_prefix_direct_blocks"], 3)
+        self.assertEqual(stats["shared_prefix_native_blocks"], 5)
+        self.assertEqual(stats["shared_prefix_native_requests"], 3)
+        self.assertEqual(stats["shared_prefix_partial_requests"], 1)
+        self.assertEqual(stats["shared_prefix_masked_native_blocks"], 1)
+
     def test_direct_mode_requires_adaptive_hints(self):
         with mock.patch.dict(
             "os.environ",

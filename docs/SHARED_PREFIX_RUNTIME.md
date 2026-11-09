@@ -24,9 +24,12 @@ Use the same command with `--shared-prefix-reuse off` as the paired control.
 The source is a live full-resident request. A host-backed request resolves each
 Top-K block that lies wholly inside the declared shared prefix through the
 source request's logical-to-physical mapping. Those output slots point at the
-source request's device KV pages, so the native host-copy kernel is skipped for
-that subset. Blocks outside the prefix, partial blocks, and requests without a
-valid source continue through the unchanged native HiSparse path.
+source request's device KV pages. Fully resolved rows bypass native swap.
+For mixed rows, the audited native block swap receives `-1` in directly
+resolved lanes and skips their hot-cache lookups and host-copy misses.
+The runtime overlays the source locations in the original lane order. Blocks
+outside the prefix, partial blocks, blocks containing the consumer's newest
+token, and requests without a valid source continue through native HiSparse.
 
 Sharing requires equality of the declared group and token length plus a
 sha256 identity over the complete prefix token ids, `extra_key`, cache salt,
@@ -46,9 +49,11 @@ Direct resolution is batched per layer. One GPU indexing operation resolves the
 complete `[consumer, block]` matrix for all live sources, and all consumers with
 at least one missing block share one native host-staging call. The host copies
 one compact per-consumer hit count to classify full, partial and native-only
-rows; it no longer synchronizes or launches a native call independently for
-every consumer in the layer. Partial rows are overwritten only in their shared
-lanes, preserving the native result elsewhere.
+rows. The remaining lanes share one native launch per layer. The kernel
+excludes masked lanes from LRU access, so a block used through its donor does
+not refresh the consumer's hot cache. The newest-token block remains eligible
+for the consumer's reserved slot. Direct mode checks the pinned CUDA source
+and Python wrapper digests at startup.
 
 The process-local registry also indexes live sources by exact fingerprint and
 by `(group, tokens)` geometry. A consumer therefore examines only the matching
@@ -64,9 +69,13 @@ valid only while that source request is still resident.
 The opt-in path is intended first for correctness and hit-rate evaluation.
 Compare it with native HiSparse under identical Top-K and residency settings,
 and report `shared_prefix_direct_blocks`, `shared_prefix_native_blocks`,
-`shared_prefix_native_requests`, `shared_prefix_partial_requests`, TPOT, host
-transfer bytes, and source-removal events. Planning-only prefix credit remains a
-separate capacity model until this data path has passed real MiniMax GPU
+`shared_prefix_native_requests`, `shared_prefix_partial_requests`, and
+`shared_prefix_masked_native_blocks`. The masked counter covers lanes removed
+from native swap on partial rows. The native block counter covers unmasked
+lane positions submitted to native swap, including invalid input positions.
+Actual host-to-device transfer bytes depend on native hot-cache misses and
+require GPU measurement alongside TPOT and source-removal events. Planning-only
+prefix credit remains a separate capacity model until real MiniMax GPU
 validation.
 
 The reduced GPU synchronization and launch count is covered by CPU tensor

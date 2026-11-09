@@ -40,6 +40,9 @@ def comparison_signature(directory, performance):
     manifest = json.loads((directory / "source_manifest.json").read_text(encoding="utf-8"))
     require(outer.get("status") == "complete", f"{directory}: outer run is incomplete")
     require(outer.get("mode") == manifest["mode"], f"{directory}: mode evidence differs")
+    require(not manifest.get("live_profile_diagnostic")
+            and not outer.get("live_profile_diagnostic"),
+            f"{directory}: live profiling diagnostic is excluded from performance comparisons")
     for key in DIAGNOSTICS:
         require(key in manifest and not manifest[key], f"{directory}: missing or intrusive {key}")
     settings = manifest["adaptive_settings"] or {}

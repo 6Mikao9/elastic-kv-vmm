@@ -25,6 +25,7 @@ from adaptive_sparse.sglang_future_hook import (
     planned_cohort_sizes,
 )
 from benchmarks.client import digest_ids, prompt_ids, write_json
+from scripts.profile_hisparse_live import DEFAULT_OUTPUT_TOKEN_CAP, MAX_OUTPUT_TOKEN_CAP
 from scripts.run_case import HOST, PORT, ROOT, leader_exit, on_sigterm, stop_server
 
 
@@ -348,6 +349,10 @@ def main():
     parser.add_argument("--sm80-bf16-projections", action="store_true",
                         help="Use the experimental MiniMax SM80 projection fallback")
     parser.add_argument("--benchmark-repeats", type=int, default=0)
+    parser.add_argument("--profile-workload",
+                        help="capture one warmed CPU/CUDA phase on TP4 in a diagnostic run")
+    parser.add_argument("--profile-output-token-cap", type=int,
+                        help=f"cap each profile request at this many output tokens (default: {DEFAULT_OUTPUT_TOKEN_CAP})")
     parser.add_argument("--forced-replay", action="store_true",
                         help="Controlled benchmark with synthetic fixed generated token IDs")
     parser.add_argument("--warmup-once", action="store_true")
@@ -622,6 +627,21 @@ def main():
     if args.vmm_backing and not library.is_file():
         parser.error("compile native/libelastic_vmm.so before using VMM")
     gpu_uuids = os.environ.get("EKV_BENCH_GPU_UUIDS", "").split(",")
+    if args.profile_output_token_cap is not None:
+        if not args.profile_workload or not 1 <= args.profile_output_token_cap <= MAX_OUTPUT_TOKEN_CAP:
+            parser.error(f"profile output token cap requires profiling and a value from 1 to {MAX_OUTPUT_TOKEN_CAP}")
+    elif args.profile_workload:
+        args.profile_output_token_cap = DEFAULT_OUTPUT_TOKEN_CAP
+    if args.profile_workload:
+        from benchmarks.hisparse_client import WORKLOADS
+
+        if args.profile_workload not in WORKLOADS or args.tp_size != 4:
+            parser.error("profiling requires a known workload and TP4")
+        if (args.benchmark_repeats or args.future_policy != "off" or args.future_plan
+                or args.future_workload or args.diagnostic_captures or args.launch_blocking
+                or args.trace_layers or args.capture_attention or args.logical_shadow
+                or args.disable_fused_qknorm or args.semantic_probes):
+            parser.error("profiling requires a separate run without benchmark or other diagnostics")
     if args.benchmark_repeats < 0 or (args.benchmark_repeats and (
             args.tp_size != 4 or len(gpu_uuids) != 4 or len(set(gpu_uuids)) != 4
             or any(not uuid.startswith("GPU-") for uuid in gpu_uuids))):
@@ -710,6 +730,8 @@ def main():
     ]
     environment = os.environ.copy()
     environment["PYTHONPATH"] = os.pathsep.join(filter(None, (str(ROOT), environment.get("PYTHONPATH"))))
+    if args.profile_workload:
+        environment["SGLANG_PROFILE_V2"] = "0"
     if args.launch_blocking:
         environment["CUDA_LAUNCH_BLOCKING"] = "1"
     else:
@@ -810,8 +832,10 @@ def main():
             "adaptive_sparse/minimax_sm80.py",
             "adaptive_sparse/memory_telemetry.py",
         )
-    if args.benchmark_repeats:
+    if args.benchmark_repeats or args.profile_workload:
         sources += ("benchmarks/hisparse_client.py",)
+    if args.profile_workload:
+        sources += ("scripts/profile_hisparse_live.py",)
     if args.forced_replay:
         sources += ("benchmarks/forced_tokens.py",)
     if args.semantic_probes:
@@ -857,6 +881,8 @@ def main():
         "server_base_url": base_url,
         "sm80_bf16_projections": args.sm80_bf16_projections,
         "benchmark_repeats": args.benchmark_repeats, "workloads": args.workloads,
+        "live_profile_diagnostic": args.profile_workload,
+        "profile_output_token_cap": args.profile_output_token_cap,
         "forced_replay": args.forced_replay,
         "warmup_once": args.warmup_once,
         "semantic_probes": args.semantic_probes,
@@ -947,6 +973,7 @@ def main():
                "future_elastic_residency_budget": args.future_elastic_residency_budget,
                "future_preannounce_lead_ms": args.future_preannounce_lead_ms,
                "future_require_complete_cohorts": args.future_require_complete_cohorts,
+               "live_profile_diagnostic": args.profile_workload,
                "status": "running", "probes": []}
     server = None
     step = "startup"
@@ -1058,6 +1085,12 @@ def main():
                           repeats=args.benchmark_repeats, workloads=args.workloads,
                           forced_replay=args.forced_replay, warmup_once=args.warmup_once,
                           emit_future_hints=args.future_policy != "off")
+        if args.profile_workload:
+            from scripts.profile_hisparse_live import capture
+
+            step = "live_profile"
+            capture(base_url, output, args.profile_workload, opener,
+                    output_token_cap=args.profile_output_token_cap)
         if args.logical_shadow:
             step = "logical_shadow_validation"
             if args.validation_rounds:

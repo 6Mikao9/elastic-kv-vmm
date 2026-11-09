@@ -6,6 +6,7 @@ build/
 dist/
 *.egg-info/
 cache/
+.container-work/
 .scratch/
 inspection/
 **/private_trace/
