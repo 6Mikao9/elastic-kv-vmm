@@ -138,8 +138,14 @@ at the share boundary while preserving atomic mapping failure semantics.
   runtime, selected GPU identity, native-library hash, exact launch command and
   SQLite WAL/journal state.
 - Request groups pass through an in-driver `threading.Barrier`; repeats reverse
-  the hot-instance order while keeping the joint phase last. Warmup and measured
-  KV lifecycles use an explicit drain wait rather than one widened sleep.
+  the hot-instance order while keeping the joint phase last. `a-to-b` and
+  `b-to-a` phases dispatch the incumbent first and start the incoming
+  instance after a configurable gap, so the test includes an actual overlap
+  transition instead of only independent hot phases. Each phase records actual
+  per-instance start/finish times, observed overlap and overlap-token
+  throughput; a nominal transition with no observed overlap fails closed.
+  Warmup and measured KV lifecycles use an explicit drain wait rather than one
+  widened sleep.
 - Raw request/sample artifacts are written separately. `results.json` now has
   `status`, `arm`, `configuration`, summarized `phases`, `violations` and
   `source_manifest`, and failed phases leave a machine-readable incomplete
@@ -167,6 +173,9 @@ at the share boundary while preserving atomic mapping failure semantics.
   any owner or lease remains after teardown. A direct `main(argv)` mock test
   exercises the launch-failure, reverse cleanup and post-teardown snapshot
   order without CUDA.
-- Still open before a GPU acceptance claim: multi-stage transition schedules, a
-  real-broker runner integration test, and the paired
+- The snapshot reader is also exercised against a real
+  `GlobalAdmissionBroker` database created by the production broker, including
+  fair targets and a recorded demand from the second tenant.
+- Still open before a GPU acceptance claim: a live-server end-to-end runner
+  test and the paired
   isolated/shared/observe/enforce GPU matrix itself.

@@ -187,15 +187,19 @@ for lease lifetimes, failure semantics, multi-GPU state paths and the paired
 validation matrix. The dense [dual-instance runner](scripts/run_dual.py) now
 accepts one fresh broker file plus per-model tenant and weight values, samples
 broker capacity/usage/demand and whole-device NVML together, and runs `a-hot`,
-`b-hot` and `both-active` phases. Dispatch is barrier-synchronized, hot-instance
-order reverses across repeats, and source/runtime/native/model/image provenance
-is recorded. Raw request/sample files are written separately from summarized
+`b-hot`, `a-to-b`, `b-to-a` and `both-active` phases. Transition phases dispatch
+the incumbent first and the incoming model after a configurable gap. The runner
+records the observed overlap, overlap-token throughput and fails the phase when
+a transition actually ran serially. Dispatch is barrier-synchronized,
+hot-instance order reverses across repeats, and source/runtime/native/model/image
+provenance is recorded. Raw request/sample files are written separately from summarized
 results, and an untimed non-streaming token matrix is retained for paired
 correctness checks. `--requests-per-instance`, `--input-tokens` and
 `--output-tokens` make pressure runs explicit; each phase records the model's
 dense KV bytes/token and the estimated phase-demand to broker-capacity ratio.
 Optional `--arrival-delay-a-ms` / `--arrival-delay-b-ms` create a recorded
-unfair-arrival schedule after the common dispatch barrier.
+unfair-arrival schedule after the common dispatch barrier, while
+`--transition-gap-ms` controls the incoming instance in both transition phases.
 The full arm and acceptance protocol is in
 the [dual-instance validation plan](docs/DUAL_INSTANCE_VALIDATION_ZH.md).
 

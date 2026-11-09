@@ -9,6 +9,7 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
+from elastic_kv.global_broker import GlobalAdmissionBroker
 from scripts.run_dual import (
     adapter_stats,
     broker_environment,
@@ -20,9 +21,12 @@ from scripts.run_dual import (
     phase_stem,
     read_broker_snapshot,
     record_run_failure,
+    request_timing_evidence,
+    require_transition_overlap,
     run_correctness_probes,
     run_synchronized,
     scenario_order,
+    scheduled_job_delay_ms,
     server_exit_records,
     server_launch_spec,
     source_hashes,
@@ -262,6 +266,47 @@ class DualBrokerRunnerTest(unittest.TestCase):
         self.assertEqual(snapshot["owners"]["owner-a"]["leased_bytes"], 70)
         self.assertEqual(snapshot["owners"]["owner-b"]["lease_count"], 1)
 
+    def test_snapshot_integrates_with_real_global_broker_owner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "broker.sqlite"
+            first = GlobalAdmissionBroker(
+                path,
+                100,
+                owner_id="owner-a",
+                tenant_id="model-a",
+                fair_mode="enforce",
+                heartbeat_seconds=None,
+            )
+            second = GlobalAdmissionBroker(
+                path,
+                100,
+                owner_id="owner-b",
+                tenant_id="model-b",
+                fair_mode="enforce",
+                heartbeat_seconds=None,
+            )
+            try:
+                self.assertTrue(first.reserve({"a-0": 100}).admit)
+                self.assertFalse(second.reserve({"b-0": 1}).admit)
+                self.assertEqual(first.release(["a-0"]), 100)
+                self.assertTrue(first.reserve({"a-1": 40}).admit)
+
+                snapshot = read_broker_snapshot(path)
+            finally:
+                first.close()
+                second.close()
+
+        self.assertEqual(snapshot["status"], "ready")
+        self.assertEqual(snapshot["outstanding_bytes"], 40)
+        self.assertEqual(snapshot["tenant_usage_bytes"], {"model-a": 40})
+        self.assertEqual(snapshot["tenant_demand_bytes"], {"model-b": 1})
+        self.assertEqual(snapshot["fair_target_bytes"], {
+            "model-a": 50,
+            "model-b": 50,
+        })
+        self.assertEqual(snapshot["starved_tenants"], ["model-b"])
+        self.assertEqual(snapshot["owners"]["owner-a"]["lease_count"], 1)
+
     def test_snapshot_counts_temporary_claims_in_aggregate_and_owner_usage(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "broker.sqlite"
@@ -401,10 +446,12 @@ class DualBrokerRunnerTest(unittest.TestCase):
 
     def test_load_order_reverses_hot_instances_but_keeps_joint_phase_last(self):
         self.assertEqual(
-            scenario_order(1), ("a-hot", "b-hot", "both-active")
+            scenario_order(1),
+            ("a-hot", "b-hot", "a-to-b", "b-to-a", "both-active"),
         )
         self.assertEqual(
-            scenario_order(2), ("b-hot", "a-hot", "both-active")
+            scenario_order(2),
+            ("b-hot", "a-hot", "b-to-a", "a-to-b", "both-active"),
         )
         self.assertEqual(phase_stem("a-hot", 2), "repeat-02-a-hot")
         self.assertEqual(phase_stem("a-hot", 0, True), "warmup-a-hot")
@@ -441,6 +488,14 @@ class DualBrokerRunnerTest(unittest.TestCase):
             "elapsed_s": 0.5,
             "drain_s": 0.1,
             "dispatch_skew_s": 0.001,
+            "instance_timing_s": {
+                "a": {"earliest_start_s": 0.1, "latest_finish_s": 0.6},
+                "b": {"earliest_start_s": 0.2, "latest_finish_s": 0.7},
+            },
+            "observed_overlap_s": 0.4,
+            "overlap_output_tokens": 32,
+            "overlap_output_tokens_per_s": 80.0,
+            "configured_transition_gap_ms": 100,
             "input_tokens": 1024,
             "output_tokens": 128,
             "estimated_kv_bytes": {"a": 1024},
@@ -465,6 +520,8 @@ class DualBrokerRunnerTest(unittest.TestCase):
         self.assertEqual(summary["scenario"], "a-hot")
         self.assertNotIn("requests", summary)
         self.assertEqual(summary["summary"]["instances"]["a"]["peak_live_tokens"], 3)
+        self.assertEqual(summary["summary"]["observed_overlap_s"], 0.4)
+        self.assertEqual(summary["summary"]["configured_transition_gap_ms"], 100)
         self.assertIn("p95", summary["summary"]["ttft_s"])
 
     def test_phase_artifacts_are_split_from_summary(self):
@@ -575,6 +632,72 @@ class DualBrokerRunnerTest(unittest.TestCase):
             {"a": {"bytes_per_token": 4}, "b": {"bytes_per_token": 8}},
         )
         self.assertEqual(estimate, {"a": 1440, "b": 2880})
+
+    def test_transition_schedules_incoming_instance_after_gap(self):
+        workload = {
+            "arrival_delay_ms": {"a": 100, "b": 250},
+            "transition_gap_ms": 500,
+        }
+        self.assertEqual(scheduled_job_delay_ms("a-to-b", "a", workload), 100)
+        self.assertEqual(scheduled_job_delay_ms("a-to-b", "b", workload), 600)
+        self.assertEqual(scheduled_job_delay_ms("b-to-a", "b", workload), 250)
+        self.assertEqual(scheduled_job_delay_ms("b-to-a", "a", workload), 750)
+        self.assertEqual(scheduled_job_delay_ms("both-active", "a", workload), 100)
+
+    def test_transition_jobs_carry_identical_per_instance_delay(self):
+        workload = {
+            "requests_per_instance": 2,
+            "input_tokens": 32,
+            "output_tokens": 8,
+            "arrival_delay_ms": {"a": 0, "b": 0},
+            "transition_gap_ms": 400,
+        }
+        jobs = build_phase_jobs("a-to-b", 1, workload)
+        delays = {
+            instance: {job[1]["start_delay_ms"] for job in jobs if job[0] == instance}
+            for instance in ("a", "b")
+        }
+        self.assertEqual(delays, {"a": {0}, "b": {400}})
+
+    def test_transition_timing_records_overlap_and_its_token_rate(self):
+        requests = [
+            {
+                "instance": "a",
+                "_started_perf_s": 10.0,
+                "end_to_end_s": 0.5,
+                "token_count_events": [
+                    {"arrival_s": 0.1, "new_tokens": 2},
+                    {"arrival_s": 0.3, "new_tokens": 3},
+                ],
+            },
+            {
+                "instance": "b",
+                "_started_perf_s": 10.2,
+                "end_to_end_s": 0.6,
+                "token_count_events": [
+                    {"arrival_s": 0.1, "new_tokens": 4},
+                    {"arrival_s": 0.5, "new_tokens": 5},
+                ],
+            },
+        ]
+
+        timing = request_timing_evidence(requests, origin=10.0)
+
+        self.assertAlmostEqual(timing["observed_overlap_s"], 0.3)
+        self.assertEqual(timing["overlap_output_tokens"], 7)
+        self.assertAlmostEqual(timing["overlap_output_tokens_per_s"], 7 / 0.3)
+        self.assertAlmostEqual(timing["instances"]["a"]["earliest_start_s"], 0.0)
+        self.assertAlmostEqual(timing["instances"]["b"]["latest_finish_s"], 0.8)
+
+    def test_serial_transition_is_rejected(self):
+        timing = {
+            "observed_overlap_s": -0.1,
+            "overlap_output_tokens": None,
+            "overlap_output_tokens_per_s": None,
+        }
+        with self.assertRaisesRegex(RuntimeError, "without an observed overlap"):
+            require_transition_overlap("a-to-b", timing)
+        require_transition_overlap("a-hot", timing)
 
 
 if __name__ == "__main__":

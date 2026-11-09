@@ -40,8 +40,12 @@ that history; all TP ranks use the conservative common result. Ownership remains
 with the original process: a lease is transferred only after successful
 `cuMemUnmap` and release. The dense dual-instance runner now exposes `off`,
 `observe` and `enforce` with per-model tenants, samples broker and NVML state,
-executes `a-hot`, `b-hot` and `both-active` phases, synchronizes dispatch, and
-reverses hot-instance order across repeats. It writes raw request/sample files
+executes `a-hot`, `b-hot`, staged `a-to-b`/`b-to-a` transitions and
+`both-active`, synchronizes dispatch, and reverses hot-instance order across
+repeats. Transition schedules keep the incumbent active while the incoming
+instance arrives after a configured gap. They record per-instance start/finish
+times, observed overlap and overlap-token throughput, and fail closed if a
+supposed transition is actually serial. It writes raw request/sample files
 plus a runtime/source-bound summary and an untimed non-streaming correctness
 matrix. Request count and prompt/output lengths are explicit, and results record
 the model-derived logical KV demand against broker capacity. The next evidence is a

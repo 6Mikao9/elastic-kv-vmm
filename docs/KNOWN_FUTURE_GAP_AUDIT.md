@@ -145,7 +145,7 @@ Scheduler wrapper
   让已成熟的实测值覆盖计划中的静态速率；某一模式没有样本时继续使用该模式
   在 hint 或 kind profile 中的估计。回归覆盖模式隔离、运行中改降级后的速率
   选择、期限排序以及实测值覆盖静态 hint。SGLang 0.5.17 隔离容器完整回归为
-  **467 passed, 2 skipped, 146 subtests passed**；2 个 skip 仍是需要真实 CUDA
+  **472 passed, 2 skipped, 146 subtests passed**；2 个 skip 仍是需要真实 CUDA
   device 的用例。
 - 低水位提升不再按 request id 选择候选，而是按 TP 共同可见的 deadline、
   weight、剩余生成量和共享前缀复用价值排序，迁移成本仅作为并列时的次级条件。

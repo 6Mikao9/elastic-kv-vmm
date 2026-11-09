@@ -36,7 +36,14 @@ from client import (
 )
 
 PORTS = {"a": 31080, "b": 31081}
-SCENARIOS = {"a-hot": ("a",), "b-hot": ("b",), "both-active": ("a", "b")}
+SCENARIOS = {
+    "a-hot": ("a",),
+    "b-hot": ("b",),
+    "a-to-b": ("a", "b"),
+    "b-to-a": ("b", "a"),
+    "both-active": ("a", "b"),
+}
+TRANSITION_SCENARIOS = {"a-to-b", "b-to-a"}
 FAIR_MODES = ("off", "observe", "enforce")
 SOURCE_ROOTS = ("elastic_kv", "adaptive_sparse", "native", "benchmarks", "scripts")
 SOURCE_SUFFIXES = {".py", ".cpp", ".cc", ".c", ".h", ".hpp", ".cuh", ".sh"}
@@ -746,8 +753,10 @@ def finalize_broker_results(results, broker_path):
 
 
 def scenario_order(repeat):
-    order = ("a-hot", "b-hot", "both-active")
-    return order if repeat % 2 else ("b-hot", "a-hot", "both-active")
+    order = ("a-hot", "b-hot", "a-to-b", "b-to-a", "both-active")
+    return order if repeat % 2 else (
+        "b-hot", "a-hot", "b-to-a", "a-to-b", "both-active"
+    )
 
 
 def phase_stem(scenario, repeat, warmup=False):
@@ -768,10 +777,35 @@ def build_phase_jobs(scenario, repeat, workload, warmup=False):
             "instance": instance,
             "input_tokens": workload["input_tokens"],
             "requested_output_tokens": workload["output_tokens"],
+            "start_delay_ms": scheduled_job_delay_ms(
+                scenario, instance, workload
+            ),
         })
         for instance in SCENARIOS[scenario]
         for index in range(request_count)
     ]
+
+
+def scheduled_job_delay_ms(scenario, instance, workload):
+    """Return a deterministic per-instance dispatch delay.
+
+    A transition first dispatches the incumbent instance, then dispatches the
+    incoming instance after the configured gap. Explicit per-instance arrival
+    delays remain lower bounds, so callers can still skew the paired schedule.
+    """
+
+    instances = SCENARIOS[scenario]
+    if instance not in instances:
+        raise ValueError(f"instance {instance!r} is not active in {scenario}")
+    arrival = workload.get("arrival_delay_ms", {})
+    delay = int(arrival.get(instance, 0))
+    if scenario in TRANSITION_SCENARIOS and instance == instances[1]:
+        incumbent_delay = int(arrival.get(instances[0], 0))
+        delay = max(
+            delay,
+            incumbent_delay + int(workload.get("transition_gap_ms", 0)),
+        )
+    return delay
 
 
 def estimate_phase_kv_bytes(scenario, workload, geometry):
@@ -786,6 +820,65 @@ def estimate_phase_kv_bytes(scenario, workload, geometry):
             * value
         )
     return instances
+
+
+def request_timing_evidence(requests, *, origin=0.0):
+    """Compute per-instance lifetimes and the common overlap window."""
+
+    bounds = {}
+    for request in requests:
+        instance = request["instance"]
+        started = float(request["_started_perf_s"])
+        finished = started + float(request["end_to_end_s"])
+        if instance not in bounds:
+            bounds[instance] = [started, finished]
+        else:
+            bounds[instance][0] = min(bounds[instance][0], started)
+            bounds[instance][1] = max(bounds[instance][1], finished)
+
+    overlap_start = max(start for start, _ in bounds.values()) if len(bounds) > 1 else None
+    overlap_end = min(end for _, end in bounds.values()) if len(bounds) > 1 else None
+    overlap_s = (
+        overlap_end - overlap_start
+        if overlap_start is not None and overlap_end is not None
+        else None
+    )
+    overlap_tokens = None
+    overlap_tokens_per_s = None
+    if overlap_s is not None and overlap_s > 0:
+        overlap_tokens = 0
+        for request in requests:
+            started = float(request["_started_perf_s"])
+            for event in request.get("token_count_events", ()):
+                event_time = started + float(event.get("arrival_s", 0.0))
+                if overlap_start <= event_time <= overlap_end:
+                    overlap_tokens += int(event.get("new_tokens", 0))
+        overlap_tokens_per_s = overlap_tokens / overlap_s
+
+    return {
+        "instances": {
+            instance: {
+                "earliest_start_s": start - origin,
+                "latest_finish_s": end - origin,
+            }
+            for instance, (start, end) in sorted(bounds.items())
+        },
+        "observed_overlap_s": overlap_s,
+        "overlap_output_tokens": overlap_tokens,
+        "overlap_output_tokens_per_s": overlap_tokens_per_s,
+    }
+
+
+def require_transition_overlap(scenario, timing):
+    """Fail closed when a supposedly staged phase ran without overlap."""
+
+    if scenario in TRANSITION_SCENARIOS and (
+        timing["observed_overlap_s"] is None
+        or timing["observed_overlap_s"] <= 0
+    ):
+        raise RuntimeError(
+            f"transition {scenario} completed without an observed overlap window"
+        )
 
 
 def wait_for_drain(stats_paths, timeout=30):
@@ -864,7 +957,7 @@ def phase(
             lambda job: generate(
                 f"http://127.0.0.1:{PORTS[job[0]]}/generate", job[1], 120
             ),
-            delay_ms=lambda job: workload["arrival_delay_ms"].get(job[0], 0),
+            delay_ms=lambda job: job[1]["start_delay_ms"],
         )
         finished = time.perf_counter()
         started = min(starts)
@@ -903,6 +996,8 @@ def phase(
         raise RuntimeError("broker exceeded its configured capacity")
     if any(stats["live_tokens"] for stats in idle["instances"].values()):
         raise RuntimeError(f"live tokens remain after {scenario} repeat {repeat}")
+    timing = request_timing_evidence(requests, origin=sampler.origin)
+    require_transition_overlap(scenario, timing)
     for request in requests:
         request.pop("_started_perf_s")
         request.pop("output_ids", None)
@@ -913,6 +1008,11 @@ def phase(
         "status": "ok", "scenario": scenario, "repeat": repeat,
         "warmup": warmup, "elapsed_s": elapsed, "drain_s": drain_s,
         "dispatch_skew_s": dispatch_skew_s,
+        "instance_timing_s": timing["instances"],
+        "observed_overlap_s": timing["observed_overlap_s"],
+        "overlap_output_tokens": timing["overlap_output_tokens"],
+        "overlap_output_tokens_per_s": timing["overlap_output_tokens_per_s"],
+        "configured_transition_gap_ms": workload.get("transition_gap_ms"),
         "input_tokens": sum(request["input_tokens"] for request in requests),
         "output_tokens": output_tokens, "output_tokens_per_s": output_tokens / elapsed,
         "estimated_kv_bytes": estimated_kv_bytes,
@@ -965,6 +1065,15 @@ def summarize_phase(result):
             "elapsed_s": result["elapsed_s"],
             "drain_s": result["drain_s"],
             "dispatch_skew_s": result["dispatch_skew_s"],
+            "instance_timing_s": result.get("instance_timing_s", {}),
+            "observed_overlap_s": result.get("observed_overlap_s"),
+            "overlap_output_tokens": result.get("overlap_output_tokens"),
+            "overlap_output_tokens_per_s": result.get(
+                "overlap_output_tokens_per_s"
+            ),
+            "configured_transition_gap_ms": (
+                result.get("configured_transition_gap_ms")
+            ),
             "input_tokens": result["input_tokens"],
             "output_tokens": result["output_tokens"],
             "output_tokens_per_s": result["output_tokens_per_s"],
@@ -1067,6 +1176,12 @@ def main(argv=None):
     parser.add_argument("--arrival-delay-a-ms", type=int, default=0)
     parser.add_argument("--arrival-delay-b-ms", type=int, default=0)
     parser.add_argument(
+        "--transition-gap-ms",
+        type=int,
+        default=500,
+        help="delay from incumbent dispatch to incoming-instance dispatch",
+    )
+    parser.add_argument(
         "--skip-correctness-probe",
         action="store_true",
         help="skip the fixed non-streaming output-ID matrix (debug runs only)",
@@ -1103,6 +1218,8 @@ def main(argv=None):
         parser.error("--arrival-delay-a-ms must be in [0, 60000]")
     if not 0 <= args.arrival_delay_b_ms <= 60000:
         parser.error("--arrival-delay-b-ms must be in [0, 60000]")
+    if not 0 <= args.transition_gap_ms <= 60000:
+        parser.error("--transition-gap-ms must be in [0, 60000]")
     output = args.output_dir.resolve()
     broker_path = None if args.broker_path is None else args.broker_path.resolve()
     if broker_path is not None and broker_path.exists():
@@ -1133,6 +1250,7 @@ def main(argv=None):
             "a": args.arrival_delay_a_ms,
             "b": args.arrival_delay_b_ms,
         },
+        "transition_gap_ms": args.transition_gap_ms,
     }
     broker_capacity_bytes = (
         args.broker_mib * 1024 * 1024 if broker_path is not None else None

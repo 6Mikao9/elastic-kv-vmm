@@ -55,8 +55,13 @@ dense 首轮直接使用现有的 `scripts/run_dual.py`。它已经支持：
 ```
 
 驱动会拒绝已有 broker 文件、非 VMM 模式、两个模型共用 tenant，以及不完整的
-broker 参数。它在 `a-hot`、`b-hot`、`both-active` 三个相位同时采样
-adapter backing、整卡 NVML 和只读 broker 快照。MiniMax/HiSparse 使用其独立
+broker 参数。它在 `a-hot`、`b-hot`、`a-to-b`、`b-to-a`、`both-active` 五个
+相位同时采样 adapter backing、整卡 NVML 和只读 broker 快照。两个 transition
+相位先提交 incumbent，再在统一 barrier 之后按 `--transition-gap-ms` 提交
+incoming instance，随后共同 drain。runner 计算双方实际活跃区间的交叠时长、
+交叠窗口输出 token 速率，并在 transition 实际变成串行时将该次运行判为失败。
+相位 wall-clock 吞吐包含人为 gap 与尾部，不能直接当成纯算法加速比。
+MiniMax/HiSparse 使用其独立
 TP4 runner；在它接入相同的相位驱动前，不能把 dense 结果当成请求级迁移结果。
 
 示例（在宿主机项目根目录运行）：
@@ -77,7 +82,9 @@ bash scripts/container_dual.sh 0 /path/to/huggingface/hub v2 \
 并记录逻辑相位需求与 broker capacity 的比值；该比值是容量压力上界，
 不能替代对齐后的实际 lease 峰值和超卖采样。
 `--arrival-delay-a-ms` 和 `--arrival-delay-b-ms` 在统一 barrier 放行后施加
-显式到达偏移，用于先占/后发的不公平突发；实际 dispatch skew 写入相位结果。
+显式到达偏移，用于先占/后发的不公平突发；transition 的 incoming dispatch
+至少滞后 incumbent 一个 `--transition-gap-ms`。实际每实例首请求偏移和
+最后完成时间、交叠时长、交叠吞吐及 dispatch skew 均写入相位结果。
 
 最小结果结构如下，原始 samples 和 requests 单独保存，汇总只从原始产物生成：
 
@@ -135,7 +142,7 @@ outstanding bytes；成功实验若仍有 owner/lease，或 broker 状态不可�
 1. `warmup-light`：两侧各提交少量短请求，确认 healthy、adapter stats 和 broker owner 已出现。warmup 不计时。
 2. `steady-low`：两侧低并发，等待一段稳定窗口。记录 idle backing、租约和整卡基线。
 3. `a-hot`：A 达到预设高并发，B 保持低载。验证 A 可在总预算空闲时 borrow。
-4. `reverse-transition`：固定 A 的请求已完成后切换到 `b-hot`；也运行相反顺序。验证释放确认后的租约转交。
+4. `reverse-transition`：先提交 incumbent，再经过固定 gap 提交 incoming，使旧负载尚未完成时新负载已经到达；`a-to-b` 与 `b-to-a` 都在每轮运行。验证释放确认后的租约转交。
 5. `both-burst`：两侧同时提交，使对齐后的合计需求超过 broker 预算。验证拒绝发生在 `cuMemMap` 前，而不是依赖真实 CUDA OOM。
 6. `drain`：等待所有请求完成、GPU 工作同步、VMM unmap/release 和租约清理。记录回收完成时间。
 
@@ -223,7 +230,7 @@ non_vmm_reserved
 
 ## 9. 实施顺序
 
-1. `run_dual.py` 已接入 broker 配置、只读 snapshot、两租户 owner 校验、同步 dispatch barrier、非流式正确性探针、可配置负载/到达偏移与逻辑 KV 压力估算、镜像/源码/模型/GPU/native 运行时溯源、完整 adapter 计数、显式 drain 等待、失败快照和逐相位 raw 文件。三轮测量按 `a-hot, b-hot, both-active` 与 `b-hot, a-hot, both-active` 交替；分阶段 transition 和真实 broker runner 集成测试仍待加入。
+1. `run_dual.py` 已接入 broker 配置、只读 snapshot、两租户 owner 校验、同步 dispatch barrier、非流式正确性探针、可配置负载/到达偏移与逻辑 KV 压力估算、镜像/源码/模型/GPU/native 运行时溯源、完整 adapter 计数、显式 drain 等待、失败快照和逐相位 raw 文件。三轮测量按 `a-hot, b-hot, a-to-b, b-to-a, both-active` 与反向 A/B 顺序交替；分阶段 transition 已加入。真实 broker runner 集成测试和独占 GPU 矩阵仍待加入。
 2. 先跑 `isolated`、`shared-off` 和 `fair-observe` 的 CPU/单实例兼容检查，确认输出 JSON、租约不超卖和失败路径。
 3. 在空闲 A100 上跑 dense 三种 arm 的双实例配对，验证负载反转、同时突发和 drain。
 4. 启用 `fair-enforce`，检查公平拒绝和空闲回收；不要在此阶段声称 active KV 抢占。
@@ -231,3 +238,15 @@ non_vmm_reserved
 6. 最后运行 SIGKILL、partial-map/close 失败和 stale owner 故障注入，确认恢复路径不会超卖。
 
 任何 GPU 实验开始前都要先确认目标卡空闲，记录 GPU UUID、driver、CUDA、SGLang/PyTorch 版本和源码哈希。实验期间不启动未纳入 broker 的其他 GPU 进程；这样“broker 不覆盖外部 allocator”的边界不会被误判为 broker 失败。
+
+## 10. 当前验证边界
+
+2026-11-09 在 5090 宿主机的 SGLang 0.5.17 无 GPU、无网络隔离容器中，双实例
+runner、单实例 runner 和全局 broker 的专项测试为 **63 passed, 9 subtests
+passed**。加入分阶段 transition 后，同一镜像的完整回归为 **472 passed,
+2 skipped, 146 subtests passed**；两个 skip 仍需要真实 CUDA device。
+
+这组测试证明 `a-to-b`/`b-to-a` 相位会按固定 gap 生成两阶段 dispatch，并把
+每实例最早启动、最晚完成、实际交叠窗口和交叠 token 速率写进汇总；没有正
+交叠的 transition 会 fail closed。它不证明 VMM 映射、租约转交或服务时延；这些仍需
+在独占 GPU 上用同源、同请求集合、同 broker 容量的配对矩阵测量。
