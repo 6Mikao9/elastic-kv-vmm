@@ -8,6 +8,8 @@ from collections import Counter
 from dataclasses import dataclass
 import os
 
+from .profile_ranges import profile_range
+
 
 @dataclass
 class PreparedDemotion:
@@ -62,6 +64,7 @@ def _release_host(coordinator, row):
     coordinator.req_to_host_pool_allocated_len[row] = 0
 
 
+@profile_range("hisparse/demotion/prepare")
 def prepare_demote(coordinator, req, synchronize):
     """Stage committed sparse main K/V without changing attention ownership."""
     if not coordinator.is_m3_hisparse or coordinator.spec_swap.enabled:
@@ -125,6 +128,7 @@ def abort_demote(prepared):
     prepared.status = "aborted"
 
 
+@profile_range("hisparse/demotion/commit")
 def commit_demote(prepared, publish_host_backed, synchronize, trim_quiescent=None):
     """Transfer reused pages to the fixed hot buffer and release the remainder.
 
@@ -185,6 +189,7 @@ class PreparedPromotion:
     status: str = "prepared"
 
 
+@profile_range("hisparse/promotion/prepare")
 def prepare_promote(coordinator, req, synchronize):
     """Copy host-backed history into new physical pages without publishing it."""
     if (not coordinator.is_m3_hisparse or coordinator.spec_swap.enabled
@@ -252,6 +257,7 @@ def abort_promote(prepared):
     prepared.status = "aborted"
 
 
+@profile_range("hisparse/promotion/commit")
 def commit_promote(prepared, publish_gpu_resident, synchronize):
     """Release the source and publish its prepopulated full-resident mapping."""
     if prepared.status != "prepared":

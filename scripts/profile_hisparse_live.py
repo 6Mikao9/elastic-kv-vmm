@@ -35,6 +35,7 @@ def inspect_trace(path):
     counts = Counter()
     kernels = {}
     waits = {}
+    scopes = {}
     cuda_apis = {category: {} for category in CUDA_API_CATEGORIES}
     devices = set()
     intervals = []
@@ -43,7 +44,10 @@ def inspect_trace(path):
         if event.get("ph") != "X":
             continue
         category = event.get("cat")
-        if category not in GPU_CATEGORIES and category != "cpu_op" and category not in cuda_apis:
+        is_scope = (category == "user_annotation"
+                    and str(event.get("name", "")).startswith("ekv/"))
+        if (category not in GPU_CATEGORIES and category != "cpu_op"
+                and category not in cuda_apis and not is_scope):
             continue
         name = event["name"]
         start, duration = event["ts"], event["dur"]
@@ -59,6 +63,8 @@ def inspect_trace(path):
                 devices.add(device)
         if category == "kernel":
             accumulate_duration(kernels, name, duration)
+        if is_scope:
+            accumulate_duration(scopes, name, duration)
         if category in cuda_apis:
             accumulate_duration(cuda_apis[category], name, duration)
             if WAIT_CALLS.search(name):
@@ -84,6 +90,7 @@ def inspect_trace(path):
         "gpu_activity_sum_us": sum(stop - start for start, stop in intervals),
         "cuda_device_from_trace": next(iter(devices), None),
         "cuda_kernels_by_name": kernels,
+        "ekv_cpu_scopes_by_name": scopes,
         "cuda_api_cpu_durations_by_category_and_name": cuda_apis,
         "cuda_wait_api_cpu_durations_by_name": waits,
         "explicit_gpu_memcpy": memcpy,
@@ -179,6 +186,8 @@ def capture(base_url, output, workload, opener, output_token_cap=DEFAULT_OUTPUT_
             "GPU union assumes one CUDA device per rank, checked when device metadata is present. "
             "CUDA API durations describe observed CPU calls only. An empty API category "
             "does not establish that VMM operations were absent. "
+            "EKV scopes are nested CPU wall intervals, not exclusive costs or GPU intervals. "
+            "Their sums can double-count nested work and include asynchronous launch time. "
             "Wait API durations measure CPU calls, including stream-wait enqueues, and cannot "
             "measure GPU stall time. Explicit CUDA memcpy events "
             "report bytes only when provided by the trace. HiSparse kernels can read "

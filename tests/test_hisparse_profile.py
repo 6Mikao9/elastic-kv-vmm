@@ -27,6 +27,9 @@ def write_trace(directory, rank, *, include_gpu=True, multiple_devices=False):
         event("cuda_runtime", 1, 1, "cudaLaunchKernel"),
         event("cuda_runtime", 9, 2, "cudaStreamSynchronize"),
         event("cuda_runtime", 12, 1, "cudaStreamWaitEvent"),
+        event("user_annotation", 0, 2000, "ekv/residency/map_latest"),
+        event("user_annotation", 100, 500, "ekv/residency/resolve"),
+        event("user_annotation", 2050, 100, "ekv/residency/map_latest"),
     ]
     if include_gpu:
         events.extend([
@@ -61,6 +64,10 @@ class HiSparseProfileTest(unittest.TestCase):
         self.assertEqual(ranks["0"]["cuda_device_from_trace"], 0)
         self.assertEqual(ranks["0"]["cuda_kernels_by_name"], {
             "kernel": {"count": 2, "sum_us": 18, "max_us": 10},
+        })
+        self.assertEqual(ranks["0"]["ekv_cpu_scopes_by_name"], {
+            "ekv/residency/map_latest": {"count": 2, "sum_us": 2100, "max_us": 2000},
+            "ekv/residency/resolve": {"count": 1, "sum_us": 500, "max_us": 500},
         })
         self.assertEqual(ranks["0"]["cuda_api_cpu_durations_by_category_and_name"], {
             "cuda_driver": {

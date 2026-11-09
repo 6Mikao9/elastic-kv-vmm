@@ -9,6 +9,7 @@ import time
 import torch
 
 from .future_residency import decide_resident_claim
+from .profile_ranges import profile_range
 from .residency_broker import (
     ResidencyBroker,
     page_aligned_growth_slots,
@@ -273,6 +274,8 @@ def install_request_residency():
         raise ValueError("EKV_SHARED_PREFIX_REUSE must be off or direct")
     if resolver == "triton":
         from .resident_lookup import resolve_resident
+
+        resolve_resident = profile_range("hisparse/resident_resolver")(resolve_resident)
     reserve = int(os.environ.get("EKV_RESIDENT_FREE_RESERVE", "0"))
     if limit < 0 or reserve <= 0:
         raise ValueError("Static residency requires a positive physical slot reserve")
@@ -874,7 +877,11 @@ def install_request_residency():
     cls.__init__ = initialize
     cls.admit_request_into_staging = stage
     cls.alloc_device_buffer = allocate_buffer
-    cls.map_last_loc_to_buffer = map_latest
+    cls.map_last_loc_to_buffer = profile_range("hisparse/map_latest")(map_latest)
+    if os.environ.get("EKV_PROFILE_RANGES") == "1":
+        cls.swap_in_selected_blocks = profile_range("hisparse/native_sparse_swap")(
+            cls.swap_in_selected_blocks
+        )
     cls.request_finished = finish
     cls.abort_staging_request = abort
     if broker_mode != "off" or shared_prefix_mode == "direct":
@@ -887,5 +894,5 @@ def install_request_residency():
     if shared_prefix_mode == "direct":
         cls._ekv_register_promoted_source = register_promoted_source
         cls._ekv_remove_demoted_source = remove_demoted_source
-    attn._hisparse_swap_in_blocks = swap
+    attn._hisparse_swap_in_blocks = profile_range("hisparse/attention_swap")(swap)
     cls._ekv_static_residency = True

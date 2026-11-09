@@ -90,4 +90,11 @@ def install_minimax_runtime() -> tuple[str, ...]:
         install_memory_telemetry(allocator_stats_dir)
         installed.append("memory_telemetry")
 
+    if (os.environ.get("EKV_PROFILE_RANGES") == "1"
+            and not int(os.environ.get("EKV_RESIDENT_LIMIT", "0"))):
+        from adaptive_sparse.profile_ranges import install_native_profile_ranges
+
+        install_native_profile_ranges()
+        installed.append("native_profile_ranges")
+
     return tuple(installed)

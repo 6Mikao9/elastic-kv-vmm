@@ -27,6 +27,31 @@ Per-action attribution still needs explicit ranges and launch correlations.
 An existing frozen run can be re-read offline into a new analysis artifact;
 do not overwrite its original trace or equate re-analysis with a new capture.
 
+## Optional phase attribution
+
+New diagnostic workers enable `EKV_PROFILE_RANGES=1` when the runner receives
+`--profile-workload`. Regular performance runs explicitly clear an inherited
+flag. The manifest records the setting. Workers bind the wrappers at startup;
+enabling profiling later in an already-running unmarked worker does not install
+them. With the flag off, the decorator returns the original callable, so the
+normal per-layer path gains no profiler wrapper or context.
+
+The Torch trace uses `ekv/` CPU annotations for native mapping/swap, mixed-mode
+mapping/attention swap, the Triton resident resolver, native sparse swap, and
+demotion/promotion prepare and commit. The Torch resident resolver remains
+inline and is covered by its outer attention-swap scope. These labels identify
+which operation enqueued work; they do not establish its critical-path cost.
+`ekv_cpu_scopes_by_name` reports nested CPU wall intervals separately from GPU
+activity. Summing these scopes can double-count nested work and does not measure
+GPU stall or transfer volume. Use launch correlations in the raw trace for
+further attribution.
+
+The scope helper, runner isolation, trace accounting and relevant migration
+paths passed 46 targeted tests in the A100 development container. A separate
+real Torch CPU capture checked nesting and original exception propagation.
+These checks do not validate a marked full-model GPU capture. The r6/r7/r8
+frozen comparison source predates these additions and remains unchanged.
+
 ## Nsight Systems installation, 2026-11-09
 
 Nsight Systems CLI **2026.5.1.161** is now extracted into the persistent container

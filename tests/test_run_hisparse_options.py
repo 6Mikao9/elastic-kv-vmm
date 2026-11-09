@@ -7,6 +7,7 @@ import tempfile
 import unittest
 
 from scripts.run_hisparse_smoke import (
+    configure_profile_environment,
     diagnostic_capture_arguments,
     global_broker_environment,
     global_broker_manifest,
@@ -28,6 +29,17 @@ from scripts.run_hisparse_smoke import (
 
 
 class ResidentHintRunnerOptionsTest(unittest.TestCase):
+    def test_profile_ranges_cannot_leak_into_performance_runs(self):
+        environment = {"EKV_PROFILE_RANGES": "1", "CUDA_VISIBLE_DEVICES": "GPU-test"}
+        configure_profile_environment(environment, None)
+        self.assertNotIn("EKV_PROFILE_RANGES", environment)
+        self.assertEqual(environment["CUDA_VISIBLE_DEVICES"], "GPU-test")
+        configure_profile_environment(environment, "mixed")
+        self.assertEqual(environment["EKV_PROFILE_RANGES"], "1")
+        self.assertEqual(environment["SGLANG_PROFILE_V2"], "0")
+        configure_profile_environment(environment, "")
+        self.assertNotIn("EKV_PROFILE_RANGES", environment)
+
     def test_server_base_url_supports_explicit_ports_and_wildcards(self):
         self.assertEqual(server_base_url("127.0.0.1", 31081), "http://127.0.0.1:31081")
         self.assertEqual(server_base_url("0.0.0.0", 31082), "http://127.0.0.1:31082")

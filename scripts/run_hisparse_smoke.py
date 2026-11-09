@@ -36,6 +36,14 @@ def server_base_url(host, port):
     return f"http://{authority}:{port}"
 
 
+def configure_profile_environment(environment, workload):
+    """Keep scope instrumentation confined to explicit diagnostic runs."""
+    environment.pop("EKV_PROFILE_RANGES", None)
+    if workload:
+        environment["SGLANG_PROFILE_V2"] = "0"
+        environment["EKV_PROFILE_RANGES"] = "1"
+
+
 def validate_server_endpoint(parser, *, host, port):
     if not host or host != host.strip() or any(character.isspace() for character in host):
         parser.error("server host must be a nonempty value without whitespace")
@@ -730,8 +738,7 @@ def main():
     ]
     environment = os.environ.copy()
     environment["PYTHONPATH"] = os.pathsep.join(filter(None, (str(ROOT), environment.get("PYTHONPATH"))))
-    if args.profile_workload:
-        environment["SGLANG_PROFILE_V2"] = "0"
+    configure_profile_environment(environment, args.profile_workload)
     if args.launch_blocking:
         environment["CUDA_LAUNCH_BLOCKING"] = "1"
     else:
@@ -826,6 +833,7 @@ def main():
         "elastic_kv/launch.py",
         "elastic_kv/config.py",
         "adaptive_sparse/minimax_runtime.py",
+        "adaptive_sparse/profile_ranges.py",
     )
     if args.sm80_bf16_projections:
         sources += (
@@ -882,6 +890,7 @@ def main():
         "sm80_bf16_projections": args.sm80_bf16_projections,
         "benchmark_repeats": args.benchmark_repeats, "workloads": args.workloads,
         "live_profile_diagnostic": args.profile_workload,
+        "ekv_profile_ranges": environment.get("EKV_PROFILE_RANGES") == "1",
         "profile_output_token_cap": args.profile_output_token_cap,
         "forced_replay": args.forced_replay,
         "warmup_once": args.warmup_once,

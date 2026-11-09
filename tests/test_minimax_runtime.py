@@ -102,6 +102,23 @@ class MiniMaxRuntimeTest(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True), patch.dict(sys.modules, {}):
             self.assertEqual(install_minimax_runtime(), ())
 
+    def test_native_scopes_only_install_in_native_diagnostic(self):
+        calls = []
+        modules = {
+            "adaptive_sparse.profile_ranges": SimpleNamespace(
+                install_native_profile_ranges=lambda: calls.append("native")),
+            "adaptive_sparse.request_residency": SimpleNamespace(
+                install_request_residency=lambda: calls.append("resident")),
+        }
+        with patch.dict(sys.modules, modules), patch.dict(
+                os.environ, {"EKV_PROFILE_RANGES": "1"}, clear=True):
+            self.assertEqual(install_minimax_runtime(), ("native_profile_ranges",))
+            self.assertEqual(calls, ["native"])
+            calls.clear()
+            os.environ["EKV_RESIDENT_LIMIT"] = "2"
+            self.assertEqual(install_minimax_runtime(), ("request_residency",))
+            self.assertEqual(calls, ["resident"])
+
 
 if __name__ == "__main__":
     unittest.main()
