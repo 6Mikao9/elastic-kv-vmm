@@ -911,6 +911,60 @@ class RolloutExecutorTest(unittest.TestCase):
                 [replace(submission(), decode_batch_size=0)]
             )
 
+    def test_rejects_inconsistent_batch_cohort_metadata(self):
+        first = replace(
+            submission(),
+            request_id="first",
+            prefill_batch_size=2,
+            cohort_id="batch-0",
+        )
+        second = replace(
+            submission(),
+            request_id="second",
+            submit_at_ms=11,
+            deadline_ms=111,
+            prefill_batch_size=2,
+            cohort_id="batch-0",
+        )
+
+        with self.assertRaisesRegex(RolloutExecutionError, "inconsistent timing"):
+            validate_submissions([first, second])
+        with self.assertRaisesRegex(RolloutExecutionError, "requires a cohort"):
+            validate_submissions(
+                [replace(submission(), prefill_batch_size=2)]
+            )
+
+    def test_batched_plan_round_trips_cohort_inputs(self):
+        plan = plan_rollout(
+            [
+                RequestProfile(
+                    "first", 0, 10, 10, residence_hint="resident"
+                ),
+                RequestProfile(
+                    "second", 0, 10, 10, residence_hint="resident"
+                ),
+            ],
+            PlannerConfig(
+                memory_budget_bytes=100_000,
+                kv_bytes_per_token=10,
+                prefill_workspace_bytes_per_token=0,
+                sparse_hot_tokens=10,
+                max_active_requests=2,
+                max_batch_requests=2,
+            ),
+            "batched",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "plan.json"
+            path.write_text(
+                json.dumps({"rollout": plan.as_dict()}), encoding="utf-8"
+            )
+            loaded = load_plan(path)
+
+        self.assertEqual({item.prefill_batch_size for item in loaded}, {2})
+        self.assertEqual(len({item.cohort_id for item in loaded}), 1)
+        self.assertEqual(len({item.submit_at_ms for item in loaded}), 1)
+
     def test_plan_round_trips_with_execution_inputs(self):
         plan = plan_rollout(
             [
@@ -943,6 +997,8 @@ class RolloutExecutorTest(unittest.TestCase):
         self.assertEqual(loaded[0].hint["prefix_group"], "request-prefix")
         self.assertEqual(loaded[0].hint["shared_prefix_tokens"], 16)
         self.assertEqual(loaded[0].decode_batch_size, 1)
+        self.assertEqual(loaded[0].prefill_batch_size, 1)
+        self.assertIsNone(loaded[0].cohort_id)
 
     def test_residency_evidence_reconciles_all_tp_ranks(self):
         with tempfile.TemporaryDirectory() as directory:

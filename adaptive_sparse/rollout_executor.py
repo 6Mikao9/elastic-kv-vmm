@@ -141,6 +141,7 @@ def validate_submissions(submissions: Iterable[RolloutSubmission]) -> tuple[Roll
     if not ordered:
         raise RolloutExecutionError("rollout contains no submissions")
     prefix_lengths: dict[str, set[int]] = {}
+    cohorts: dict[str, list[RolloutSubmission]] = {}
     for item in ordered:
         if not isinstance(item.request_id, str) or not item.request_id:
             raise RolloutExecutionError("each rollout submission needs a request ID")
@@ -169,6 +170,27 @@ def validate_submissions(submissions: Iterable[RolloutSubmission]) -> tuple[Roll
         ):
             raise RolloutExecutionError(
                 f"{item.request_id}: decode batch size must be positive"
+            )
+        if (
+            type(item.prefill_batch_size) is not int
+            or item.prefill_batch_size < 1
+        ):
+            raise RolloutExecutionError(
+                f"{item.request_id}: prefill batch size must be positive"
+            )
+        if item.cohort_id is not None:
+            if (
+                not isinstance(item.cohort_id, str)
+                or not item.cohort_id
+                or len(item.cohort_id) > 128
+            ):
+                raise RolloutExecutionError(
+                    f"{item.request_id}: invalid cohort ID"
+                )
+            cohorts.setdefault(item.cohort_id, []).append(item)
+        elif item.prefill_batch_size != 1:
+            raise RolloutExecutionError(
+                f"{item.request_id}: batched prefill requires a cohort ID"
             )
         hint = FutureHint.from_payload(_future_payload(item.hint))
         if hint.release_after_ms != 0:
@@ -216,6 +238,18 @@ def validate_submissions(submissions: Iterable[RolloutSubmission]) -> tuple[Roll
     ids = [item.request_id for item in ordered]
     if len(set(ids)) != len(ids):
         raise RolloutExecutionError("rollout request IDs must be unique")
+    for cohort_id, members in cohorts.items():
+        starts = {item.submit_at_ms for item in members}
+        sizes = {item.prefill_batch_size for item in members}
+        decodes = {item.decode_batch_size for item in members}
+        if len(starts) != 1 or len(sizes) != 1 or len(decodes) != 1:
+            raise RolloutExecutionError(
+                f"cohort {cohort_id}: inconsistent timing or batch metadata"
+            )
+        if next(iter(sizes)) != len(members):
+            raise RolloutExecutionError(
+                f"cohort {cohort_id}: prefill batch size does not match members"
+            )
     return tuple(
         sorted(ordered, key=lambda item: (item.submit_at_ms, item.request_id))
     )
@@ -253,6 +287,8 @@ def load_plan(path: str | Path) -> tuple[RolloutSubmission, ...]:
                 hint=dict(hint),
                 deadline_ms=raw.get("deadline_ms"),
                 decode_batch_size=raw.get("decode_batch_size", 1),
+                prefill_batch_size=raw.get("prefill_batch_size", 1),
+                cohort_id=raw.get("cohort_id"),
             )
         except KeyError as exc:
             raise RolloutExecutionError(

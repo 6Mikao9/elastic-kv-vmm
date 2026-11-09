@@ -149,6 +149,16 @@ linear model and are never interpolated. Because an already-admitted request is
 not rewritten when a later request joins its batch, the next step is to collect
 real SGLang co-batch traces and compare predicted with observed TTFT, TPOT and
 makespan before treating the profile as a serving performance claim.
+The known-future `batched` policy adds exact-size aggregate prefill profiles and
+jointly placed resident/HiSparse cohorts. It waits only when a measured profile
+improves both weighted completion and makespan without turning a satisfiable
+deadline into a miss; missing measurements use serial prefill and linear decode.
+Cohort IDs, prefill/decode batch sizes and latest-admission timing are carried
+through the executable plan and validated before dispatch. This remains a
+planner/controller mechanism. Future work must capture real SGLang prefill and
+decode profiles for each target model, verify that native `PrefillAdder` forms
+the intended cohort, and report predicted versus observed TTFT, TPOT, makespan,
+prefill-workspace peak and whole-device memory.
 
 The controller now also tracks the real in-flight set.  A bounded concurrency
 mode turns planned timestamps into earliest admission times, deadline ordering

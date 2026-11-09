@@ -882,6 +882,195 @@ class FuturePlanTest(unittest.TestCase):
             ):
                 PlannerConfig(**common, decode_batch_profiles=profiles)
 
+    def test_batched_policy_waits_only_when_measured_cohort_is_faster(self):
+        config = replace(
+            self.config,
+            memory_budget_bytes=20_000,
+            kv_bytes_per_token=10,
+            sparse_hot_tokens=5,
+            prefill_tokens_per_ms=10,
+            resident_decode_tokens_per_ms=10,
+            max_active_requests=2,
+            max_batch_requests=2,
+            batch_window_ms=10,
+            prefill_batch_profiles={2: 30},
+            decode_batch_profiles={
+                2: {
+                    "resident_tokens_per_ms": 30,
+                    "sparse_tokens_per_ms": 20,
+                }
+            },
+        )
+        workload = (
+            RequestProfile(
+                "first",
+                0,
+                100,
+                20,
+                residence_hint="resident",
+            ),
+            RequestProfile(
+                "second",
+                5,
+                100,
+                20,
+                residence_hint="resident",
+            ),
+        )
+
+        fifo = simulate(workload, config, "fifo")
+        batched = simulate(workload, config, "batched")
+
+        self.assertEqual({item.start_ms for item in batched.admissions}, {5})
+        self.assertEqual(len({item.cohort_id for item in batched.admissions}), 1)
+        self.assertEqual(
+            {item.prefill_batch_size for item in batched.admissions}, {2}
+        )
+        self.assertLess(batched.weighted_completion_ms, fifo.weighted_completion_ms)
+        self.assertLess(batched.makespan_ms, fifo.makespan_ms)
+        rollout = plan_rollout(
+            workload, config, "batched", simulation=batched
+        )
+        self.assertEqual(
+            {item.hint["prefill_tokens_per_s"] for item in rollout.submissions},
+            {15_000.0},
+        )
+
+    def test_batched_policy_does_not_trade_a_met_deadline_for_a_cohort(self):
+        config = replace(
+            self.config,
+            memory_budget_bytes=20_000,
+            kv_bytes_per_token=10,
+            sparse_hot_tokens=5,
+            prefill_tokens_per_ms=10,
+            resident_decode_tokens_per_ms=10,
+            max_active_requests=2,
+            max_batch_requests=2,
+            batch_window_ms=5,
+            prefill_batch_profiles={2: 30},
+        )
+        workload = (
+            RequestProfile(
+                "deadline",
+                0,
+                10,
+                10,
+                deadline_ms=3,
+                residence_hint="resident",
+            ),
+            RequestProfile(
+                "later",
+                4,
+                10,
+                10,
+                residence_hint="resident",
+            ),
+        )
+
+        result = simulate(workload, config, "batched")
+        by_id = {item.request_id: item for item in result.admissions}
+
+        self.assertEqual(by_id["deadline"].start_ms, 0)
+        self.assertLessEqual(by_id["deadline"].finish_ms, 3)
+        self.assertEqual(result.deadline_misses, 0)
+
+    def test_missing_prefill_profile_never_synthesizes_batch_benefit(self):
+        config = replace(
+            self.config,
+            memory_budget_bytes=100_000,
+            kv_bytes_per_token=10,
+            sparse_hot_tokens=20,
+            max_active_requests=2,
+            max_batch_requests=2,
+            batch_window_ms=10,
+        )
+        workload = (
+            RequestProfile(
+                "first", 0, 100, 20, residence_hint="resident"
+            ),
+            RequestProfile(
+                "second", 5, 100, 20, residence_hint="resident"
+            ),
+        )
+
+        result = simulate(workload, config, "batched")
+        by_id = {item.request_id: item for item in result.admissions}
+
+        self.assertEqual(by_id["first"].start_ms, 0)
+        self.assertNotEqual(
+            by_id["first"].cohort_id,
+            by_id["second"].cohort_id,
+        )
+
+    def test_batched_joint_placement_can_mix_resident_and_hisparse(self):
+        config = replace(
+            self.config,
+            memory_budget_bytes=350,
+            kv_bytes_per_token=10,
+            prefill_workspace_bytes_per_token=0,
+            sparse_hot_tokens=10,
+            max_active_requests=2,
+            max_batch_requests=2,
+            batch_window_ms=0,
+        )
+        workload = (
+            RequestProfile(
+                "resident", 0, 10, 10, residence_hint="resident"
+            ),
+            RequestProfile(
+                "sparse", 0, 10, 10, residence_hint="resident"
+            ),
+        )
+
+        result = simulate(workload, config, "batched")
+        by_id = {item.request_id: item for item in result.admissions}
+
+        self.assertEqual(by_id["resident"].mode, ResidencyMode.RESIDENT)
+        self.assertEqual(by_id["sparse"].mode, ResidencyMode.HI_SPARSE)
+        self.assertEqual(len(result.admissions), 2)
+        self.assertLessEqual(result.peak_memory_bytes, config.memory_budget_bytes)
+
+    def test_batched_config_round_trips_and_rejects_invalid_values(self):
+        config = replace(
+            self.config,
+            batch_window_ms=7,
+            max_batch_requests=3,
+            prefill_batch_profiles={"1": 10, "3": 24},
+        )
+
+        restored = PlannerConfig(**config.as_dict())
+
+        self.assertEqual(restored.prefill_batch_profiles, ((1, 10), (3, 24)))
+        self.assertEqual(restored.prefill_rate_for_batch("generic", 1), 10)
+        self.assertEqual(restored.prefill_rate_for_batch("generic", 3), 8)
+        self.assertEqual(restored.prefill_rate_for_batch("missing", 2), 1000)
+        self.assertEqual(restored.as_dict(), config.as_dict())
+
+        common = {
+            "memory_budget_bytes": 1,
+            "kv_bytes_per_token": 1,
+            "prefill_workspace_bytes_per_token": 0,
+            "max_active_requests": 2,
+        }
+        with self.assertRaisesRegex(ValueError, "batch_window_ms"):
+            PlannerConfig(**common, batch_window_ms=-1)
+        with self.assertRaisesRegex(ValueError, "max_batch_requests"):
+            PlannerConfig(**common, max_batch_requests=0)
+        with self.assertRaisesRegex(ValueError, "max_batch_requests"):
+            PlannerConfig(**common, max_batch_requests=3)
+        for profiles, message in (
+            ({"0": 1}, "prefill batch size"),
+            ({True: 1}, "integer"),
+            ({1: 0}, "finite positive"),
+            ({1: math.inf}, "finite positive"),
+            ((1, 2, 3), "entries"),
+            ((("1", 1), (1, 2)), "duplicate"),
+        ):
+            with self.subTest(profiles=profiles), self.assertRaisesRegex(
+                ValueError, message
+            ):
+                PlannerConfig(**common, prefill_batch_profiles=profiles)
+
     def test_active_prefix_reuse_requires_explicit_radix_capability(self):
         config = replace(self.config, active_prefix_prefill_reuse=True)
         workload = (

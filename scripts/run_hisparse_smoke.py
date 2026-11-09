@@ -14,7 +14,11 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from benchmarks.client import digest_ids, prompt_ids, write_json
+from adaptive_sparse.future_plan import POLICIES
 from scripts.run_case import HOST, PORT, ROOT, leader_exit, on_sigterm, stop_server
 
 
@@ -381,7 +385,7 @@ def main():
     parser.add_argument("--future-workload", type=Path,
                         help="plan and execute a known-future workload")
     parser.add_argument("--future-planning-policy",
-                        choices=("fifo", "longest", "mode-aware", "future", "online", "oracle"),
+                        choices=POLICIES,
                         default="future")
     parser.add_argument("--future-no-hints", action="store_true")
     parser.add_argument("--future-service-time-feedback", action="store_true")

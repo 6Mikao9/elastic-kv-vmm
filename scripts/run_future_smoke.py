@@ -15,6 +15,11 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from adaptive_sparse.future_plan import POLICIES
+
 HOST = "127.0.0.1"
 PORT = 31180
 URL = f"http://{HOST}:{PORT}"
@@ -144,7 +149,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--planning-policy",
-        choices=("fifo", "longest", "mode-aware", "future", "online", "oracle"),
+        choices=POLICIES,
         default="future",
     )
     parser.add_argument(

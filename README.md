@@ -260,6 +260,17 @@ records the `decode_batch_size` used by its timing model, and the emitted decode
 rate hint uses the same value. Durations fixed at an earlier admission are not
 retroactively rewritten when another request joins the batch, so this remains a
 policy model rather than a full serving simulator.
+The matching `prefill_batch_profiles` records aggregate prefill tokens per
+millisecond at exact cohort sizes. The `batched` known-future policy may hold
+ready work for `batch_window_ms` only when these profiles predict both no worse
+weighted completion and no worse makespan, and when no satisfiable hard
+deadline becomes a miss. Missing prefill measurements retain the prior serial
+prefill model; missing decode measurements retain the per-request linear model.
+`max_batch_requests` caps the cohort and must not exceed
+`max_active_requests`. Every admission records `prefill_batch_size` and a
+`cohort_id`, and the executor rejects a cohort whose members disagree on start
+time, prefill size or decode size. This is deterministic policy-model evidence;
+the profile values still need calibration against real SGLang co-batch traces.
 `search_exact` distinguishes a completed search from a capped incumbent. Use
 `online` to evaluate each immediate action by completing the deployable
 `future` heuristic from that branch, then commit only the first action. Its
@@ -268,7 +279,7 @@ committed, exhaustion returns the ordinary `future` plan. After an `online`
 action is committed, exhaustion keeps that prefix and completes it with a
 `future` suffix; the `fallback_policy="online_prefix_then_future"` label makes
 this hybrid explicit. Use
-`--policies fifo future online oracle` to limit offline work; an emitted policy
+`--policies fifo future batched online oracle` to limit offline work; an emitted policy
 is automatically included and its simulation is reused. Each result also
 carries `oracle_gap` metrics when the comparison includes oracle. A negative
 makespan gap is possible because deadline misses and weighted completion are

@@ -17,6 +17,7 @@ import argparse
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
+from itertools import product
 import json
 import math
 from pathlib import Path
@@ -24,7 +25,15 @@ from pathlib import Path
 from .future_residency import RESIDENCE_HINTS
 
 
-POLICIES = ("fifo", "longest", "mode-aware", "future", "online", "oracle")
+POLICIES = (
+    "fifo",
+    "longest",
+    "mode-aware",
+    "future",
+    "batched",
+    "online",
+    "oracle",
+)
 RUNTIME_HINT_MAX_MS = 86_400_000
 
 
@@ -309,6 +318,49 @@ def normalize_decode_batch_profiles(
     return tuple(sorted(profiles.items()))
 
 
+def normalize_prefill_batch_profiles(
+    value: object,
+) -> tuple[tuple[int, float], ...]:
+    """Validate measured aggregate prefill throughput by batch size."""
+
+    raw_profiles: Iterable[tuple[object, object]]
+    if isinstance(value, Mapping):
+        raw_profiles = value.items()
+    elif isinstance(value, (tuple, list)):
+        raw_profiles = value
+    else:
+        raise ValueError(
+            "prefill_batch_profiles must be a mapping or pair sequence"
+        )
+    profiles: dict[int, float] = {}
+    for item in raw_profiles:
+        if not isinstance(item, (tuple, list)) or len(item) != 2:
+            raise ValueError(
+                "prefill_batch_profiles entries must be batch/rate pairs"
+            )
+        raw_batch_size, raw_rate = item
+        if isinstance(raw_batch_size, str) and raw_batch_size.isdecimal():
+            batch_size = int(raw_batch_size)
+        elif isinstance(raw_batch_size, bool):
+            raise ValueError("prefill batch size must be an integer")
+        else:
+            batch_size = raw_batch_size
+        _bounded_int(batch_size, "prefill batch size", minimum=1)
+        if batch_size in profiles:
+            raise ValueError(f"duplicate prefill batch profile: {batch_size}")
+        if (
+            isinstance(raw_rate, bool)
+            or not isinstance(raw_rate, (int, float))
+            or not math.isfinite(raw_rate)
+            or raw_rate <= 0
+        ):
+            raise ValueError(
+                "prefill batch throughput must be a finite positive number"
+            )
+        profiles[batch_size] = raw_rate
+    return tuple(sorted(profiles.items()))
+
+
 @dataclass(frozen=True, slots=True)
 class PlannerConfig:
     """Conservative per-instance resource model.
@@ -328,11 +380,17 @@ class PlannerConfig:
     sparse_decode_tokens_per_ms: float = 16.0
     max_active_requests: int = 8
     lookahead_ms: int = 0
+    batch_window_ms: int = 0
+    max_batch_requests: int = 1
     auto_resident_output_threshold: int = 1
     active_prefix_prefill_reuse: bool = False
     decode_batch_profiles: (
         tuple[tuple[int, DecodeBatchProfile], ...]
         | Mapping[int | str, DecodeBatchProfile | Mapping[str, object]]
+    ) = ()
+    prefill_batch_profiles: (
+        tuple[tuple[int, float], ...]
+        | Mapping[int | str, float]
     ) = ()
     oracle_max_expansions: int = 100_000
     online_max_rollouts: int = 2_000
@@ -347,6 +405,7 @@ class PlannerConfig:
             "kv_bytes_per_token": self.kv_bytes_per_token,
             "sparse_hot_tokens": self.sparse_hot_tokens,
             "max_active_requests": self.max_active_requests,
+            "max_batch_requests": self.max_batch_requests,
             "auto_resident_output_threshold": self.auto_resident_output_threshold,
             "oracle_max_expansions": self.oracle_max_expansions,
             "online_max_rollouts": self.online_max_rollouts,
@@ -374,6 +433,15 @@ class PlannerConfig:
             "lookahead_ms",
             maximum=RUNTIME_HINT_MAX_MS,
         )
+        _bounded_int(
+            self.batch_window_ms,
+            "batch_window_ms",
+            maximum=RUNTIME_HINT_MAX_MS,
+        )
+        if self.max_batch_requests > self.max_active_requests:
+            raise ValueError(
+                "max_batch_requests must be <= max_active_requests"
+            )
         if not isinstance(self.active_prefix_prefill_reuse, bool):
             raise ValueError("active_prefix_prefill_reuse must be a boolean")
         object.__setattr__(
@@ -383,6 +451,11 @@ class PlannerConfig:
             self,
             "decode_batch_profiles",
             normalize_decode_batch_profiles(self.decode_batch_profiles),
+        )
+        object.__setattr__(
+            self,
+            "prefill_batch_profiles",
+            normalize_prefill_batch_profiles(self.prefill_batch_profiles),
         )
 
     def profile_for(self, kind: str) -> KindServiceProfile:
@@ -417,6 +490,20 @@ class PlannerConfig:
             if candidate == batch_size:
                 return profile
         return None
+
+    def prefill_rate_for_batch(self, kind: str, batch_size: int) -> float:
+        """Return estimated per-stream prefill throughput at ``batch_size``.
+
+        A measured prefill profile contains aggregate tokens per millisecond,
+        so it is divided by the measured batch size. A missing measurement
+        falls back to the existing per-kind rate and never interpolates.
+        """
+
+        _bounded_int(batch_size, "batch_size", minimum=1)
+        for candidate, aggregate_rate in self.prefill_batch_profiles:
+            if candidate == batch_size:
+                return aggregate_rate / batch_size
+        return self.prefill_rate(kind)
 
     def decode_rate_for_batch(
         self,
@@ -462,11 +549,17 @@ class PlannerConfig:
             "sparse_decode_tokens_per_ms": self.sparse_decode_tokens_per_ms,
             "max_active_requests": self.max_active_requests,
             "lookahead_ms": self.lookahead_ms,
+            "batch_window_ms": self.batch_window_ms,
+            "max_batch_requests": self.max_batch_requests,
             "auto_resident_output_threshold": self.auto_resident_output_threshold,
             "active_prefix_prefill_reuse": self.active_prefix_prefill_reuse,
             "decode_batch_profiles": {
                 str(batch_size): profile.as_dict()
                 for batch_size, profile in self.decode_batch_profiles
+            },
+            "prefill_batch_profiles": {
+                str(batch_size): rate
+                for batch_size, rate in self.prefill_batch_profiles
             },
             "oracle_max_expansions": self.oracle_max_expansions,
             "online_max_rollouts": self.online_max_rollouts,
@@ -538,6 +631,8 @@ class Admission:
     prefill_workspace_bytes: int
     reason: str
     decode_batch_size: int = 1
+    prefill_batch_size: int = 1
+    cohort_id: str | None = None
 
     @property
     def startup_delay_ms(self) -> int:
@@ -600,6 +695,8 @@ class PlanResult:
                     "prefill_workspace_bytes": item.prefill_workspace_bytes,
                     "reason": item.reason,
                     "decode_batch_size": item.decode_batch_size,
+                    "prefill_batch_size": item.prefill_batch_size,
+                    "cohort_id": item.cohort_id,
                 }
                 for item in self.admissions
             ],
@@ -620,6 +717,8 @@ class RolloutSubmission:
     hint: dict[str, object]
     deadline_ms: int | None = None
     decode_batch_size: int = 1
+    prefill_batch_size: int = 1
+    cohort_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -653,6 +752,8 @@ class RolloutPlan:
                     "hint": item.hint,
                     "deadline_ms": item.deadline_ms,
                     "decode_batch_size": item.decode_batch_size,
+                    "prefill_batch_size": item.prefill_batch_size,
+                    "cohort_id": item.cohort_id,
                 }
                 for item in self.submissions
             ],
@@ -1222,6 +1323,480 @@ def _oracle_idle_child(
     )
 
 
+def _assign_batch_modes(
+    requests: Sequence[RequestProfile],
+    active: Sequence[_Active],
+    config: PlannerConfig,
+) -> tuple[tuple[ResidencyMode, ...], tuple[str, ...]] | None:
+    """Choose a joint feasible placement for one prefill cohort.
+
+    The search is bounded by the already limited scheduler batch. Prefix credit
+    depends on the complete resident set, so assigning modes greedily can miss
+    a feasible mixed resident/HiSparse cohort.
+    """
+
+    if (
+        not requests
+        or len(requests) > config.max_batch_requests
+        or len(active) + len(requests) > config.max_active_requests
+    ):
+        return None
+    choices = tuple(_feasible_modes(item, active, config) for item in requests)
+    if any(not item for item in choices):
+        return None
+    workspace = sum(
+        item.prompt_tokens * config.prefill_workspace_rate(item.kind)
+        for item in requests
+    )
+    best: tuple[
+        tuple[int, tuple[int, ...], tuple[str, ...]],
+        tuple[ResidencyMode, ...],
+        tuple[str, ...],
+    ] | None = None
+    for candidate in product(*choices):
+        modes = tuple(item[0] for item in candidate)
+        reasons = tuple(item[1] for item in candidate)
+        placements = (
+            *_active_placements(active),
+            *zip(requests, modes, strict=True),
+        )
+        aggregate, _ = _placement_memory(placements, config)
+        if aggregate + workspace > config.memory_budget_bytes:
+            continue
+        preference_penalty = tuple(
+            next(
+                index
+                for index, (mode, _) in enumerate(request_choices)
+                if mode is selected
+            )
+            for request_choices, selected in zip(choices, modes, strict=True)
+        )
+        sparse_count = sum(mode is ResidencyMode.HI_SPARSE for mode in modes)
+        key = (
+            sparse_count,
+            preference_penalty,
+            tuple(mode.value for mode in modes),
+        )
+        if best is None or key < best[0]:
+            best = (key, modes, reasons)
+    if best is None:
+        return None
+    return best[1], best[2]
+
+
+def _prefill_batch_tokens(
+    requests: Sequence[RequestProfile],
+    modes: Sequence[ResidencyMode],
+    active: Sequence[_Active],
+    config: PlannerConfig,
+) -> tuple[int, int]:
+    """Return aggregate tokens and no-profile serial prefill duration."""
+
+    total_tokens = 0
+    serial_duration = 0
+    cohort_placements: list[tuple[RequestProfile, ResidencyMode]] = []
+    for request, mode in zip(requests, modes, strict=True):
+        tokens = _prefill_tokens(
+            request,
+            active,
+            config,
+            extra_placements=cohort_placements,
+        )
+        total_tokens += tokens
+        serial_duration += _ceil_duration(
+            tokens, config.prefill_rate(request.kind)
+        )
+        cohort_placements.append((request, mode))
+    return total_tokens, serial_duration
+
+
+def _prefill_batch_duration(
+    requests: Sequence[RequestProfile],
+    modes: Sequence[ResidencyMode],
+    active: Sequence[_Active],
+    config: PlannerConfig,
+) -> int:
+    """Return measured aggregate prefill time or the serial fallback."""
+
+    total_tokens, serial_duration = _prefill_batch_tokens(
+        requests, modes, active, config
+    )
+    for batch_size, aggregate_rate in config.prefill_batch_profiles:
+        if batch_size == len(requests):
+            return _ceil_duration(total_tokens, aggregate_rate)
+    return serial_duration
+
+
+def _batch_decode_improves(
+    requests: Sequence[RequestProfile],
+    modes: Sequence[ResidencyMode],
+    base_batch_size: int,
+    combined_batch_size: int,
+    config: PlannerConfig,
+) -> bool:
+    profile = config.decode_batch_profile(combined_batch_size)
+    if profile is None:
+        return False
+    for request, mode in zip(requests, modes, strict=True):
+        measured = profile.rate(mode)
+        if measured is None:
+            continue
+        if measured / combined_batch_size > config.decode_rate_for_batch(
+            request.kind, mode, base_batch_size
+        ):
+            return True
+    return False
+
+
+def _wait_for_batch_improves(
+    base: Sequence[RequestProfile],
+    future: RequestProfile,
+    active: Sequence[_Active],
+    now_ms: int,
+    config: PlannerConfig,
+) -> bool:
+    """Return whether a measured profile justifies waiting for one arrival."""
+
+    combined = (*base, future)
+    base_assignment = _assign_batch_modes(base, active, config)
+    combined_assignment = _assign_batch_modes(combined, active, config)
+    if base_assignment is None or combined_assignment is None:
+        return False
+    base_modes, _ = base_assignment
+    combined_modes, _ = combined_assignment
+
+    base_prefill = _prefill_batch_duration(
+        base, base_modes, active, config
+    )
+    _, base_serial = _prefill_batch_tokens(base, base_modes, active, config)
+    future_prefill, _ = _prefill_batch_tokens(
+        (future,),
+        (combined_modes[-1],),
+        active,
+        config,
+    )
+    combined_prefill = _prefill_batch_duration(
+        combined, combined_modes, active, config
+    )
+    has_prefill_profile = any(
+        batch_size == len(combined)
+        for batch_size, _ in config.prefill_batch_profiles
+    )
+    prefill_gain = (
+        has_prefill_profile
+        and combined_prefill < base_serial + future_prefill
+    )
+
+    base_size = min(
+        config.max_active_requests, len(active) + len(base)
+    )
+    combined_size = min(
+        config.max_active_requests, len(active) + len(combined)
+    )
+    decode_gain = _batch_decode_improves(
+        combined,
+        combined_modes,
+        base_size,
+        combined_size,
+        config,
+    )
+    if not (prefill_gain or decode_gain):
+        return False
+
+    start_ms = max(now_ms, future.arrival_ms)
+    base_finishes = [
+        now_ms
+        + base_prefill
+        + _ceil_duration(
+            request.output_tokens,
+            config.decode_rate_for_batch(request.kind, mode, base_size),
+        )
+        for request, mode in zip(base, base_modes, strict=True)
+    ]
+    future_finish_without_wait = (
+        future.arrival_ms
+        + _prefill_duration(
+            future,
+            active,
+            config,
+            extra_placements=tuple(zip(base, base_modes, strict=True)),
+        )
+        + _ceil_duration(
+            future.output_tokens,
+            config.decode_rate_for_batch(
+                future.kind, combined_modes[-1], combined_size
+            ),
+        )
+    )
+    combined_finishes = [
+        start_ms
+        + combined_prefill
+        + _ceil_duration(
+            request.output_tokens,
+            config.decode_rate_for_batch(request.kind, mode, combined_size),
+        )
+        for request, mode in zip(combined, combined_modes, strict=True)
+    ]
+    without_wait_weight = math.fsum(item.priority for item in combined)
+    without_wait_completion = math.fsum(
+        [
+            request.priority * finish
+            for request, finish in zip(base, base_finishes, strict=True)
+        ]
+        + [future.priority * future_finish_without_wait]
+    )
+    wait_completion = math.fsum(
+        request.priority * finish
+        for request, finish in zip(combined, combined_finishes, strict=True)
+    )
+    if without_wait_weight <= 0:
+        return False
+    without_wait_weighted = without_wait_completion / without_wait_weight
+    wait_weighted = wait_completion / without_wait_weight
+    without_wait_makespan = max(*base_finishes, future_finish_without_wait)
+    wait_makespan = max(combined_finishes)
+    if wait_weighted > without_wait_weighted or wait_makespan > without_wait_makespan:
+        return False
+    if (
+        wait_weighted == without_wait_weighted
+        and wait_makespan == without_wait_makespan
+    ):
+        return False
+
+    for index, (request, mode) in enumerate(
+        zip(base, base_modes, strict=True)
+    ):
+        if request.deadline_ms is None:
+            continue
+        current_finish = base_finishes[index]
+        wait_finish = start_ms + combined_prefill + _ceil_duration(
+            request.output_tokens,
+            config.decode_rate_for_batch(
+                request.kind, mode, combined_size
+            ),
+        )
+        if current_finish <= request.deadline_ms < wait_finish:
+            return False
+
+    future_mode = combined_modes[-1]
+    if future.deadline_ms is not None:
+        future_finish = start_ms + combined_prefill + _ceil_duration(
+            future.output_tokens,
+            config.decode_rate_for_batch(
+                future.kind, future_mode, combined_size
+            ),
+        )
+        if future_finish > future.deadline_ms:
+            return False
+    return True
+
+
+def _ready_batch(
+    pending: Sequence[RequestProfile],
+    active: Sequence[_Active],
+    config: PlannerConfig,
+) -> tuple[tuple[RequestProfile, ...], tuple[ResidencyMode, ...], tuple[str, ...]]:
+    """Build the largest joint-feasible ready cohort in policy order."""
+
+    selected: list[RequestProfile] = []
+    selected_assignment = None
+    for request in pending:
+        if len(selected) >= config.max_batch_requests:
+            break
+        candidate = (*selected, request)
+        assignment = _assign_batch_modes(candidate, active, config)
+        if assignment is None:
+            continue
+        selected.append(request)
+        selected_assignment = assignment
+    if selected_assignment is None:
+        return (), (), ()
+    return tuple(selected), *selected_assignment
+
+
+def _batched_order(request: RequestProfile) -> tuple[object, ...]:
+    """Order arrivals by deadlines, then value, then deterministic FIFO."""
+
+    return (
+        0 if request.deadline_ms is not None else 1,
+        request.deadline_ms if request.deadline_ms is not None else math.inf,
+        -request.priority,
+        request.arrival_ms,
+        request.request_id,
+    )
+
+
+def _simulate_batched(
+    workload: Sequence[RequestProfile],
+    config: PlannerConfig,
+) -> PlanResult:
+    """Form measured prefill/decode cohorts from known near-future arrivals."""
+
+    requests_by_id = {item.request_id: item for item in workload}
+    remaining_ids = set(requests_by_id)
+    active: tuple[_Active, ...] = ()
+    admissions: list[Admission] = []
+    now_ms = min(item.arrival_ms for item in workload)
+    prefill_busy_until = -1
+    peak_memory_bytes = 0
+    peak_shared_prefix_credit_bytes = 0
+    cohort_index = 0
+
+    while remaining_ids or active:
+        active = _normalize_active(active, now_ms)
+        if not remaining_ids and not active:
+            break
+        if not remaining_ids:
+            now_ms = min(item.admission.finish_ms for item in active)
+            continue
+        if prefill_busy_until > now_ms:
+            wake_times = [prefill_busy_until]
+            wake_times.extend(
+                requests_by_id[request_id].arrival_ms
+                for request_id in remaining_ids
+                if requests_by_id[request_id].arrival_ms > now_ms
+            )
+            wake_times.extend(
+                item.admission.finish_ms
+                for item in active
+                if item.admission.finish_ms > now_ms
+            )
+            now_ms = min(wake_times)
+            continue
+
+        pending = sorted(
+            (
+                requests_by_id[request_id]
+                for request_id in remaining_ids
+                if requests_by_id[request_id].arrival_ms <= now_ms
+            ),
+            key=_batched_order,
+        )
+        if not pending:
+            wake_times = [
+                requests_by_id[request_id].arrival_ms
+                for request_id in remaining_ids
+                if requests_by_id[request_id].arrival_ms > now_ms
+            ]
+            wake_times.extend(
+                item.admission.finish_ms
+                for item in active
+                if item.admission.finish_ms > now_ms
+            )
+            if not wake_times:
+                raise RuntimeError(f"batched planner deadlock at {now_ms} ms")
+            now_ms = min(wake_times)
+            continue
+
+        base, modes, reasons = _ready_batch(pending, active, config)
+        if not base:
+            wake_times = [
+                item.admission.finish_ms
+                for item in active
+                if item.admission.finish_ms > now_ms
+            ]
+            wake_times.extend(
+                requests_by_id[request_id].arrival_ms
+                for request_id in remaining_ids
+                if requests_by_id[request_id].arrival_ms > now_ms
+            )
+            if not wake_times:
+                raise RuntimeError(
+                    f"batched planner cannot place ready work at {now_ms} ms"
+                )
+            now_ms = min(wake_times)
+            continue
+
+        if len(base) < config.max_batch_requests and config.batch_window_ms > 0:
+            horizon = now_ms + config.batch_window_ms
+            near_future = sorted(
+                (
+                    requests_by_id[request_id]
+                    for request_id in remaining_ids
+                    if now_ms < requests_by_id[request_id].arrival_ms <= horizon
+                ),
+                key=_batched_order,
+            )
+            waited = False
+            for candidate in near_future:
+                if _wait_for_batch_improves(
+                    base, candidate, active, now_ms, config
+                ):
+                    now_ms = candidate.arrival_ms
+                    waited = True
+                    break
+            if waited:
+                continue
+
+        prefill = _prefill_batch_duration(base, modes, active, config)
+        decode_batch_size = min(
+            config.max_active_requests,
+            len(active) + len(base),
+        )
+        cohort_id = f"cohort-{cohort_index:04d}-{now_ms}"
+        cohort_index += 1
+        aggregate, shared_credit = _placement_memory(
+            (
+                *_active_placements(active),
+                *zip(base, modes, strict=True),
+            ),
+            config,
+        )
+        workspace = sum(
+            item.prompt_tokens * config.prefill_workspace_rate(item.kind)
+            for item in base
+        )
+        peak_memory_bytes = max(
+            peak_memory_bytes, aggregate + workspace
+        )
+        peak_shared_prefix_credit_bytes = max(
+            peak_shared_prefix_credit_bytes, shared_credit
+        )
+        new_active: list[_Active] = list(active)
+        for request, mode, reason in zip(
+            base, modes, reasons, strict=True
+        ):
+            finish_ms = now_ms + prefill + _ceil_duration(
+                request.output_tokens,
+                config.decode_rate_for_batch(
+                    request.kind, mode, decode_batch_size
+                ),
+            )
+            admission = Admission(
+                request_id=request.request_id,
+                arrival_ms=request.arrival_ms,
+                start_ms=now_ms,
+                finish_ms=finish_ms,
+                mode=mode,
+                kind=request.kind,
+                resident_kv_bytes=_hold_bytes(request, mode, config),
+                prefill_workspace_bytes=(
+                    request.prompt_tokens
+                    * config.prefill_workspace_rate(request.kind)
+                ),
+                reason=f"batched:{reason}",
+                decode_batch_size=decode_batch_size,
+                prefill_batch_size=len(base),
+                cohort_id=cohort_id,
+            )
+            admissions.append(admission)
+            new_active.append(_Active(request, admission))
+            remaining_ids.remove(request.request_id)
+        active = tuple(new_active)
+        prefill_busy_until = now_ms + prefill
+        now_ms = prefill_busy_until
+
+    if len(admissions) != len(workload):
+        raise RuntimeError("batched planner did not admit every request")
+    return _result_from_admissions(
+        "batched",
+        workload,
+        admissions,
+        peak_memory_bytes,
+        peak_shared_prefix_credit_bytes=peak_shared_prefix_credit_bytes,
+    )
+
+
 def _oracle_objective(result: PlanResult) -> tuple[object, ...]:
     # The order matches the research contract: hard deadlines first, then user
     # and batch completion, followed by lower-cost sparse placement.  The last
@@ -1454,6 +2029,8 @@ def simulate(
         return _simulate_oracle(workload, config)
     if policy == "online":
         return _simulate_online(workload, config)
+    if policy == "batched":
+        return _simulate_batched(workload, config)
     return _simulate_greedy(workload, config, policy)
 
 
@@ -1804,7 +2381,10 @@ def plan_rollout(
                 else "host_backed"
             ),
             "prefill_tokens_per_s": (
-                config.prefill_rate(request.kind) * 1000.0
+                config.prefill_rate_for_batch(
+                    request.kind, admission.prefill_batch_size
+                )
+                * 1000.0
             ),
             "decode_tokens_per_s": (
                 config.decode_rate_for_batch(
@@ -1834,6 +2414,8 @@ def plan_rollout(
                 hint=hint,
                 deadline_ms=request.deadline_ms,
                 decode_batch_size=admission.decode_batch_size,
+                prefill_batch_size=admission.prefill_batch_size,
+                cohort_id=admission.cohort_id,
             )
         )
     return RolloutPlan(simulation, tuple(submissions), config, capabilities)

@@ -388,6 +388,30 @@ contention 的估计。已经开始的请求不会在后续请求加入 batch �
 动态 batching；后者需要从真实服务器采集 profile，并让 executor 记录实际 co-batch
 大小后做 paired replay。
 
+### 4.1.3 已实现：已知未来 cohort 的保守等待策略
+
+`prefill_batch_profiles` 按精确 cohort size 记录 aggregate prefill tokens/ms。
+例如，`{"2": 30.0}` 表示两条请求共同 prefill 的聚合吞吐为 30 tokens/ms，
+规划器再除以 2 得到每流估计。缺失的 cohort size 回退到逐请求 prefill 串行时长，
+不做插值，也不会从“同时提交”本身虚构吞吐收益。
+
+`batched` 策略使用 `batch_window_ms` 查看已经到达或即将到达的已知请求，
+最多组成 `max_batch_requests` 个 request 的 cohort。只有实测 profile 让等待后的
+加权完成时间和 makespan 都不差，且至少一项严格改善时才等待。若某个当前本可满足
+的 hard deadline 会因等待变成 miss，则立即执行；未来请求自己的 deadline 也会在
+cohort 时长下重新检查。没有可用 profile、等待不能让端到端估计变好、显存不足或
+deadline 不安全时，策略不会等待。
+
+cohort 的 placement 联合求解，可以在字节预算内选择 resident、HiSparse 或混合
+组合，并沿用同一份 physical-prefix credit。一次 admission 产生的所有成员共享
+`start_ms`、`cohort_id`、`prefill_batch_size` 和实际 decode batch size；因此
+后加入者不会反过来改写已经模拟完成的请求时序。rollout JSON 保存这些字段，旧计划
+缺少字段时按单请求批大小 1 读取。执行器会拒绝同一 cohort 中 start、prefill size
+或 decode size 不一致的计划，也会拒绝声明 batch size 大于 1 却没有 cohort ID
+的计划。SGLang 原生 `PrefillAdder` 和显存 admission 仍是最终权威；本策略只控制
+受控 rollout 的提交时刻与 hint，不会绕过原生容量检查。真实收益仍需在同一模型、
+同一硬件上采集 batch-size-specific prefill/decode 曲线后配对验证。
+
 ### 4.2 受控 rollout 的可执行计划
 
 `plan_rollout()` 把离线策略结果转换成 orchestrator 可执行的动作。每个 action
@@ -399,7 +423,7 @@ hint 使用 `release_after_ms=0`，并把绝对 deadline 换算成相对 schedul
 ```bash
 python3 scripts/future_plan_compare.py \
   benchmarks/workloads/known-future-rollout.json \
-  --policies fifo future online oracle \
+  --policies fifo future batched online oracle \
   --emit-policy oracle \
   --output results/future-planning/oracle-comparison.json
 ```
