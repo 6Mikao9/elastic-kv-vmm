@@ -42,6 +42,14 @@ second physical owner or changing VMM chunk reference counts. A later version
 may pin pages across source completion, but that requires an explicit lifetime
 and budget contract.
 
+Direct resolution is batched per layer. One GPU indexing operation resolves the
+complete `[consumer, block]` matrix for all live sources, and all consumers with
+at least one missing block share one native host-staging call. The host copies
+one compact per-consumer hit count to classify full, partial and native-only
+rows; it no longer synchronizes or launches a native call independently for
+every consumer in the layer. Partial rows are overwritten only in their shared
+lanes, preserving the native result elsewhere.
+
 Promotion restores the metadata source after the complete GPU mapping has been
 published. The scheduler's VMM reclaim path remains authoritative: direct reuse
 never extends a source lease, and a Top-K lookup from the same layer remains
@@ -54,3 +62,8 @@ and report `shared_prefix_direct_blocks`, `shared_prefix_native_blocks`,
 transfer bytes, and source-removal events. Planning-only prefix credit remains a
 separate capacity model until this data path has passed real MiniMax GPU
 validation.
+
+The reduced GPU synchronization and launch count is covered by CPU tensor
+equivalence tests, including mixed sources, unmapped slots, invalid blocks and
+partial prefixes. End-to-end launch reduction and TPOT still require the paired
+MiniMax run; the batching change itself does not establish a latency result.

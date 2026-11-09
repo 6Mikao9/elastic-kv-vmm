@@ -9,6 +9,7 @@ from adaptive_sparse.shared_prefix import (
     complete_shared_blocks,
     make_prefix_claim,
     resolve_shared_block_locations,
+    resolve_shared_block_locations_batched,
 )
 from adaptive_sparse.request_residency import install_request_residency
 
@@ -135,6 +136,61 @@ class SharedPrefixTest(unittest.TestCase):
             device_mapping=mapping,
         )
         self.assertEqual(valid.tolist(), [True, False])
+
+    def test_batched_block_locations_match_scalar_resolution(self):
+        request_table = torch.tensor([
+            [10, 11, 12, 13, 14, 15],
+            [20, 21, 22, 23, 24, 25],
+            [30, 31, 32, 33, 34, 35],
+        ])
+        mapping = torch.arange(40, dtype=torch.long)
+        mapping[21] = 0
+        block_ids = torch.tensor([[0, 1, 2], [1, 2, 3], [0, 1, 9]])
+        source_rows = [0, 1, 2]
+        prefixes = [4, 4, 2]
+        lengths = torch.tensor([6, 4, 6])
+
+        valid, physical = resolve_shared_block_locations_batched(
+            block_ids,
+            source_rows=source_rows,
+            seq_len=lengths,
+            shared_tokens=prefixes,
+            block_size=2,
+            request_table=request_table,
+            device_mapping=mapping,
+        )
+        expected_valid = []
+        expected_physical = []
+        for row, prefix, length, blocks in zip(
+            source_rows, prefixes, lengths, block_ids
+        ):
+            scalar_valid, scalar_physical = resolve_shared_block_locations(
+                blocks,
+                source_row=row,
+                seq_len=length,
+                shared_tokens=prefix,
+                block_size=2,
+                request_table=request_table,
+                device_mapping=mapping,
+            )
+            expected_valid.append(scalar_valid)
+            expected_physical.append(scalar_physical)
+        self.assertTrue(torch.equal(valid, torch.stack(expected_valid)))
+        self.assertTrue(torch.equal(physical, torch.stack(expected_physical)))
+
+    def test_batched_block_locations_reject_mismatched_metadata(self):
+        request_table = torch.arange(12).reshape(2, 6)
+        mapping = torch.arange(12)
+        with self.assertRaisesRegex(ValueError, "dimensions differ"):
+            resolve_shared_block_locations_batched(
+                torch.tensor([[0, 1]]),
+                source_rows=[0],
+                seq_len=torch.tensor([6]),
+                shared_tokens=[2, 4],
+                block_size=2,
+                request_table=request_table,
+                device_mapping=mapping,
+            )
 
     def test_registry_requires_same_length_and_fingerprint(self):
         registry = SharedPrefixRegistry()

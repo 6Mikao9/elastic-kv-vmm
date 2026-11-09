@@ -119,6 +119,91 @@ def resolve_shared_block_locations(
     return valid, physical.to(torch.int32)
 
 
+def resolve_shared_block_locations_batched(
+    block_ids: torch.Tensor,
+    *,
+    source_rows: Iterable[int],
+    seq_len: torch.Tensor,
+    shared_tokens: Iterable[int],
+    block_size: int,
+    request_table: torch.Tensor,
+    device_mapping: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Resolve many consumers in one GPU operation.
+
+    ``block_ids`` has shape ``[requests, blocks]``.  Source rows and shared
+    prefix lengths describe the same request dimension.  Keeping all address
+    arithmetic on device removes the per-request synchronization previously
+    required by the scalar helper when one layer served many shared-prefix
+    consumers.
+    """
+
+    if block_ids.ndim != 2:
+        raise ValueError("block ids must be two-dimensional")
+    request_count, blocks_per_request = block_ids.shape
+    if block_ids.dtype == torch.bool:
+        raise ValueError("block ids must be integers")
+    if block_size < 1:
+        raise ValueError("invalid shared block geometry")
+    if request_table.ndim != 2 or not request_table.shape[1] or not device_mapping.numel():
+        raise ValueError("shared prefix address geometry is empty")
+
+    rows = []
+    for row in source_rows:
+        if (
+            isinstance(row, bool)
+            or not isinstance(row, int)
+            or row < 0
+            or row >= request_table.shape[0]
+        ):
+            raise ValueError("source row is outside the request table")
+        rows.append(row)
+    prefixes = []
+    for tokens in shared_tokens:
+        if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
+            raise ValueError("invalid shared prefix geometry")
+        prefixes.append(tokens)
+    lengths = torch.as_tensor(seq_len, device=block_ids.device, dtype=torch.long).reshape(-1)
+    if len(rows) != request_count or len(prefixes) != request_count:
+        raise ValueError("shared prefix metadata dimensions differ")
+    if lengths.numel() != request_count:
+        raise ValueError("sequence length dimensions differ")
+    if request_count == 0:
+        empty = torch.empty(
+            (0, blocks_per_request),
+            dtype=torch.bool,
+            device=block_ids.device,
+        )
+        physical = torch.empty(
+            (0, blocks_per_request, block_size),
+            dtype=torch.int32,
+            device=block_ids.device,
+        )
+        return empty, physical
+
+    rows_device = torch.tensor(rows, device=block_ids.device, dtype=torch.long)
+    prefixes_device = torch.tensor(
+        prefixes, device=block_ids.device, dtype=torch.long
+    ).reshape(-1, 1)
+    blocks = block_ids.to(dtype=torch.long)
+    starts = blocks * block_size
+    ends = starts + block_size
+    valid = (
+        (blocks >= 0)
+        & (ends <= prefixes_device)
+        & (ends <= lengths.reshape(-1, 1))
+    )
+    positions = starts.unsqueeze(2) + torch.arange(
+        block_size, device=block_ids.device, dtype=torch.long
+    )
+    safe_positions = positions.clamp(0, request_table.shape[1] - 1)
+    logical = request_table[rows_device.reshape(-1, 1, 1), safe_positions]
+    safe_logical = logical.clamp(0, device_mapping.numel() - 1)
+    physical = device_mapping[safe_logical]
+    valid = valid & (logical >= 0).all(dim=2) & (physical > 0).all(dim=2)
+    return valid, physical.to(torch.int32)
+
+
 def _prepare_prefix_value(value: Any) -> Any:
     """Make adapter and salt identities comparable in a stable way."""
 

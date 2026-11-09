@@ -18,7 +18,7 @@ from .residency_broker import (
 from .shared_prefix import (
     SharedPrefixRegistry,
     make_prefix_claim,
-    resolve_shared_block_locations,
+    resolve_shared_block_locations_batched,
 )
 
 
@@ -602,34 +602,78 @@ def install_request_residency():
             else:
                 sparse_blocks = topk_idx[0, sparse]
                 sparse_row_ids = [request_rows_cpu[i] for i in sparse_rows]
-                native_local = []
-                partial = []
-                direct_blocks = 0
-                native_blocks = 0
+                source_local = []
+                source_rows = []
+                source_tokens = []
+                fallback_local = []
                 for local, row_id in enumerate(sparse_row_ids):
                     source = registry.resolve(int(row_id))
                     if source is None:
-                        native_local.append(local)
-                        native_blocks += int(sparse_blocks[local].numel())
+                        fallback_local.append(local)
                         continue
-                    valid, physical = resolve_shared_block_locations(
-                        sparse_blocks[local],
-                        source_row=source.row,
-                        seq_len=lengths[sparse[local]],
-                        shared_tokens=source.claim.tokens,
+                    source_local.append(local)
+                    source_rows.append(source.row)
+                    source_tokens.append(source.claim.tokens)
+
+                direct_blocks = 0
+                native_blocks = sum(
+                    int(sparse_blocks[local].numel()) for local in fallback_local
+                )
+                native_requests = len(fallback_local)
+                partial_requests = 0
+                direct_index = None
+                valid = None
+                physical = None
+                if source_local:
+                    direct_index = torch.tensor(
+                        source_local, device=rows.device, dtype=torch.long
+                    )
+                    valid, physical = resolve_shared_block_locations_batched(
+                        sparse_blocks[direct_index],
+                        source_rows=source_rows,
+                        seq_len=lengths[sparse[direct_index]],
+                        shared_tokens=source_tokens,
                         block_size=block_size,
                         request_table=self.req_to_token,
                         device_mapping=mapping,
                     )
-                    if not bool(valid.any()):
-                        native_local.append(local)
-                        native_blocks += int(sparse_blocks[local].numel())
-                        continue
-                    result[sparse[local]].view(-1, block_size)[valid] = physical[valid]
-                    direct_blocks += int(valid.sum().item())
-                    if bool((~valid).any()):
-                        partial.append((local, ~valid))
-                        native_blocks += int((~valid).sum().item())
+                    valid_counts = valid.sum(dim=1).to(
+                        device="cpu", dtype=torch.long
+                    ).tolist()
+                    direct_blocks += sum(valid_counts)
+                    native_blocks += (
+                        len(source_local) * sparse_blocks.shape[1]
+                        - sum(valid_counts)
+                    )
+                    partial_requests = sum(
+                        0 < count < sparse_blocks.shape[1]
+                        for count in valid_counts
+                    )
+                    fallback_local.extend(
+                        source_local[index]
+                        for index, count in enumerate(valid_counts)
+                        if count < sparse_blocks.shape[1]
+                    )
+
+                if fallback_local:
+                    chosen = torch.tensor(
+                        fallback_local, device=rows.device, dtype=torch.long
+                    )
+                    result[sparse[chosen]] = ctrl.swap_in_selected_blocks(
+                        req_pool_indices=rows[sparse[chosen]],
+                        seq_lens=lengths[sparse[chosen]],
+                        top_k_blocks=sparse_blocks[chosen],
+                        layer_id=layer_id,
+                        sparse_block_size=block_size,
+                    )
+                if direct_index is not None and direct_blocks:
+                    direct_values = result[sparse[direct_index]].view(
+                        len(source_local), sparse_blocks.shape[1], block_size
+                    )
+                    direct_values[valid] = physical[valid]
+                    result[sparse[direct_index]] = direct_values.view(
+                        len(source_local), -1
+                    )
                 if direct_blocks:
                     ctrl._ekv_residency_stats["shared_prefix_direct_blocks"] = (
                         ctrl._ekv_residency_stats.get("shared_prefix_direct_blocks", 0)
@@ -640,36 +684,19 @@ def install_request_residency():
                         ctrl._ekv_residency_stats.get("shared_prefix_native_blocks", 0)
                         + native_blocks
                     )
-                if native_local:
+                if native_requests:
                     ctrl._ekv_residency_stats["shared_prefix_native_requests"] = (
                         ctrl._ekv_residency_stats.get(
                             "shared_prefix_native_requests", 0
                         )
-                        + len(native_local)
+                            + native_requests
                     )
-                if partial:
+                if partial_requests:
                     ctrl._ekv_residency_stats["shared_prefix_partial_requests"] = (
                         ctrl._ekv_residency_stats.get(
                             "shared_prefix_partial_requests", 0
                         )
-                        + len(partial)
-                    )
-                if native_local:
-                    chosen = torch.tensor(native_local, device=rows.device, dtype=torch.long)
-                    result[sparse[chosen]] = ctrl.swap_in_selected_blocks(
-                        req_pool_indices=rows[sparse[chosen]], seq_lens=lengths[sparse[chosen]],
-                        top_k_blocks=sparse_blocks[chosen], layer_id=layer_id,
-                        sparse_block_size=block_size)
-                for local, missing in partial:
-                    native = ctrl.swap_in_selected_blocks(
-                        req_pool_indices=rows[sparse[local]].reshape(1),
-                        seq_lens=lengths[sparse[local]].reshape(1),
-                        top_k_blocks=sparse_blocks[local][missing].reshape(1, -1),
-                        layer_id=layer_id,
-                        sparse_block_size=block_size,
-                    )
-                    result[sparse[local]].view(-1, block_size)[missing] = (
-                        native.reshape(-1, block_size)
+                        + partial_requests
                     )
                 ctrl._ekv_residency_stats["shared_prefix"] = registry.snapshot()
         return result.unsqueeze(0)
