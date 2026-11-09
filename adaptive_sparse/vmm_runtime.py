@@ -7,10 +7,30 @@ from functools import wraps
 from pathlib import Path
 from time import monotonic_ns, perf_counter_ns
 
+from .budget_ownership import build_budget_ownership_snapshot
 from .minimax_vmm import install_minimax_vmm
 
 
 _SCHEDULER_HASH = "fc96ed4b680fdf55621a5397f844cfd4cbd30213f44eec8a888b7cce75cafe60"
+
+
+def attach_budget_ownership(stats, *, tracker, tracker_stats):
+    """Attach read-only ownership telemetry without failing an idle tick."""
+
+    try:
+        residency = stats.get("request_residency", {})
+        stats["budget_ownership"] = build_budget_ownership_snapshot(
+            physical_broker_snapshot=tracker.backing.metrics.get(
+                "global_broker"
+            ),
+            request_growth_snapshot=residency.get("resident_broker"),
+            request_growth_mode=residency.get("resident_broker_mode", "off"),
+            vmm_backing_snapshot=tracker_stats,
+            activation_counters=getattr(tracker, "counters", None),
+        )
+    except Exception as exc:
+        stats["budget_ownership_error"] = type(exc).__name__
+    return stats
 
 
 class IdleGrace:
@@ -101,13 +121,19 @@ def install_vmm_runtime(stats_dir):
                 else:
                     grace.reset()
                 parallel = scheduler.get_parallel()
+                tracker_stats = tracker.stats()
                 stats = {"tp_rank": parallel.tp_rank, "tp_size": parallel.tp_size,
-                         "idle": True, **tracker.stats(), **tracker.backing.metrics,
+                         "idle": True, **tracker_stats, **tracker.backing.metrics,
                          "idle_grace_ms": grace.milliseconds,
                          "deferred_idle_trims": grace.deferred_trims,
                          "timestamp_monotonic_ns": perf_counter_ns()}
                 if hasattr(coordinator, "_ekv_residency_stats"):
                     stats["request_residency"] = dict(coordinator._ekv_residency_stats)
+                attach_budget_ownership(
+                    stats,
+                    tracker=tracker,
+                    tracker_stats=tracker_stats,
+                )
                 signature = {key: value for key, value in stats.items()
                              if key != "timestamp_monotonic_ns"}
                 if signature != getattr(self, "_adaptive_vmm_last_stats", None):

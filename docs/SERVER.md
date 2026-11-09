@@ -157,6 +157,12 @@ budget input rather than a live allocator hook. Sampling is best-effort: only
 positive growth from a positive token/batch shape contributes a sample, and a
 telemetry read failure is counted without failing the prefill.
 
+Runtime budget telemetry also exposes a read-only `budget_ownership` view.
+The global broker is the physical-capacity authority and already includes VMM
+leases plus temporary claims. Request-growth reservations are predictive and
+must not be added to that usage a second time. The view attributes local VMM
+backing and claim kinds but does not introduce another admission ledger.
+
 Set `--elastic-future-stats-path` (or `EKV_FUTURE_STATS_PATH`) to atomically
 export scheduler hook counters from `adaptive_sparse.sglang_future_hook`; these
 are separate from the VMM adapter's `--elastic-stats-path` file. Once scheduler

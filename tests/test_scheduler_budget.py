@@ -26,6 +26,81 @@ from adaptive_sparse.scheduler_budget import (
 
 
 class SchedulerBudgetTest(unittest.TestCase):
+    def test_budget_ownership_preserves_authority_boundaries(self):
+        policy = SchedulerBudget(100, 0, 0, 0)
+        request_broker = B(
+            snapshot=Mock(
+                return_value={
+                    "outstanding_bytes": 20,
+                    "active_reservations": 2,
+                }
+            )
+        )
+        coordinator = B(
+            _ekv_residency_broker=request_broker,
+            _ekv_residency_stats={"resident_broker_mode": "enforce"},
+        )
+        tracker = B(
+            refs={1: 1, 2: 1},
+            chunk_bytes=10,
+            backing=B(backed_bytes=40),
+            counters={"activation_global_prefill_claim_admissions": 1},
+        )
+
+        policy.observe_budget_ownership(
+            coordinator,
+            tracker,
+            {
+                "capacity_bytes": 100,
+                "outstanding_bytes": 70,
+                "available_bytes": 30,
+                "lease_bytes": 60,
+                "claim_bytes": 10,
+                "claims": {
+                    "prefill": {"kind": "prefill", "bytes": 10}
+                },
+                "fairness_pressure": False,
+            },
+        )
+
+        ownership = policy.stats["budget_ownership"]
+        self.assertEqual(
+            ownership["physical_broker"]["active_claim_kinds"],
+            {"prefill": 10},
+        )
+        self.assertEqual(
+            ownership["request_growth"]["outstanding_bytes"], 20
+        )
+        self.assertEqual(
+            ownership["vmm_backing"]["reclaimable_bytes"], 20
+        )
+        self.assertFalse(
+            ownership["relationship"][
+                "request_growth_is_additive_to_physical_usage"
+            ]
+        )
+        self.assertIsNone(policy.stats["budget_ownership_error"])
+
+    def test_budget_ownership_telemetry_is_best_effort(self):
+        policy = SchedulerBudget(100, 0, 0, 0)
+        coordinator = B(
+            _ekv_residency_broker=B(
+                snapshot=Mock(side_effect=RuntimeError("temporarily unavailable"))
+            )
+        )
+        tracker = B(
+            refs={},
+            chunk_bytes=10,
+            backing=B(backed_bytes=0),
+            counters={},
+        )
+
+        policy.observe_budget_ownership(coordinator, tracker, None)
+
+        self.assertEqual(
+            policy.stats["budget_ownership_error"], "RuntimeError"
+        )
+
     def test_future_reservation_telemetry_is_latest_snapshot(self):
         policy = SchedulerBudget(100, 0, 0, 0)
         policy.observe_future_prefill(empty_plan("dry_run"), 0)

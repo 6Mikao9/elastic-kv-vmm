@@ -13,6 +13,7 @@ from itertools import combinations
 from pathlib import Path
 
 from .adaptive_runtime import MigrationFatal
+from .budget_ownership import build_budget_ownership_snapshot
 from .future_prefill import (
     FuturePrefillConfig,
     effective_prefill_headroom,
@@ -139,6 +140,11 @@ def _broker_snapshot(tracker):
         "outstanding_bytes": outstanding,
         "available_bytes": available,
         "fairness_pressure": fairness_pressure,
+        "lease_bytes": value.get("lease_bytes"),
+        "claim_bytes": value.get("claim_bytes"),
+        "claims": value.get("claims"),
+        "fair_mode": value.get("fair_mode"),
+        "fair_share_would_yield": value.get("fair_share_would_yield"),
     }
 
 
@@ -548,6 +554,8 @@ class SchedulerBudget:
                       "global_broker_min_available_bytes": None,
                       "global_broker_max_outstanding_bytes": 0,
                       "global_broker_min_capacity_bytes": None,
+                      "budget_ownership": None,
+                      "budget_ownership_error": None,
                       "last_demotion_runtime_values": {},
                       "min_live_bytes": None, "max_live_bytes": 0,
                       "min_reclaimable_bytes": None, "max_reclaimable_bytes": 0}
@@ -562,6 +570,49 @@ class SchedulerBudget:
             temporary = self.stats_path.with_suffix(".tmp")
             temporary.write_text(json.dumps(self.stats, indent=2), encoding="utf-8")
             temporary.replace(self.stats_path)
+
+    def observe_budget_ownership(self, coordinator, tracker, broker_snapshot):
+        """Publish a read-only view of the existing budget owners."""
+
+        try:
+            request_broker = getattr(
+                coordinator, "_ekv_residency_broker", None
+            )
+            request_snapshot = (
+                request_broker.snapshot()
+                if request_broker is not None
+                and callable(getattr(request_broker, "snapshot", None))
+                else None
+            )
+            residency_stats = getattr(
+                coordinator, "_ekv_residency_stats", {}
+            )
+            request_mode = (
+                residency_stats.get("resident_broker_mode", "off")
+                if isinstance(residency_stats, dict)
+                else "off"
+            )
+            live = len(tracker.refs) * tracker.chunk_bytes
+            backing = {
+                "backed_bytes": tracker.backing.backed_bytes,
+                "live_bytes": live,
+                "reclaimable_bytes": (
+                    tracker.backing.backed_bytes - live
+                ),
+                "mapped_chunks": len(tracker.refs),
+            }
+            self.stats["budget_ownership"] = (
+                build_budget_ownership_snapshot(
+                    physical_broker_snapshot=broker_snapshot,
+                    request_growth_snapshot=request_snapshot,
+                    request_growth_mode=request_mode,
+                    vmm_backing_snapshot=backing,
+                    activation_counters=getattr(tracker, "counters", None),
+                )
+            )
+            self.stats["budget_ownership_error"] = None
+        except Exception as exc:
+            self.stats["budget_ownership_error"] = type(exc).__name__
 
     def migration_byte_cap(self, direction="demotion"):
         return self.migration_bandwidth.effective_byte_cap(
@@ -786,6 +837,7 @@ class SchedulerBudget:
         snapshot = _broker_snapshot(tracker)
         if self.broker_headroom_bytes and snapshot is None:
             raise RuntimeError("global broker pressure requires a broker-enabled VMM backing")
+        self.observe_budget_ownership(coordinator, tracker, snapshot)
         local = (
             backed, force, now - self.last_change >= self.dwell, force_promote,
             None if snapshot is None else snapshot["available_bytes"],
@@ -832,6 +884,9 @@ class SchedulerBudget:
             self.low_since = None
             self.trim_slack(coordinator, tracker, exchange, synchronize, reclaimable)
             post_snapshot = _broker_snapshot(tracker)
+            self.observe_budget_ownership(
+                coordinator, tracker, post_snapshot
+            )
             post_local = (
                 tracker.backing.backed_bytes, local[1], local[2], local[3],
                 None if post_snapshot is None else post_snapshot["available_bytes"],

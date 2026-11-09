@@ -22,6 +22,11 @@ changing the attention addressing model:
    forward boundary; observe mode records would-admit without mutation. Exact
    hard partitions, true activation ownership and transactional OOM recovery
    remain open.
+   Scheduler and idle telemetry now expose a read-only `budget_ownership`
+   snapshot that names the physical broker as authoritative, marks request
+   growth reservations as predictive and non-additive, and attributes VMM
+   backing plus temporary prefill claims to their existing owners. It is an
+   observability contract, not a second ledger or a new admission authority.
    SGLang schedule overlap is now an explicit V5-only experiment. The
    implementation keeps a device-wide fence before physical unmap and rejects
    two-batch overlap; correctness, memory and serving latency still need a
