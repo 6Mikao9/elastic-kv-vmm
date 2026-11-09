@@ -8,7 +8,10 @@ The interval planner previously rescanned every active request and every
 shared-prefix group at each event. The updated path maintains active bytes and
 the per-group shared-prefix deduction incrementally with a lazy minimum heap.
 The reservation broker similarly maintains its outstanding byte total instead
-of summing every reservation for each admission decision.
+of summing every reservation for each admission decision. The managed rollout
+executor now computes each deadline-priority key once, performs one sort per
+scheduling pass, indexes cohorts instead of rescanning all pending requests for
+each group, and removes a dispatched cohort from its queue in one pass.
 
 Run from the repository root:
 
@@ -28,15 +31,35 @@ One local Windows CPU run used a Python 3.12 runtime, 21 timing repeats and
 
 | requests | interval scan | incremental interval | speedup |
 |---:|---:|---:|---:|
-| 64 | 1.787 ms | 0.342 ms | 5.2x |
-| 256 | 2.473 ms | 1.263 ms | 2.0x |
-| 1024 | 10.143 ms | 5.190 ms | 2.0x |
+| 64 | 0.308 ms | 0.126 ms | 2.4x |
+| 256 | 0.976 ms | 0.498 ms | 2.0x |
+| 1024 | 3.716 ms | 1.777 ms | 2.1x |
 
 | reservations | 1,000 scanned reads | 1,000 incremental reads | speedup |
 |---:|---:|---:|---:|
-| 64 | 0.779 ms | 0.079 ms | 9.9x |
-| 256 | 2.351 ms | 0.083 ms | 28.4x |
-| 1024 | 9.388 ms | 0.080 ms | 116.9x |
+| 64 | 0.258 ms | 0.028 ms | 9.1x |
+| 256 | 0.808 ms | 0.029 ms | 28.1x |
+| 1024 | 3.426 ms | 0.028 ms | 121.9x |
+
+The worst-case rollout benchmark makes every request due immediately and keeps
+every request as its own cohort. This exposes the previous restart-from-head
+ordering, which recomputed a parsed deadline key and `min()` scan repeatedly.
+
+| due requests | repeated `min` ordering | single sort | speedup |
+|---:|---:|---:|---:|
+| 64 | 9.256 ms | 0.289 ms | 32.0x |
+| 256 | 146.853 ms | 1.169 ms | 125.7x |
+| 1024 | 2,353.714 ms | 4.869 ms | 483.4x |
+
+The execution-group benchmark uses eight requests per cohort. The previous
+implementation scanned the whole request list once for every cohort; the index
+pass fills each group in one traversal.
+
+| requests / cohorts | full scan per cohort | indexed grouping | speedup |
+|---:|---:|---:|---:|
+| 64 / 8 | 0.018 ms | 0.009 ms | 2.0x |
+| 256 / 32 | 0.167 ms | 0.035 ms | 4.8x |
+| 1024 / 128 | 2.256 ms | 0.135 ms | 16.7x |
 
 These numbers show that the control-plane work no longer repeatedly walks every
 active request or promised reservation. They do not establish model latency or

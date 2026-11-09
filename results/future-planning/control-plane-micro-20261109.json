@@ -1,44 +1,84 @@
 {
+  "cohort_ordering": [
+    {
+      "cohorts": 64,
+      "reference_median_us": 9256.0,
+      "requests": 64,
+      "single_sort_median_us": 289.2
+    },
+    {
+      "cohorts": 256,
+      "reference_median_us": 146852.5,
+      "requests": 256,
+      "single_sort_median_us": 1168.6
+    },
+    {
+      "cohorts": 1024,
+      "reference_median_us": 2353714.0,
+      "requests": 1024,
+      "single_sort_median_us": 4869.1
+    }
+  ],
   "environment": "local CPU control-plane microbenchmark; no CUDA or model execution",
+  "execution_groups": [
+    {
+      "cohorts": 8,
+      "reference_median_us": 17.7,
+      "requests": 64,
+      "single_index_median_us": 9.0
+    },
+    {
+      "cohorts": 32,
+      "reference_median_us": 167.0,
+      "requests": 256,
+      "single_index_median_us": 35.1
+    },
+    {
+      "cohorts": 128,
+      "reference_median_us": 2256.4,
+      "requests": 1024,
+      "single_index_median_us": 134.9
+    }
+  ],
   "interval_peak": [
     {
-      "incremental_median_us": 342.4,
+      "incremental_median_us": 125.6,
       "peak_bytes": 48918,
-      "reference_median_us": 1786.5,
+      "reference_median_us": 307.6,
       "requests": 64
     },
     {
-      "incremental_median_us": 1263.4,
+      "incremental_median_us": 498.1,
       "peak_bytes": 348077,
-      "reference_median_us": 2473.3,
+      "reference_median_us": 975.7,
       "requests": 256
     },
     {
-      "incremental_median_us": 5190.2,
+      "incremental_median_us": 1776.6,
       "peak_bytes": 4101077,
-      "reference_median_us": 10143.3,
+      "reference_median_us": 3715.8,
       "requests": 1024
     }
   ],
   "repeats": 21,
   "reserved_bytes": [
     {
-      "incremental_median_us": 78.5,
-      "reference_median_us": 779.2,
+      "incremental_median_us": 28.3,
+      "reference_median_us": 257.6,
       "reservations": 64,
       "scans_per_sample": 1000,
       "total_bytes": 2080
     },
     {
-      "incremental_median_us": 82.9,
-      "reference_median_us": 2350.6,
+      "incremental_median_us": 28.8,
+      "reference_median_us": 808.3,
       "reservations": 256,
       "scans_per_sample": 1000,
       "total_bytes": 32896
     },
     {
-      "incremental_median_us": 80.3,
-      "reference_median_us": 9387.5,
+      "incremental_median_us": 28.1,
+      "reference_median_us": 3425.7,
       "reservations": 1024,
       "scans_per_sample": 1000,
       "total_bytes": 524800

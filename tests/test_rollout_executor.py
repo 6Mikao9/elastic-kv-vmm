@@ -890,6 +890,75 @@ class RolloutExecutorTest(unittest.TestCase):
         self.assertEqual(result["requests"][0]["request_id"], "urgent")
         self.assertGreater(result["summary"]["max_capacity_delay_ms"], 0)
 
+    def test_due_cohort_order_computes_each_priority_once(self):
+        base = without_deadline(submission())
+        requests = []
+        for index in range(24):
+            cohort_id = f"batch-{index // 3}" if index % 4 else None
+            requests.append(
+                replace(
+                    base,
+                    request_id=f"request-{index:02d}",
+                    planned_arrival_ms=0,
+                    submit_at_ms=0,
+                    estimated_finish_ms=50 + index,
+                    cohort_id=cohort_id,
+                    prefill_batch_size=3 if cohort_id else 1,
+                )
+            )
+        estimator = ServiceTimeEstimator(
+            prefill_tokens_per_s=100,
+            decode_tokens_per_s=100,
+        )
+
+        with patch.object(
+            estimator, "rates", wraps=estimator.rates
+        ) as rates:
+            cohorts = rollout_module._ordered_due_cohorts(
+                requests,
+                requests,
+                "deadline",
+                service_time_estimator=estimator,
+            )
+
+        self.assertEqual(rates.call_count, len(requests))
+        flattened = [item.request_id for cohort in cohorts for item in cohort]
+        self.assertCountEqual(flattened, [item.request_id for item in requests])
+        self.assertEqual(len(flattened), len(set(flattened)))
+        for cohort in cohorts:
+            cohort_ids = {item.cohort_id for item in cohort}
+            self.assertEqual(len(cohort_ids), 1)
+
+    def test_execution_groups_index_interleaved_cohort_members(self):
+        base = without_deadline(submission())
+        requests = []
+        for index, (request_id, cohort_id) in enumerate(
+            (
+                ("singleton", None),
+                ("a-1", "a"),
+                ("b-1", "b"),
+                ("a-2", "a"),
+                ("b-2", "b"),
+            )
+        ):
+            requests.append(
+                replace(
+                    base,
+                    request_id=request_id,
+                    submit_at_ms=index,
+                    estimated_finish_ms=100 + index,
+                    cohort_id=cohort_id,
+                    prefill_batch_size=2 if cohort_id else 1,
+                )
+            )
+
+        groups = rollout_module._execution_groups(requests)
+
+        self.assertEqual(
+            [[item.request_id for item in group] for group in groups],
+            [["singleton"], ["a-1", "a-2"], ["b-1", "b-2"]],
+        )
+
     def test_calibrated_duration_breaks_equal_static_deadline_slack(self):
         def timed(request_id, prompt_tokens, output_tokens):
             return RolloutSubmission(

@@ -236,7 +236,13 @@ peak from 10.14 ms to 5.19 ms in the checked-in microbenchmark. The residency
 growth broker now maintains its outstanding byte total during reserve,
 consume and release, making admission reads O(1): 1,000 reads across 1,024
 reservations fell from 9.39 ms to 0.08 ms. These are scheduler-control-plane
-measurements, not a serving-speed claim. The batched rollout policy also uses
+measurements, not a serving-speed claim. Managed rollout ordering now parses
+and scores each ready request once before one sort instead of restarting a
+minimum scan for every cohort; indexed cohort construction and one-pass
+dispatch removal also replace full-list rescans. In a deliberately adversarial
+all-ready trace, 1,024 singleton cohorts fell from 2.35 s to 4.87 ms, while
+1,024 requests in 128 measured cohorts were grouped in 0.135 ms instead of
+2.26 ms. The batched rollout policy also uses
 the whole ready cohort when protecting a satisfiable imminent deadline and
 excludes members whose addition would create a miss; the checked-in controlled
 trace now reaches zero deadline misses in both `future` and `batched` arms.

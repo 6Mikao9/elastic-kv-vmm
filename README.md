@@ -387,7 +387,10 @@ early releases versus requests whose workspace remained charged to completion.
 Future reservations use the peak concurrent demand of anticipated intervals and
 protect deadlines only while waiting behind the current request would consume
 feasible slack. Intervals already backlogged past their planned finish retain a
-predicted service duration from their actual start.
+predicted service duration from their actual start. Managed ordering scores
+each ready request once, sorts once, and indexes measured cohorts; a deliberately
+adversarial 1,024-singleton trace fell from 2.35 s to 4.87 ms. This is a
+control-plane measurement, not a serving-speed claim.
 Shared immutable prefixes are also carried through the validated future hint;
 resident requests in one `prefix_group` are charged one prefix copy in the
 planner and future reservation model. Planner credit still requires an explicit

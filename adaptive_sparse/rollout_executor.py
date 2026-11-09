@@ -51,29 +51,33 @@ def _execution_groups(
 ) -> tuple[tuple[RolloutSubmission, ...], ...]:
     """Return chronological atomic submission groups for execution."""
 
-    groups: list[tuple[RolloutSubmission, ...]] = []
-    emitted_cohorts: set[str] = set()
+    groups: list[tuple[RolloutSubmission, ...] | list[RolloutSubmission]] = []
+    cohort_positions: dict[str, int] = {}
     for item in submissions:
         if item.cohort_id is None:
             groups.append((item,))
             continue
-        if item.cohort_id in emitted_cohorts:
-            continue
-        emitted_cohorts.add(item.cohort_id)
-        groups.append(
-            tuple(
-                candidate
-                for candidate in submissions
-                if candidate.cohort_id == item.cohort_id
-            )
-        )
-    groups.sort(
-        key=lambda group: (
-            group[0].submit_at_ms,
-            min(item.request_id for item in group),
+        position = cohort_positions.get(item.cohort_id)
+        if position is None:
+            cohort_positions[item.cohort_id] = len(groups)
+            groups.append([item])
+        else:
+            group = groups[position]
+            assert isinstance(group, list)
+            group.append(item)
+    normalized = tuple(
+        tuple(group) if isinstance(group, list) else group for group in groups
+    )
+    normalized = tuple(
+        sorted(
+            normalized,
+            key=lambda group: (
+                group[0].submit_at_ms,
+                min(item.request_id for item in group),
+            ),
         )
     )
-    return tuple(groups)
+    return normalized
 
 
 def _cohort_from_queue(
@@ -677,46 +681,61 @@ def _select_due(
         return min(due, key=lambda item: (item.submit_at_ms, item.request_id))
     if policy != "deadline":
         raise ValueError("queue policy must be timeline or deadline")
-
-    def key(item: RolloutSubmission) -> tuple[object, ...]:
-        hint = FutureHint.from_payload(dict(item.hint))
-        item_feedback = _submission_service_rates(
-            service_time_estimator,
+    return min(
+        due,
+        key=lambda item: _deadline_order_key(
             item,
-        )
-        if service_time_estimator is not None:
-            item_prefill = item_feedback.get("prefill_tokens_per_s")
-            item_decode = item_feedback.get("decode_tokens_per_s")
-        else:
-            item_prefill = prefill_tokens_per_s
-            item_decode = (
-                decode_tokens_per_s
-                if decode_tokens_per_s_by_residence is None
-                else decode_tokens_per_s_by_residence.get(hint.residence)
-            )
-            if item_decode is None:
-                item_decode = decode_tokens_per_s
-        if item.deadline_ms is not None:
-            predicted_duration = _duration_ms(
-                item,
-                hint,
-                fallback_ms=max(
-                    1, item.estimated_finish_ms - item.submit_at_ms
-                ),
-                prefill_tokens_per_s=item_prefill,
-                decode_tokens_per_s=item_decode,
-            )
-            return (
-                0,
-                item.deadline_ms,
-                item.deadline_ms - item.submit_at_ms - predicted_duration,
-                -hint.weight,
-                item.submit_at_ms,
-                item.request_id,
-            )
-        return (1, 0, 0, -hint.weight, item.submit_at_ms, item.request_id)
+            prefill_tokens_per_s=prefill_tokens_per_s,
+            decode_tokens_per_s=decode_tokens_per_s,
+            decode_tokens_per_s_by_residence=(
+                decode_tokens_per_s_by_residence
+            ),
+            service_time_estimator=service_time_estimator,
+        ),
+    )
 
-    return min(due, key=key)
+
+def _deadline_order_key(
+    item: RolloutSubmission,
+    *,
+    prefill_tokens_per_s: float | None = None,
+    decode_tokens_per_s: float | None = None,
+    decode_tokens_per_s_by_residence: Mapping[str, float | None] | None = None,
+    service_time_estimator: ServiceTimeEstimator | None = None,
+) -> tuple[object, ...]:
+    """Return the immutable deadline-policy key for one rollout request."""
+
+    hint = FutureHint.from_payload(dict(item.hint))
+    item_feedback = _submission_service_rates(service_time_estimator, item)
+    if service_time_estimator is not None:
+        item_prefill = item_feedback.get("prefill_tokens_per_s")
+        item_decode = item_feedback.get("decode_tokens_per_s")
+    else:
+        item_prefill = prefill_tokens_per_s
+        item_decode = (
+            decode_tokens_per_s
+            if decode_tokens_per_s_by_residence is None
+            else decode_tokens_per_s_by_residence.get(hint.residence)
+        )
+        if item_decode is None:
+            item_decode = decode_tokens_per_s
+    if item.deadline_ms is not None:
+        predicted_duration = _duration_ms(
+            item,
+            hint,
+            fallback_ms=max(1, item.estimated_finish_ms - item.submit_at_ms),
+            prefill_tokens_per_s=item_prefill,
+            decode_tokens_per_s=item_decode,
+        )
+        return (
+            0,
+            item.deadline_ms,
+            item.deadline_ms - item.submit_at_ms - predicted_duration,
+            -hint.weight,
+            item.submit_at_ms,
+            item.request_id,
+        )
+    return (1, 0, 0, -hint.weight, item.submit_at_ms, item.request_id)
 
 
 def _ordered_due_cohorts(
@@ -731,25 +750,43 @@ def _ordered_due_cohorts(
 ) -> tuple[tuple[RolloutSubmission, ...], ...]:
     """Return atomic cohorts in policy order for this scheduling pass."""
 
-    remaining = list(due)
-    ordered: list[tuple[RolloutSubmission, ...]] = []
-    while remaining:
-        head = _select_due(
-            remaining,
-            policy,
-            prefill_tokens_per_s=prefill_tokens_per_s,
-            decode_tokens_per_s=decode_tokens_per_s,
-            decode_tokens_per_s_by_residence=(
-                decode_tokens_per_s_by_residence
-            ),
-            service_time_estimator=service_time_estimator,
+    if policy == "timeline":
+        prioritized = sorted(
+            due, key=lambda item: (item.submit_at_ms, item.request_id)
         )
-        cohort = _cohort_from_queue(head, queue)
+    elif policy == "deadline":
+        prioritized = sorted(
+            due,
+            key=lambda item: _deadline_order_key(
+                item,
+                prefill_tokens_per_s=prefill_tokens_per_s,
+                decode_tokens_per_s=decode_tokens_per_s,
+                decode_tokens_per_s_by_residence=(
+                    decode_tokens_per_s_by_residence
+                ),
+                service_time_estimator=service_time_estimator,
+            ),
+        )
+    else:
+        raise ValueError("queue policy must be timeline or deadline")
+
+    cohort_members: dict[str, list[RolloutSubmission]] = {}
+    for item in queue:
+        if item.cohort_id is not None:
+            cohort_members.setdefault(item.cohort_id, []).append(item)
+    remaining_ids = {item.request_id for item in due}
+    ordered: list[tuple[RolloutSubmission, ...]] = []
+    for head in prioritized:
+        if head.request_id not in remaining_ids:
+            continue
+        cohort = (
+            (head,)
+            if head.cohort_id is None
+            else tuple(cohort_members[head.cohort_id])
+        )
         cohort_ids = {item.request_id for item in cohort}
         ordered.append(cohort)
-        remaining = [
-            item for item in remaining if item.request_id not in cohort_ids
-        ]
+        remaining_ids.difference_update(cohort_ids)
     return tuple(ordered)
 
 
@@ -1191,6 +1228,7 @@ def _execute_managed_rollout(
                 cohort_barrier_timeout_s,
                 generate,
             )
+            dispatched_ids: set[str] = set()
             for member in cohort:
                 admission = admissions[member.request_id]
                 spec: dict[str, object] = {
@@ -1241,7 +1279,6 @@ def _execute_managed_rollout(
                             "decode_tokens_per_s"
                         ),
                     )
-                queue.remove(member)
                 pending_item = _PendingRequest(
                     submission=member,
                     future=None,
@@ -1264,6 +1301,10 @@ def _execute_managed_rollout(
                 )
                 pending_item.future = future
                 pending.append(pending_item)
+                dispatched_ids.add(member.request_id)
+            queue = [
+                item for item in queue if item.request_id not in dispatched_ids
+            ]
         harvest()
     return rows, failures, scheduler_stats
 
