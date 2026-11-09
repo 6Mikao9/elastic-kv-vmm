@@ -239,6 +239,13 @@ identical request signatures are collapsed, and the better of the deployable
 `future` and `online` plans is retained as an incumbent when the expansion cap
 is reached. Search telemetry is exported as `search_expansions`,
 `search_truncated` and `fallback_policy`.
+The optional `active_prefix_prefill_reuse` planner flag models prefill reuse
+only from a same-`prefix_group` resident donor that is still active. Resident
+requests already share one physical-prefix charge in the capacity model; this
+flag additionally shortens the later request's modeled prefill and marks its
+admission reason. It defaults to off because serving measurements require
+SGLang radix caching plus a verified resident-donor lifetime. The 999 ms
+checked-in unit-test difference is policy-model evidence, not measured latency.
 `search_exact` distinguishes a completed search from a capped incumbent. Use
 `online` to evaluate each immediate action by completing the deployable
 `future` heuristic from that branch, then commit only the first action. Its

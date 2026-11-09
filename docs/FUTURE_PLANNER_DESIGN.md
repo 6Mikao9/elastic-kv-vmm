@@ -334,6 +334,21 @@ HiSparse hot-set，峰值反而只有 2,200 token。固定速率下，前者模�
 为 254 ms，后者为 1,004 ms。这个例子说明共享前缀用少量额外驻留字节换取了更少
 的 HiSparse 模式，也说明不能只比较峰值显存；它是确定性策略回放，不是模型实测。
 
+`active_prefix_prefill_reuse` 是默认关闭的预填充时间模型。开启后，只有当同一
+`prefix_group` 的 resident donor 仍在请求生命周期内时，后续请求才按
+
+```text
+prefilled_tokens = prompt_tokens - shared_prefix_tokens
+```
+
+计算 prefill 时长，并在 admission reason 中标记 `active-prefix-reuse`。这条规则
+不复用已经结束但可能仍留在 radix cache 中的条目，也不从 HiSparse 热集推断完整
+前缀命中，因此是一个较保守的下界。回归场景中，1,000-token donor 保持 resident，
+第二条 1,000-token 请求复用完整前缀，规划完成时间从 2,001 ms 降到 1,002 ms，
+两条请求的规划峰值仍为 11,010 token。该数字只验证确定性调度模型。真实运行时
+必须同时启用并验证 SGLang radix cache、resident donor 生命周期和规划模式一致；
+否则执行器应按原生 prefill 耗时解释，不能引用这 999 ms 的模型差值作为服务收益。
+
 ### 4.2 受控 rollout 的可执行计划
 
 `plan_rollout()` 把离线策略结果转换成 orchestrator 可执行的动作。每个 action

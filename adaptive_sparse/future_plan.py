@@ -44,9 +44,9 @@ class RequestProfile:
     SGLang's ``FutureHint.weight`` and never assigns ``request.priority``;
     native SGLang hard-priority tiers therefore remain owned by SGLang.
     ``prefix_group`` and ``shared_prefix_tokens`` describe reusable content.
-    The initial planner reports their availability but does not yet deduct
-    cross-request shared backing; that requires physical page identity from the
-    live VMM tracker and is handled at runtime.
+    Resident requests in the same group share one physical-prefix charge in the
+    planner. Runtime placement still uses the live VMM owner index; the planner
+    only supplies a conservative capacity model.
     """
 
     request_id: str
@@ -241,6 +241,7 @@ class PlannerConfig:
     max_active_requests: int = 8
     lookahead_ms: int = 0
     auto_resident_output_threshold: int = 1
+    active_prefix_prefill_reuse: bool = False
     oracle_max_expansions: int = 100_000
     online_max_rollouts: int = 2_000
     kind_profiles: (
@@ -281,6 +282,8 @@ class PlannerConfig:
             "lookahead_ms",
             maximum=RUNTIME_HINT_MAX_MS,
         )
+        if not isinstance(self.active_prefix_prefill_reuse, bool):
+            raise ValueError("active_prefix_prefill_reuse must be a boolean")
         object.__setattr__(
             self, "kind_profiles", normalize_kind_profiles(self.kind_profiles)
         )
@@ -333,6 +336,7 @@ class PlannerConfig:
             "max_active_requests": self.max_active_requests,
             "lookahead_ms": self.lookahead_ms,
             "auto_resident_output_threshold": self.auto_resident_output_threshold,
+            "active_prefix_prefill_reuse": self.active_prefix_prefill_reuse,
             "oracle_max_expansions": self.oracle_max_expansions,
             "online_max_rollouts": self.online_max_rollouts,
             "kind_profiles": {
@@ -551,9 +555,68 @@ def _active_placements(
     ]
 
 
-def _duration_ms(request: RequestProfile, mode: ResidencyMode, config: PlannerConfig) -> int:
-    prefill = _ceil_duration(
-        request.prompt_tokens, config.prefill_rate(request.kind)
+def _prefill_tokens(
+    request: RequestProfile,
+    active: Sequence[_Active],
+    config: PlannerConfig,
+    *,
+    extra_placements: Sequence[tuple[RequestProfile, ResidencyMode]] = (),
+) -> int:
+    """Return prompt tokens sent to prefill under the selected model.
+
+    A resident request is a conservative proxy for a live SGLang radix-cache
+    entry. HiSparse requests do not receive this credit because their bounded
+    Top-K hot set is not guaranteed to retain the complete prefix.
+    """
+
+    if (
+        not config.active_prefix_prefill_reuse
+        or request.prefix_group is None
+        or request.shared_prefix_tokens <= 0
+    ):
+        return request.prompt_tokens
+    placements = (*_active_placements(active), *extra_placements)
+    if any(
+        mode is ResidencyMode.RESIDENT
+        and candidate.prefix_group == request.prefix_group
+        and candidate.shared_prefix_tokens >= request.shared_prefix_tokens
+        for candidate, mode in placements
+    ):
+        return max(1, request.prompt_tokens - request.shared_prefix_tokens)
+    return request.prompt_tokens
+
+
+def _prefill_duration(
+    request: RequestProfile,
+    active: Sequence[_Active],
+    config: PlannerConfig,
+    *,
+    extra_placements: Sequence[tuple[RequestProfile, ResidencyMode]] = (),
+) -> int:
+    return _ceil_duration(
+        _prefill_tokens(
+            request,
+            active,
+            config,
+            extra_placements=extra_placements,
+        ),
+        config.prefill_rate(request.kind),
+    )
+
+
+def _duration_ms(
+    request: RequestProfile,
+    mode: ResidencyMode,
+    config: PlannerConfig,
+    active: Sequence[_Active] = (),
+    *,
+    extra_placements: Sequence[tuple[RequestProfile, ResidencyMode]] = (),
+) -> int:
+    prefill = _prefill_duration(
+        request,
+        active,
+        config,
+        extra_placements=extra_placements,
     )
     decode = _ceil_duration(
         request.output_tokens, config.decode_rate(request.kind, mode)
@@ -589,7 +652,7 @@ def _future_contention(
 
     if (not pending and not future) or mode is ResidencyMode.HI_SPARSE:
         return 0
-    finish = now_ms + _duration_ms(request, mode, config)
+    finish = now_ms + _duration_ms(request, mode, config, active)
     spend, _ = _placement_memory(
         (*_active_placements(active), (request, mode)), config
     )
@@ -680,10 +743,8 @@ def _defer_for_imminent_work(
     choice can tolerate being placed behind that work.
     """
 
-    current_prefill = _ceil_duration(
-        choice.prompt_tokens, config.prefill_rate(choice.kind)
-    )
-    choice_duration = _duration_ms(choice, mode, config)
+    current_prefill = _prefill_duration(choice, active, config)
+    choice_duration = _duration_ms(choice, mode, config, active)
     for item in future:
         if item.arrival_ms > now_ms + config.lookahead_ms:
             break
@@ -693,9 +754,18 @@ def _defer_for_imminent_work(
         if standalone is None:
             continue
         future_mode = standalone[0]
-        future_duration = _duration_ms(item, future_mode, config)
-        future_prefill = _ceil_duration(
-            item.prompt_tokens, config.prefill_rate(item.kind)
+        future_duration = _duration_ms(
+            item,
+            future_mode,
+            config,
+            active,
+            extra_placements=((choice, mode),),
+        )
+        future_prefill = _prefill_duration(
+            item,
+            active,
+            config,
+            extra_placements=((choice, mode),),
         )
         blocked_start = max(item.arrival_ms, now_ms + current_prefill)
         delayed_finish = blocked_start + future_duration
@@ -846,6 +916,10 @@ def _select(
         choice, mode, active, future, now_ms, config
     ):
         return None
+    if _prefill_duration(choice, active, config) < _ceil_duration(
+        choice.prompt_tokens, config.prefill_rate(choice.kind)
+    ):
+        reason = f"{reason}+active-prefix-reuse"
     return choice, mode, reason
 
 
@@ -898,9 +972,12 @@ def _admission_child(
     workspace = request.prompt_tokens * config.prefill_workspace_rate(
         request.kind
     )
-    prefill = _ceil_duration(
+    prefill = _prefill_duration(request, active, config)
+    base_prefill = _ceil_duration(
         request.prompt_tokens, config.prefill_rate(request.kind)
     )
+    if prefill < base_prefill:
+        reason = f"{reason}+active-prefix-reuse"
     aggregate, shared_credit = _placement_memory(
         (
             *_active_placements(active),
@@ -912,7 +989,7 @@ def _admission_child(
         request_id=request.request_id,
         arrival_ms=request.arrival_ms,
         start_ms=state.now_ms,
-        finish_ms=state.now_ms + _duration_ms(request, mode, config),
+        finish_ms=state.now_ms + _duration_ms(request, mode, config, active),
         mode=mode,
         kind=request.kind,
         resident_kv_bytes=hold,
@@ -1286,10 +1363,12 @@ def _simulate_heuristic_from_state(
                 request.kind
             )
             hold = _hold_bytes(request, mode, config)
-            duration = _duration_ms(request, mode, config)
-            prefill = _ceil_duration(
+            duration = _duration_ms(request, mode, config, active)
+            prefill = _prefill_duration(request, active, config)
+            if prefill < _ceil_duration(
                 request.prompt_tokens, config.prefill_rate(request.kind)
-            )
+            ):
+                reason = f"{reason}+active-prefix-reuse"
             admission = Admission(
                 request_id=request.request_id,
                 arrival_ms=request.arrival_ms,

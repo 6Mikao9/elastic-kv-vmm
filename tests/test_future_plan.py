@@ -595,6 +595,72 @@ class FuturePlanTest(unittest.TestCase):
                 prefill_workspace_bytes_per_token=0,
                 lookahead_ms=True,
             )
+        with self.assertRaisesRegex(
+            ValueError, "active_prefix_prefill_reuse must be a boolean"
+        ):
+            PlannerConfig(
+                memory_budget_bytes=1,
+                kv_bytes_per_token=1,
+                prefill_workspace_bytes_per_token=0,
+                active_prefix_prefill_reuse=1,
+            )
+
+    def test_live_resident_prefix_can_reduce_known_future_prefill(self):
+        base = PlannerConfig(
+            memory_budget_bytes=50_000,
+            kv_bytes_per_token=1,
+            prefill_workspace_bytes_per_token=0,
+            sparse_hot_tokens=100,
+            prefill_tokens_per_ms=1,
+            resident_decode_tokens_per_ms=100,
+            sparse_decode_tokens_per_ms=50,
+            max_active_requests=2,
+            lookahead_ms=50,
+        )
+        workload = (
+            RequestProfile(
+                "anchor",
+                arrival_ms=0,
+                prompt_tokens=1000,
+                output_tokens=10_000,
+                kind="chat",
+                prefix_group="system-prefix",
+                shared_prefix_tokens=1000,
+                residence_hint="resident",
+            ),
+            RequestProfile(
+                "reuse",
+                arrival_ms=10,
+                prompt_tokens=1000,
+                output_tokens=10,
+                kind="chat",
+                prefix_group="system-prefix",
+                shared_prefix_tokens=1000,
+                residence_hint="resident",
+            ),
+        )
+
+        disabled = simulate(workload, base, "future")
+        enabled = simulate(
+            workload,
+            replace(base, active_prefix_prefill_reuse=True),
+            "future",
+        )
+        disabled_by_id = {item.request_id: item for item in disabled.admissions}
+        enabled_by_id = {item.request_id: item for item in enabled.admissions}
+
+        self.assertFalse(base.active_prefix_prefill_reuse)
+        self.assertEqual(disabled_by_id["reuse"].finish_ms, 2001)
+        self.assertEqual(enabled_by_id["reuse"].finish_ms, 1002)
+        self.assertEqual(
+            enabled_by_id["reuse"].finish_ms - disabled_by_id["reuse"].finish_ms,
+            -999,
+        )
+        self.assertIn("active-prefix-reuse", enabled_by_id["reuse"].reason)
+        self.assertEqual(enabled_by_id["anchor"], disabled_by_id["anchor"])
+        self.assertEqual(enabled.peak_memory_bytes, disabled.peak_memory_bytes)
+        self.assertEqual(enabled.peak_memory_bytes, 11_010)
+        self.assertEqual(enabled.peak_shared_prefix_credit_bytes, 1000)
 
     def test_kind_profiles_drive_resources_timing_and_round_trip(self):
         config = replace(
@@ -635,6 +701,15 @@ class FuturePlanTest(unittest.TestCase):
         self.assertEqual(admission.resident_kv_bytes, 100_000)
         self.assertEqual(admission.prefill_workspace_bytes, 300)
         self.assertEqual(admission.finish_ms - admission.start_ms, 50)
+        self.assertFalse(restored.active_prefix_prefill_reuse)
+
+    def test_active_prefix_reuse_round_trips_in_planner_config(self):
+        config = replace(self.config, active_prefix_prefill_reuse=True)
+
+        restored = PlannerConfig(**config.as_dict())
+
+        self.assertTrue(restored.active_prefix_prefill_reuse)
+        self.assertEqual(restored.as_dict(), config.as_dict())
 
     def test_rollout_hint_uses_selected_kind_and_residency_rates(self):
         config = replace(
