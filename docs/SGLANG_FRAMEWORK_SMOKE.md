@@ -86,6 +86,12 @@ FUTURE_SMOKE_IMAGE=lmsysorg/sglang:latest \
 runner 现在会落盘逐请求 TTFT、TPOT、总延迟、输出 token/s、整卡 NVML、future hook
 计数和 VMM logical/backed bytes；只有 baseline 和 V5 都完成后才能比较内存与效率。
 
+计划 rollout 的结果现在还包含 `decode_occupancy`。它按 request ID 把计划中的
+`decode_batch_size` 与 SGLang hook 观测到的真实 batch-size histogram 对齐，并导出
+最近 4096 个 decode batch 的有界事件序列。`--require-decode-occupancy` 要求运行
+至少出现一次真实 decode 观测，适合接入回归；实际 batch size 与计划不同会记录为
+结构证据，不会直接改写成吞吐结论。
+
 ## 本次修复
 
 第一次 V5 smoke 没有进入 `ElasticPool`：服务日志仍显示原生固定 pool。原因是新启动器

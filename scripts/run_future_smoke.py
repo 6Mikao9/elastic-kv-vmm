@@ -19,6 +19,7 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from adaptive_sparse.decode_occupancy import compare_decode_occupancy
 from adaptive_sparse.future_plan import POLICIES
 from adaptive_sparse.sglang_future_hook import (
     cohort_completion_evidence,
@@ -204,6 +205,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="fail unless every planned cohort reaches one complete native prefill batch",
     )
+    parser.add_argument(
+        "--require-decode-occupancy",
+        action="store_true",
+        help="fail unless SGLang reports observed decode batch occupancy",
+    )
     args = parser.parse_args(argv)
     if not args.model_path.is_dir():
         parser.error("--model-path must be an existing directory")
@@ -266,6 +272,11 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--require-complete-cohorts needs --plan or --workload")
         if args.no_hints or args.future_policy == "off":
             parser.error("--require-complete-cohorts requires emitted future hints")
+    if args.require_decode_occupancy:
+        if args.plan is None and args.workload is None:
+            parser.error("--require-decode-occupancy needs --plan or --workload")
+        if args.no_hints or args.future_policy == "off":
+            parser.error("--require-decode-occupancy requires emitted future hints")
     if not 0 < args.service_time_ewma_alpha <= 1:
         parser.error("--service-time-ewma-alpha must be in (0, 1]")
     if (args.plan is not None or args.workload is not None) and not args.no_hints and args.future_policy == "off":
@@ -476,6 +487,10 @@ def main(argv: list[str] | None = None) -> int:
             else None
         )
         if planned_submissions is not None:
+            decode_occupancy = compare_decode_occupancy(
+                planned_result["requests"],
+                hook_stats or {},
+            )
             cohort_completion = (
                 cohort_completion_evidence(expected_cohorts, hook_stats or {})
                 if expected_cohorts
@@ -519,6 +534,10 @@ def main(argv: list[str] | None = None) -> int:
                 checks["complete_cohorts"] = bool(
                     cohort_completion and cohort_completion["passed"]
                 )
+            if args.require_decode_occupancy:
+                checks["decode_occupancy_observed"] = bool(
+                    decode_occupancy["available"]
+                )
             if args.require_residency_evidence:
                 checks["residency_evidence"] = bool(
                     planned_result["residency_evidence"]
@@ -554,6 +573,8 @@ def main(argv: list[str] | None = None) -> int:
                 "preannounce_lead_ms": args.preannounce_lead_ms,
                 "require_complete_cohorts": args.require_complete_cohorts,
                 "cohort_completion": cohort_completion,
+                "decode_occupancy": decode_occupancy,
+                "require_decode_occupancy": args.require_decode_occupancy,
             }
             result_path.write_text(
                 json.dumps(result, indent=2, sort_keys=True), encoding="utf-8"

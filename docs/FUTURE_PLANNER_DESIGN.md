@@ -392,7 +392,16 @@ contention 的估计。已经开始的请求不会在后续请求加入 batch �
 decode batch，写出 batch-size histogram、最后一个 decode batch 以及每个请求经历过的
 batch size 分布；逐请求 trace 有界保留最近 4096 个请求。这个证据用于 paired replay
 和诊断静态 admission 假设何时失效，当前不会反向改写已经下发的计划或估计 finish
-time。
+time。事件级 `decode_trace` 再保留最近 4096 个 batch 的进程内单调时钟、序号、
+request/cohort ID 和 mixed prefill/decode 标记，用于恢复 occupancy 变化顺序。
+
+受控 smoke 会把 rollout 中每条请求的 `decode_batch_size` 与 server telemetry 的
+逐请求实际 batch-size histogram 对齐，输出 `decode_occupancy`：覆盖率、每个请求的
+精确命中次数、exact-event fraction、主导 batch size 和事件时间跨度。
+`--require-decode-occupancy` 可以要求至少观察到真实 decode batch；batch size
+不一致本身仍作为测量证据保留，不会伪装成失败或性能收益。`decode_trace` 的时间是
+单个 server process 的 `monotonic` 时间，不能直接和另一进程的客户端时间戳相减，
+跨进程对齐仍需显式时钟校准。
 
 ### 4.1.3 已实现：已知未来 cohort 的保守等待策略
 

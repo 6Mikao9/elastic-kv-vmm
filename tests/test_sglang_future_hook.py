@@ -46,6 +46,7 @@ class SGLangFutureHookTest(unittest.TestCase):
         hook._complete_cohort_ids.clear()
         hook._decode_batch_sizes.clear()
         hook._decode_batch_sizes_by_request.clear()
+        hook._decode_trace.clear()
         hook._stats_identity.clear()
         hook._last_cohort_batch = None
         hook._last_decode_batch = None
@@ -155,14 +156,16 @@ class SGLangFutureHookTest(unittest.TestCase):
                 batch_to_run=SimpleNamespace(
                     reqs=[first], forward_mode=DecodeMode()
                 )
-            )
+            ),
+            now_s=10.0,
         )
         observe_decode_batch(
             SimpleNamespace(
                 batch_to_run=SimpleNamespace(
                     reqs=[first, second], forward_mode=DecodeMode()
                 )
-            )
+            ),
+            now_s=10.05,
         )
         after = snapshot_stats()
 
@@ -181,6 +184,44 @@ class SGLangFutureHookTest(unittest.TestCase):
         )
         self.assertEqual(
             after["decode_batch_sizes_by_request"]["second"], {"2": 1}
+        )
+        self.assertEqual(
+            [event["observed_at_s"] for event in after["decode_trace"]],
+            [10.0, 10.05],
+        )
+        self.assertEqual(
+            after["decode_trace"][1]["request_ids"],
+            ["first", "second"],
+        )
+
+    def test_decode_trace_is_bounded_and_counts_evictions(self):
+        class DecodeMode:
+            def is_decode(self):
+                return True
+
+        old_trace = hook._decode_trace
+        hook._decode_trace = hook.deque(maxlen=2)
+        before = snapshot_stats()["decode_trace_evictions"]
+        try:
+            for index in range(3):
+                observe_decode_batch(
+                    SimpleNamespace(
+                        reqs=[request(f"r{index}", 10, 1.0, {})],
+                        forward_mode=DecodeMode(),
+                    ),
+                    now_s=20.0 + index,
+                )
+            after = snapshot_stats()
+        finally:
+            hook._decode_trace = old_trace
+
+        self.assertEqual(
+            [event["request_ids"] for event in after["decode_trace"]],
+            [["r1"], ["r2"]],
+        )
+        self.assertEqual(
+            after["decode_trace_evictions"] - before,
+            1,
         )
 
     def test_decode_observer_ignores_prefill_batches(self):

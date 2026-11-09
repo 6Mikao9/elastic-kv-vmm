@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 import os
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Iterable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -42,6 +42,7 @@ POLICIES = ("off", "deadline")
 _STATS_INTERVAL_S = 0.25
 _DEFAULT_COHORT_WAIT_TIMEOUT_MS = 1000.0
 _MAX_DECODE_REQUEST_TRACES = 4096
+_MAX_DECODE_TRACE_EVENTS = 4096
 
 _installed = False
 _last_stats_publish = 0.0
@@ -61,6 +62,7 @@ _stats = {
     "decode_requests_observed": 0,
     "decode_mixed_batches": 0,
     "decode_request_trace_evictions": 0,
+    "decode_trace_evictions": 0,
     "cohort_batches": 0,
     "complete_cohort_batches": 0,
     "partial_cohort_batches": 0,
@@ -81,6 +83,7 @@ _complete_cohort_ids: set[str] = set()
 _last_decode_batch: dict[str, object] | None = None
 _decode_batch_sizes: dict[int, int] = {}
 _decode_batch_sizes_by_request: OrderedDict[str, dict[int, int]] = OrderedDict()
+_decode_trace: deque[dict[str, object]] = deque(maxlen=_MAX_DECODE_TRACE_EVENTS)
 _last_held_cohorts: list[dict[str, object]] = []
 _last_held_releases: list[dict[str, object]] = []
 _cohort_first_seen_s: dict[str, float] = {}
@@ -662,7 +665,7 @@ def observe_prefill_batch(batch: Any) -> None:
         }
 
 
-def observe_decode_batch(result: Any) -> None:
+def observe_decode_batch(result: Any, *, now_s: float | None = None) -> None:
     """Record the actual occupancy of one SGLang decode scheduling batch."""
 
     global _last_decode_batch
@@ -715,10 +718,24 @@ def observe_decode_batch(result: Any) -> None:
         if hint is not None and hint.cohort_id is not None:
             cohort_ids.add(hint.cohort_id)
 
-    _last_decode_batch = {
+    observed_at_s = time.monotonic() if now_s is None else float(now_s)
+    if not math.isfinite(observed_at_s):
+        raise ValueError("decode observation time must be finite")
+    event = {
+        "sequence": _stats["decode_batches"],
+        "observed_at_s": observed_at_s,
         "batch_size": size,
         "request_ids": sorted(request_ids),
         "cohort_ids": sorted(cohort_ids),
+        "mixed_prefill_decode": mixed,
+    }
+    if len(_decode_trace) == _decode_trace.maxlen:
+        _stats["decode_trace_evictions"] += 1
+    _decode_trace.append(event)
+    _last_decode_batch = {
+        "batch_size": size,
+        "request_ids": event["request_ids"],
+        "cohort_ids": event["cohort_ids"],
         "mixed_prefill_decode": mixed,
     }
 
@@ -985,6 +1002,7 @@ def snapshot_stats() -> dict[str, object]:
         }
         for request_id, by_size in sorted(_decode_batch_sizes_by_request.items())
     }
+    snapshot["decode_trace"] = [dict(event) for event in _decode_trace]
     snapshot["last_held_cohorts"] = list(_last_held_cohorts)
     snapshot["last_held_releases"] = list(_last_held_releases)
     snapshot["stats_identity"] = dict(_stats_identity)
