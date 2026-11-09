@@ -1,11 +1,12 @@
 import multiprocessing
+import sqlite3
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
 
-from elastic_kv.global_broker import GlobalAdmissionBroker
+from elastic_kv.global_broker import GlobalAdmissionBroker, _enable_wal_mode
 
 
 PROCESS_START_TIMEOUT_SECONDS = 60
@@ -69,6 +70,34 @@ class GlobalAdmissionBrokerTest(unittest.TestCase):
             self.assertEqual(broker.release_claim("prefill-0"), 1)
         finally:
             broker.close()
+
+    def test_wal_initialization_retries_transient_lock_contention(self):
+        class FakeConnection:
+            def __init__(self):
+                self.calls = 0
+
+            def execute(self, statement):
+                self.calls += 1
+                if self.calls == 1:
+                    raise sqlite3.OperationalError("database is locked")
+                return self
+
+            def fetchone(self):
+                return ("wal",)
+
+        connection = FakeConnection()
+        sleeps = []
+        now = [10.0]
+
+        _enable_wal_mode(
+            connection,
+            1.0,
+            clock=lambda: now[0],
+            sleep=lambda seconds: (sleeps.append(seconds), now.__setitem__(0, now[0] + seconds)),
+        )
+
+        self.assertEqual(connection.calls, 2)
+        self.assertEqual(len(sleeps), 1)
 
     def test_two_owners_share_one_capacity_without_partial_leases(self):
         first = self.broker("first")

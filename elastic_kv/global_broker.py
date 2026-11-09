@@ -76,6 +76,53 @@ FAIR_MODES = ("off", "observe", "enforce")
 MAX_RESERVE_WAIT_SECONDS = 5.0
 
 
+def _enable_wal_mode(
+    connection: sqlite3.Connection,
+    timeout_seconds: float,
+    *,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """Enable WAL even when another process is entering WAL concurrently.
+
+    SQLite deliberately bypasses the connection busy handler for a few
+    journal-mode transitions.  ``busy_timeout`` therefore does not make
+    ``PRAGMA journal_mode=WAL`` reliable when several broker processes start at
+    once.  Retry only the documented lock/busy failures and retain the same
+    bounded wait used by ordinary broker transactions.
+    """
+
+    deadline = clock() + timeout_seconds
+    delay = 0.002
+    while True:
+        try:
+            current = connection.execute("PRAGMA journal_mode").fetchone()
+            if current is not None and str(current[0]).lower() == "wal":
+                return
+            selected = connection.execute("PRAGMA journal_mode=WAL").fetchone()
+            mode = None if selected is None else str(selected[0]).lower()
+            if mode == "wal":
+                return
+            error = sqlite3.OperationalError(
+                f"failed to enable WAL journal mode (selected {mode!r})"
+            )
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            if "locked" not in message and "busy" not in message:
+                raise
+            error = exc
+
+        remaining = deadline - clock()
+        if remaining <= 0:
+            raise error
+        # Process start-ups arrive nearly together; a small jitter avoids all
+        # workers retrying on the same schedule while remaining deterministic
+        # enough to finish well inside the broker timeout.
+        jitter = ((time.monotonic_ns() + os.getpid()) % 997) / 1_000_000
+        sleep(min(remaining, delay + jitter))
+        delay = min(delay * 1.7, 0.064)
+
+
 class GlobalAdmissionBroker:
     """SQLite-backed aggregate VMM leases with optional weighted fairness.
 
@@ -243,7 +290,7 @@ class GlobalAdmissionBroker:
     def _initialize(self) -> None:
         now = time.time()
         with self._connection() as connection:
-            connection.execute("PRAGMA journal_mode=WAL")
+            _enable_wal_mode(connection, self.timeout_seconds)
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS metadata "
