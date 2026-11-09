@@ -13,8 +13,8 @@ one operation for enforced mode.
 
 from __future__ import annotations
 
+from collections.abc import Hashable
 from dataclasses import dataclass
-from typing import Hashable
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +76,7 @@ class ResidencyBroker:
 
     def __init__(self) -> None:
         self._reservations: dict[Hashable, int] = {}
+        self._reserved_bytes = 0
         self._last_lengths: dict[Hashable, int] = {}
         self._stats = {
             "assessments": 0,
@@ -119,7 +120,7 @@ class ResidencyBroker:
             self._record_decline("duplicate-request")
             return BrokerDecision(False, "duplicate-request", fixed + predicted, self.reserved_bytes)
 
-        promised = sum(self._reservations.values())
+        promised = self._reserved_bytes
         required = fixed + promised + predicted
         self._stats["would_decline" if available < required else "would_admit"] += 1
         if available < required:
@@ -135,6 +136,7 @@ class ResidencyBroker:
             self._stats["duplicate_reservations"] += 1
             raise ValueError("duplicate residency reservation for request")
         self._reservations[key] = predicted
+        self._reserved_bytes += predicted
         self._stats["reservations"] += 1
 
     def try_admit(
@@ -165,6 +167,7 @@ class ResidencyBroker:
         applied = min(remaining, consumed)
         if key in self._reservations:
             self._reservations[key] = remaining - applied
+            self._reserved_bytes -= applied
             self._stats["consumed_bytes"] += applied
         return applied
 
@@ -172,6 +175,7 @@ class ResidencyBroker:
         """Release every unconsumed byte reserved for a completed request."""
 
         remaining = self._reservations.pop(key, 0)
+        self._reserved_bytes -= remaining
         self._last_lengths.pop(key, None)
         self._stats["released_bytes"] += remaining
         return remaining
@@ -231,7 +235,7 @@ class ResidencyBroker:
 
     @property
     def reserved_bytes(self) -> int:
-        return sum(self._reservations.values())
+        return self._reserved_bytes
 
     def snapshot(self) -> dict[str, object]:
         result = dict(self._stats)

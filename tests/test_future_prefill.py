@@ -4,6 +4,8 @@ from types import SimpleNamespace as NS
 
 from adaptive_sparse.future_prefill import (
     FuturePrefillConfig,
+    FuturePrefillEntry,
+    _interval_peak,
     effective_prefill_headroom,
     plan_future_prefill,
     reconcile_tp_plan,
@@ -58,14 +60,14 @@ def request(
 
 class FuturePrefillPlanTest(unittest.TestCase):
     def config(self, **changes):
-        values = dict(
-            mode="dry_run",
-            horizon_ms=2_000,
-            max_reserve_bytes=1_000_000,
-            activation_bytes_per_token=2,
-            auto_resident_output_tokens=20,
-            sparse_hot_tokens=8,
-        )
+        values = {
+            "mode": "dry_run",
+            "horizon_ms": 2_000,
+            "max_reserve_bytes": 1_000_000,
+            "activation_bytes_per_token": 2,
+            "auto_resident_output_tokens": 20,
+            "sparse_hot_tokens": 8,
+        }
         values.update(changes)
         return FuturePrefillConfig(**values)
 
@@ -285,6 +287,45 @@ class FuturePrefillPlanTest(unittest.TestCase):
 
         self.assertEqual(sum(entry.kv_bytes for entry in plan.entries), 450)
         self.assertEqual(plan.kv_bytes, 430)
+
+    def test_incremental_interval_peak_recomputes_group_minimum_on_removal(self):
+        entries = [
+            FuturePrefillEntry(
+                request_id=request_id,
+                kind="test",
+                residence="resident",
+                prompt_tokens=1,
+                expected_output_tokens=1,
+                kv_bytes=kv_bytes,
+                activation_bytes=0,
+                release_in_ms=finish_ms,
+                native_order=index,
+                start_in_ms=0,
+                kv_finish_in_ms=finish_ms,
+                prefix_group=group,
+                shared_prefix_tokens=shared,
+                shared_prefix_bytes=shared,
+            )
+            for index, (request_id, kv_bytes, finish_ms, group, shared) in enumerate(
+                (
+                    ("a", 10, 5, "group-a", 3),
+                    ("b", 20, 10, "group-a", 4),
+                    ("c", 30, 10, "group-a", 5),
+                    ("d", 40, 20, "group-b", 8),
+                    ("e", 50, 20, "group-b", 10),
+                )
+            )
+        ]
+
+        self.assertEqual(
+            _interval_peak(
+                entries,
+                "kv_bytes",
+                "kv_finish_in_ms",
+                shared_prefix=True,
+            ),
+            136,
+        )
 
     def test_host_backed_members_do_not_receive_shared_prefix_credit(self):
         plan = plan_future_prefill(

@@ -10,6 +10,8 @@
     "sparse_decode_tokens_per_ms": 16.0,
     "max_active_requests": 8,
     "lookahead_ms": 200,
+    "batch_window_ms": 200,
+    "max_batch_requests": 4,
     "auto_resident_output_threshold": 128
   },
   "requests": [

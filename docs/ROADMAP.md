@@ -229,6 +229,20 @@ compare throughput under a common latency objective, capacity and failure
 rate. Measure transition stalls and recovery time separately. These are
 acceptance goals, not demonstrated results or an assumed speedup threshold.
 
+The known-future control plane no longer rescans every active request and
+shared-prefix group at every interval event. Incremental active-byte accounting
+plus lazily maintained per-group minima cut the local 1,024-request interval
+peak from 10.14 ms to 5.19 ms in the checked-in microbenchmark. The residency
+growth broker now maintains its outstanding byte total during reserve,
+consume and release, making admission reads O(1): 1,000 reads across 1,024
+reservations fell from 9.39 ms to 0.08 ms. These are scheduler-control-plane
+measurements, not a serving-speed claim. The batched rollout policy also uses
+the whole ready cohort when protecting a satisfiable imminent deadline and
+excludes members whose addition would create a miss; the checked-in controlled
+trace now reaches zero deadline misses in both `future` and `batched` arms.
+Missing measured cohort profiles still retain serial prefill and linear decode,
+so the next serving step remains a paired SGLang run with real cohort profiles.
+
 Physical chunk co-occupancy is an implementation issue to optimize, not
 prefix sharing: the 240 MiB/rank joint-reclaim example used independent
 request pages and disabled radix caching. The scheduler now maintains

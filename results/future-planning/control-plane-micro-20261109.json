@@ -1,0 +1,47 @@
+{
+  "environment": "local CPU control-plane microbenchmark; no CUDA or model execution",
+  "interval_peak": [
+    {
+      "incremental_median_us": 342.4,
+      "peak_bytes": 48918,
+      "reference_median_us": 1786.5,
+      "requests": 64
+    },
+    {
+      "incremental_median_us": 1263.4,
+      "peak_bytes": 348077,
+      "reference_median_us": 2473.3,
+      "requests": 256
+    },
+    {
+      "incremental_median_us": 5190.2,
+      "peak_bytes": 4101077,
+      "reference_median_us": 10143.3,
+      "requests": 1024
+    }
+  ],
+  "repeats": 21,
+  "reserved_bytes": [
+    {
+      "incremental_median_us": 78.5,
+      "reference_median_us": 779.2,
+      "reservations": 64,
+      "scans_per_sample": 1000,
+      "total_bytes": 2080
+    },
+    {
+      "incremental_median_us": 82.9,
+      "reference_median_us": 2350.6,
+      "reservations": 256,
+      "scans_per_sample": 1000,
+      "total_bytes": 32896
+    },
+    {
+      "incremental_median_us": 80.3,
+      "reference_median_us": 9387.5,
+      "reservations": 1024,
+      "scans_per_sample": 1000,
+      "total_bytes": 524800
+    }
+  ]
+}

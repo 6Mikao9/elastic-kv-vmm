@@ -1078,6 +1078,86 @@ class FuturePlanTest(unittest.TestCase):
         self.assertLessEqual(by_id["deadline"].finish_ms, 3)
         self.assertEqual(result.deadline_misses, 0)
 
+    def test_batched_policy_idles_without_profiles_to_protect_deadline(self):
+        config = PlannerConfig(
+            memory_budget_bytes=10_000,
+            kv_bytes_per_token=1,
+            prefill_workspace_bytes_per_token=0,
+            sparse_hot_tokens=10,
+            prefill_tokens_per_ms=1,
+            resident_decode_tokens_per_ms=1,
+            sparse_decode_tokens_per_ms=1,
+            max_active_requests=2,
+            max_batch_requests=2,
+            batch_window_ms=50,
+            lookahead_ms=50,
+        )
+        workload = (
+            RequestProfile(
+                "background",
+                arrival_ms=0,
+                prompt_tokens=80,
+                output_tokens=10,
+            ),
+            RequestProfile(
+                "deadline",
+                arrival_ms=10,
+                prompt_tokens=10,
+                output_tokens=10,
+                priority=2,
+                deadline_ms=30,
+            ),
+        )
+
+        result = simulate(workload, config, "batched")
+        by_id = {item.request_id: item for item in result.admissions}
+
+        self.assertEqual(result.deadline_misses, 0)
+        self.assertEqual(by_id["deadline"].start_ms, 10)
+        self.assertLessEqual(by_id["deadline"].finish_ms, 30)
+
+    def test_batched_whole_cohort_cannot_delay_known_deadline(self):
+        config = PlannerConfig(
+            memory_budget_bytes=10_000,
+            kv_bytes_per_token=1,
+            prefill_workspace_bytes_per_token=0,
+            sparse_hot_tokens=10,
+            prefill_tokens_per_ms=1,
+            resident_decode_tokens_per_ms=1,
+            sparse_decode_tokens_per_ms=1,
+            max_active_requests=4,
+            max_batch_requests=3,
+            batch_window_ms=50,
+            lookahead_ms=50,
+        )
+        workload = (
+            *(
+                RequestProfile(
+                    f"background-{index}",
+                    arrival_ms=0,
+                    prompt_tokens=8,
+                    output_tokens=10,
+                )
+                for index in range(3)
+            ),
+            RequestProfile(
+                "deadline",
+                arrival_ms=10,
+                prompt_tokens=10,
+                output_tokens=10,
+                priority=2,
+                deadline_ms=30,
+            ),
+        )
+
+        result = simulate(workload, config, "batched")
+        by_id = {item.request_id: item for item in result.admissions}
+
+        self.assertEqual(result.deadline_misses, 0)
+        self.assertEqual(by_id["deadline"].start_ms, 10)
+        self.assertLessEqual(by_id["deadline"].finish_ms, 30)
+        self.assertEqual(by_id["deadline"].prefill_batch_size, 1)
+
     def test_missing_prefill_profile_never_synthesizes_batch_benefit(self):
         config = replace(
             self.config,

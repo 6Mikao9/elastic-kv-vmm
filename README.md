@@ -310,10 +310,14 @@ This exposes where the admission-time model diverges from SGLang's changing
 occupancy; it is diagnostic evidence and does not rewrite an active plan.
 The matching `prefill_batch_profiles` records aggregate prefill tokens per
 millisecond at exact cohort sizes. The `batched` known-future policy may hold
-ready work for `batch_window_ms` only when these profiles predict both no worse
-weighted completion and no worse makespan, and when no satisfiable hard
-deadline becomes a miss. Missing prefill measurements retain the prior serial
-prefill model; missing decode measurements retain the per-request linear model.
+ready work for `batch_window_ms` when these profiles predict both no worse
+weighted completion and no worse makespan. Independently of profile
+availability, it also holds a ready cohort when the entire cohort would delay a
+satisfiable imminent hard deadline enough to turn it into a miss, provided the
+held work can itself still meet its protected deadlines. Cohort construction
+then excludes a member whose addition would create such a miss. Missing prefill
+measurements retain the prior serial prefill model; missing decode measurements
+retain the per-request linear model.
 `max_batch_requests` caps the cohort and must not exceed
 `max_active_requests`. Every admission records `prefill_batch_size` and a
 `cohort_id`, and the executor rejects a cohort whose members disagree on start

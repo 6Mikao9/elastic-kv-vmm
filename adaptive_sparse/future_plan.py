@@ -1200,6 +1200,79 @@ def _defer_for_imminent_work(
     return False
 
 
+def _defer_batch_for_imminent_work(
+    requests: Sequence[RequestProfile],
+    modes: Sequence[ResidencyMode],
+    active: Sequence[_Active],
+    future: Sequence[RequestProfile],
+    now_ms: int,
+    config: PlannerConfig,
+) -> bool:
+    """Protect a known deadline from an entire ready prefill cohort."""
+
+    placements = tuple(zip(requests, modes, strict=True))
+    current_prefill = _prefill_batch_duration(
+        requests, modes, active, config
+    )
+    for item in future:
+        if item.arrival_ms > now_ms + config.lookahead_ms:
+            break
+        if item.deadline_ms is None:
+            continue
+        standalone = _feasible_mode(
+            item,
+            active,
+            config,
+            extra_placements=placements,
+        )
+        future_mode = (
+            standalone[0]
+            if standalone is not None
+            else ResidencyMode.HI_SPARSE
+        )
+        future_duration = _duration_ms(
+            item,
+            future_mode,
+            config,
+            active,
+            extra_placements=placements,
+        )
+        future_prefill = _prefill_duration(
+            item,
+            active,
+            config,
+            extra_placements=placements,
+        )
+        blocked_start = max(item.arrival_ms, now_ms + current_prefill)
+        deadline_blocked = (
+            blocked_start + future_duration > item.deadline_ms
+            and item.arrival_ms + future_duration <= item.deadline_ms
+        )
+        if not (standalone is None or deadline_blocked):
+            continue
+
+        protected_tier = False
+        for request, mode in placements:
+            if request.deadline_ms is None:
+                continue
+            delayed_start = item.arrival_ms + (
+                future_duration if standalone is None else future_prefill
+            )
+            delayed_finish = delayed_start + _duration_ms(
+                request, mode, config, active
+            )
+            if delayed_finish > request.deadline_ms:
+                protected_tier = True
+                break
+            if item.deadline_ms > request.deadline_ms:
+                protected_tier = True
+                break
+        if protected_tier:
+            continue
+        return True
+    return False
+
+
 def _select(
     policy: str,
     unstarted: dict[str, RequestProfile],
@@ -1698,9 +1771,10 @@ def _wait_for_batch_improves(
 def _ready_batch(
     pending: Sequence[RequestProfile],
     active: Sequence[_Active],
+    now_ms: int,
     config: PlannerConfig,
 ) -> tuple[tuple[RequestProfile, ...], tuple[ResidencyMode, ...], tuple[str, ...]]:
-    """Build the largest joint-feasible ready cohort in policy order."""
+    """Build the largest joint-feasible cohort without creating a miss."""
 
     selected: list[RequestProfile] = []
     selected_assignment = None
@@ -1710,6 +1784,39 @@ def _ready_batch(
         candidate = (*selected, request)
         assignment = _assign_batch_modes(candidate, active, config)
         if assignment is None:
+            continue
+        modes = assignment[0]
+        prefill = _prefill_batch_duration(candidate, modes, active, config)
+        decode_batch_size = min(
+            config.max_active_requests, len(active) + len(candidate)
+        )
+        deadline_safe = True
+        for item, mode in zip(candidate, modes, strict=True):
+            if item.deadline_ms is None:
+                continue
+            combined_finish = now_ms + prefill + _ceil_duration(
+                item.output_tokens,
+                config.decode_rate_for_batch(
+                    item.kind, mode, decode_batch_size
+                ),
+            )
+            if combined_finish <= item.deadline_ms:
+                continue
+            standalone_prefill = _prefill_batch_duration(
+                (item,), (mode,), active, config
+            )
+            standalone_finish = now_ms + standalone_prefill + _ceil_duration(
+                item.output_tokens,
+                config.decode_rate_for_batch(
+                    item.kind,
+                    mode,
+                    min(config.max_active_requests, len(active) + 1),
+                ),
+            )
+            if standalone_finish <= item.deadline_ms:
+                deadline_safe = False
+                break
+        if not deadline_safe:
             continue
         selected.append(request)
         selected_assignment = assignment
@@ -1792,7 +1899,7 @@ def _simulate_batched(
             now_ms = min(wake_times)
             continue
 
-        base, modes, reasons = _ready_batch(pending, active, config)
+        base, modes, reasons = _ready_batch(pending, active, now_ms, config)
         if not base:
             wake_times = [
                 item.admission.finish_ms
@@ -1811,7 +1918,7 @@ def _simulate_batched(
             now_ms = min(wake_times)
             continue
 
-        if len(base) < config.max_batch_requests and config.batch_window_ms > 0:
+        if config.batch_window_ms > 0:
             horizon = now_ms + config.batch_window_ms
             near_future = sorted(
                 (
@@ -1823,9 +1930,21 @@ def _simulate_batched(
             )
             waited = False
             for candidate in near_future:
-                if _wait_for_batch_improves(
-                    base, candidate, active, now_ms, config
-                ):
+                protects_deadline = _defer_batch_for_imminent_work(
+                    base,
+                    modes,
+                    active,
+                    (candidate,),
+                    now_ms,
+                    config,
+                )
+                batching_improves = (
+                    len(base) < config.max_batch_requests
+                    and _wait_for_batch_improves(
+                        base, candidate, active, now_ms, config
+                    )
+                )
+                if protects_deadline or batching_improves:
                     now_ms = candidate.arrival_ms
                     waited = True
                     break

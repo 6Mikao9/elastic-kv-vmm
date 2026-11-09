@@ -9,6 +9,24 @@ from adaptive_sparse.residency_broker import (
 
 
 class ResidencyBrokerTest(unittest.TestCase):
+    def test_incremental_reserved_total_tracks_mixed_updates(self):
+        broker = ResidencyBroker()
+        for key, amount in (("a", 10), ("b", 20), ("c", 30)):
+            broker.try_admit(
+                key,
+                available_bytes=100,
+                fixed_reserve_bytes=0,
+                predicted_growth_bytes=amount,
+            )
+
+        self.assertEqual(broker.reserved_bytes, 60)
+        self.assertEqual(broker.consume("a", bytes_consumed=4), 4)
+        self.assertEqual(broker.reserved_bytes, 56)
+        self.assertEqual(broker.release("b"), 20)
+        self.assertEqual(broker.reserved_bytes, 36)
+        self.assertEqual(broker.release("missing"), 0)
+        self.assertEqual(broker.reserved_bytes, 36)
+
     def test_dry_run_assessment_does_not_mutate_ledger(self):
         broker = ResidencyBroker()
         decision = broker.assess(

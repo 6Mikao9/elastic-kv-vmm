@@ -9,6 +9,7 @@ request-slot, grammar and allocator checks remain authoritative.
 
 from __future__ import annotations
 
+import heapq
 import math
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -301,43 +302,83 @@ def _interval_peak(entries, byte_field, finish_field, *, shared_prefix=False):
             continue
         events.setdefault(start, []).append((1, entry.request_id))
         events.setdefault(finish, []).append((-1, entry.request_id))
+
     active = set()
+    active_bytes = 0
+    shared_deduction = 0
+    group_members = {}
+    group_value_counts = {}
+    group_value_heaps = {}
+
+    def prefix_value(entry):
+        if (
+            not shared_prefix
+            or byte_field != "kv_bytes"
+            or entry.residence != "resident"
+            or not entry.prefix_group
+            or entry.shared_prefix_bytes <= 0
+        ):
+            return None
+        return int(entry.shared_prefix_bytes)
+
+    def update_prefix(group, value, *, add):
+        nonlocal shared_deduction
+        if group is None:
+            return
+        members = group_members.setdefault(group, set())
+        counts = group_value_counts.setdefault(group, {})
+        heap = group_value_heaps.setdefault(group, [])
+        old_count = len(members)
+        old_minimum = heap[0] if old_count > 1 and heap else 0
+        old_contribution = (
+            (old_count - 1) * old_minimum if old_count > 1 else 0
+        )
+        if add:
+            members.add(request_id)
+            counts[value] = counts.get(value, 0) + 1
+            heapq.heappush(heap, value)
+        else:
+            members.remove(request_id)
+            counts[value] -= 1
+            while heap and counts.get(heap[0], 0) == 0:
+                heapq.heappop(heap)
+        new_count = len(members)
+        new_minimum = heap[0] if new_count > 1 and heap else 0
+        new_contribution = (
+            (new_count - 1) * new_minimum if new_count > 1 else 0
+        )
+        shared_deduction += new_contribution - old_contribution
+        if new_count == 0:
+            group_members.pop(group, None)
+            group_value_counts.pop(group, None)
+            group_value_heaps.pop(group, None)
+
     peak = 0
     for instant in sorted(events):
         changes = events[instant]
         # End half-open intervals before starting replacements at the same point.
         for direction, request_id in changes:
-            if direction < 0:
-                active.discard(request_id)
-        for direction, request_id in changes:
-            if direction > 0:
-                active.add(request_id)
-        if not active:
-            continue
-        total = sum(
-            int(getattr(by_id[request_id], byte_field))
-            for request_id in active
-        )
-        if shared_prefix and byte_field == "kv_bytes":
-            groups = {}
-            for request_id in active:
+            if direction < 0 and request_id in active:
                 entry = by_id[request_id]
-                # HiSparse Top-K sets are request-specific and are not
-                # guaranteed to contain the shared prefix.  Only resident
-                # members carry the full prefix and may share that deduction.
-                if (
-                    entry.residence == "resident"
-                    and entry.prefix_group
-                    and entry.shared_prefix_bytes > 0
-                ):
-                    groups.setdefault(entry.prefix_group, []).append(
-                        entry.shared_prefix_bytes
-                    )
-            total -= sum(
-                (len(values) - 1) * min(values)
-                for values in groups.values()
-            )
-        peak = max(peak, total)
+                active.remove(request_id)
+                active_bytes -= int(getattr(entry, byte_field))
+                update_prefix(
+                    entry.prefix_group if prefix_value(entry) is not None else None,
+                    prefix_value(entry),
+                    add=False,
+                )
+        for direction, request_id in changes:
+            if direction > 0 and request_id not in active:
+                entry = by_id[request_id]
+                active.add(request_id)
+                active_bytes += int(getattr(entry, byte_field))
+                update_prefix(
+                    entry.prefix_group if prefix_value(entry) is not None else None,
+                    prefix_value(entry),
+                    add=True,
+                )
+        if active:
+            peak = max(peak, active_bytes - shared_deduction)
     return peak
 
 

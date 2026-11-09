@@ -1,7 +1,7 @@
 {
   "scope": "Deterministic synthetic policy harness; not a GPU serving measurement.",
   "workload": "benchmarks/workloads/known-future-rollout.json",
-  "command": "python scripts/future_plan_compare.py benchmarks/workloads/known-future-rollout.json --emit-policy future --output results/future-planning/known-future-rollout.json",
+  "command": "python scripts/future_plan_compare.py benchmarks/workloads/known-future-rollout.json --policies fifo longest mode-aware future batched online --emit-policy future --output results/future-planning/known-future-rollout.json",
   "policy_metrics": {
     "fifo": {
       "deadline_misses": 3,
@@ -30,13 +30,29 @@
       "weighted_completion_ms": 757.6818181818181,
       "peak_memory_bytes": 4008192,
       "sparse_requests": 6
+    },
+    "batched": {
+      "deadline_misses": 0,
+      "makespan_ms": 2196,
+      "weighted_completion_ms": 772.9545454545454,
+      "peak_memory_bytes": 6524288,
+      "sparse_requests": 6
+    },
+    "online": {
+      "deadline_misses": 0,
+      "makespan_ms": 2052,
+      "weighted_completion_ms": 644.9545454545454,
+      "peak_memory_bytes": 4184192,
+      "sparse_requests": 6
     }
   },
   "observations": [
     "The future policy begins with short deadline work instead of the background request.",
+    "The batched policy protects imminent deadlines from an entire ready cohort; enabling a 200 ms cohort window reduced its misses from two to zero on this trace.",
     "All policy schedules remain within the configured memory budget.",
     "The future policy uses a lower synthetic peak because fewer requests retain full KV.",
-    "Longest makespan is smaller than the future policy's makespan, so deadline protection is a tradeoff rather than a universal throughput win."
+    "Longest makespan is smaller than the future policy's makespan, so deadline protection is a tradeoff rather than a universal throughput win.",
+    "The batched result is a control-policy simulation; missing measured cohort profiles retain serial prefill and linear decode timing."
   ],
   "validation": {
     "image": "lmsysorg/sglang:latest",
@@ -53,6 +69,14 @@
     "remote_source_bytes": 149711657,
     "remote_log": "/home/liuyuntao/experiments/elastic-kv-vmm-5090-20261108/tests-0.5.17-r8-controlled-rollout.log",
     "remote_log_sha256": "8f1bcc8405d200a507b756debe2bed192b90c7fcaae72cbda6abe9cbd4858f40"
+  },
+  "local_cpu_revalidation": {
+    "date": "2026-11-09",
+    "tests_ran": 587,
+    "tests_passed": 583,
+    "tests_skipped": 4,
+    "tests_failed": 0,
+    "scope": "Python 3.12 local CPU suite; CUDA and real SGLang serving remain skipped"
   },
   "not_claimed": [
     "GPU throughput or latency improvement",
