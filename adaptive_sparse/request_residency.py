@@ -62,6 +62,75 @@ def coordinator_broker_snapshot(coordinator: object) -> object | None:
     return snapshot() if callable(snapshot) else snapshot
 
 
+def physical_limited_growth_headroom(
+    logical_available_bytes: int, broker_snapshot: object | None
+) -> tuple[int, int | None]:
+    """Cap a logical growth promise by currently free physical VMM capacity."""
+
+    if (
+        isinstance(logical_available_bytes, bool)
+        or not isinstance(logical_available_bytes, int)
+        or logical_available_bytes < 0
+    ):
+        raise ValueError("logical available bytes must be a nonnegative integer")
+    if broker_snapshot is None:
+        return logical_available_bytes, None
+    if not isinstance(broker_snapshot, Mapping):
+        raise TypeError("global broker snapshot must be an object")
+    physical = broker_snapshot.get("available_bytes")
+    if isinstance(physical, bool) or not isinstance(physical, int) or physical < 0:
+        raise ValueError(
+            "global broker available bytes must be a nonnegative integer"
+        )
+    return min(logical_available_bytes, physical), physical
+
+
+def assess_global_growth_headroom(
+    logical_available_bytes: int,
+    required_bytes: int,
+    broker_snapshot: object | None,
+    *,
+    mode: str,
+    stats: dict[str, object],
+) -> tuple[int, bool]:
+    """Observe or enforce a global VMM limit for one resident claim."""
+
+    if mode not in ("off", "observe", "enforce"):
+        raise ValueError("global growth mode must be off, observe or enforce")
+    if isinstance(required_bytes, bool) or not isinstance(required_bytes, int):
+        raise ValueError("required bytes must be a nonnegative integer")
+    if required_bytes < 0:
+        raise ValueError("required bytes must be a nonnegative integer")
+    if mode == "off":
+        physical_limited_growth_headroom(logical_available_bytes, None)
+        return logical_available_bytes, False
+
+    stats["resident_broker_global_checks"] = (
+        stats.get("resident_broker_global_checks", 0) + 1
+    )
+    if broker_snapshot is None:
+        stats["resident_broker_global_missing"] = (
+            stats.get("resident_broker_global_missing", 0) + 1
+        )
+        return logical_available_bytes, mode == "enforce"
+
+    limited, physical_available = physical_limited_growth_headroom(
+        logical_available_bytes, broker_snapshot
+    )
+    previous = stats.get("resident_broker_global_available_min")
+    stats["resident_broker_global_available_min"] = (
+        physical_available
+        if previous is None
+        else min(previous, physical_available)
+    )
+    if required_bytes > physical_available:
+        stats["resident_broker_global_would_deny"] = (
+            stats.get("resident_broker_global_would_deny", 0) + 1
+        )
+        return limited, mode == "enforce"
+    return limited, False
+
+
 def remember_request_decision(
     stats: dict[str, object],
     request_id: object,
@@ -152,6 +221,17 @@ def install_request_residency():
     broker_mode = os.environ.get("EKV_RESIDENT_BROKER", "off")
     if broker_mode not in ("off", "dry_run", "enforce"):
         raise ValueError("EKV_RESIDENT_BROKER must be off, dry_run or enforce")
+    global_growth_mode = os.environ.get(
+        "EKV_RESIDENT_BROKER_GLOBAL_MODE", "off"
+    ).strip().lower()
+    if global_growth_mode not in ("off", "observe", "enforce"):
+        raise ValueError(
+            "EKV_RESIDENT_BROKER_GLOBAL_MODE must be off, observe or enforce"
+        )
+    if global_growth_mode != "off" and broker_mode == "off":
+        raise ValueError("global resident growth checks require the resident broker")
+    if global_growth_mode == "enforce" and broker_mode != "enforce":
+        raise ValueError("global resident growth enforcement requires broker enforce mode")
     broker_lookahead_tokens = int(
         os.environ.get("EKV_RESIDENT_BROKER_LOOKAHEAD_TOKENS", "256")
     )
@@ -249,6 +329,12 @@ def install_request_residency():
                                      "future_decision_reasons": {},
                                      "broker_dry_run_declines": 0,
                                      "resident_broker_mode": broker_mode,
+                                     "resident_broker_global_mode": global_growth_mode,
+                                     "resident_broker_global_checks": 0,
+                                     "resident_broker_global_would_deny": 0,
+                                     "resident_broker_global_missing": 0,
+                                     "resident_broker_global_declines": 0,
+                                     "resident_broker_global_available_min": None,
                                      "requests": OrderedDict()}
         self._ekv_shared_prefixes = (
             SharedPrefixRegistry() if shared_prefix_mode == "direct" else None
@@ -283,9 +369,29 @@ def install_request_residency():
         pool = self.mem_pool_device
         current_tokens, growth_slots, _, token_bytes = promotion_plan(self, req)
         required_slots = page_aligned_slots(current_tokens, pool.page_size) + growth_slots
+        logical_available = available_tokens * token_bytes
+        required_bytes = (
+            reserve * token_bytes
+            + self._ekv_residency_broker.reserved_bytes
+            + required_slots * token_bytes
+        )
+        broker_snapshot = (
+            coordinator_broker_snapshot(self)
+            if global_growth_mode != "off"
+            else None
+        )
+        limited, global_block = assess_global_growth_headroom(
+            logical_available,
+            required_bytes,
+            broker_snapshot,
+            mode=global_growth_mode,
+            stats=self._ekv_residency_stats,
+        )
+        if global_growth_mode != "off":
+            logical_available = limited
         decision = self._ekv_residency_broker.assess(
             req.kv.req_pool_idx,
-            available_bytes=available_tokens * token_bytes,
+            available_bytes=logical_available,
             fixed_reserve_bytes=reserve * token_bytes,
             predicted_growth_bytes=required_slots * token_bytes,
         )
@@ -293,7 +399,19 @@ def install_request_residency():
             self._ekv_residency_stats.get("resident_broker_promotion_checks", 0) + 1
         )
         publish_broker_stats(self)
-        return broker_mode == "dry_run" or decision.admit
+        admitted = decision.admit and not global_block
+        common_admit = torch.tensor(
+            int(admitted), dtype=torch.int64, device="cpu"
+        )
+        if self.tp_world_size > 1:
+            torch.distributed.all_reduce(
+                common_admit,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_group,
+            )
+        if global_growth_mode == "enforce" and global_block:
+            self._ekv_residency_stats["resident_broker_global_declines"] += 1
+        return broker_mode == "dry_run" or bool(common_admit.item())
 
     def broker_promotion_plan(self, req):
         if broker_mode == "off":
@@ -412,9 +530,15 @@ def install_request_residency():
         elif not slots_available or req.kv.kv_allocated_len <= self.device_buffer_size:
             claim = False
 
+        broker_snapshot = None
+        if claim and (
+            global_fair_mode != "off"
+            or (broker_mode != "off" and global_growth_mode != "off")
+        ):
+            broker_snapshot = coordinator_broker_snapshot(self)
         if claim and global_fair_mode != "off":
             would_yield, fair_block = resident_admission_fairness(
-                coordinator_broker_snapshot(self), global_fair_mode
+                broker_snapshot, global_fair_mode
             )
             stats["global_fair_claim_checks"] += 1
             if would_yield:
@@ -460,14 +584,31 @@ def install_request_residency():
             # the resident staging path.  Calling try_admit independently made
             # an otherwise synchronized request vulnerable to path divergence
             # if one rank's ledger observed a different capacity.
+            logical_available = slots.item() * logical_token_bytes
+            required_bytes = (
+                reserve * logical_token_bytes
+                + self._ekv_residency_broker.reserved_bytes
+                + predicted_growth
+            )
+            limited, global_block = assess_global_growth_headroom(
+                logical_available,
+                required_bytes,
+                broker_snapshot,
+                mode=global_growth_mode,
+                stats=stats,
+            )
+            if global_growth_mode != "off":
+                logical_available = limited
             decision = self._ekv_residency_broker.assess(
                 key,
-                available_bytes=slots.item() * logical_token_bytes,
+                available_bytes=logical_available,
                 fixed_reserve_bytes=reserve * logical_token_bytes,
                 predicted_growth_bytes=predicted_growth,
             )
             broker_admit = torch.tensor(
-                int(decision.admit), dtype=torch.int64, device="cpu"
+                int(decision.admit and not global_block),
+                dtype=torch.int64,
+                device="cpu",
             )
             if self.tp_world_size > 1:
                 torch.distributed.all_reduce(
@@ -476,6 +617,8 @@ def install_request_residency():
                     group=self.tp_group,
                 )
             if not broker_admit.item():
+                if global_growth_mode == "enforce" and global_block:
+                    stats["resident_broker_global_declines"] += 1
                 if broker_mode == "enforce":
                     decline_reason = "broker-insufficient-growth-headroom"
                     adopt_native("broker-insufficient-growth-headroom")

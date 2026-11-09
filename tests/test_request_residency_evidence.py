@@ -3,7 +3,9 @@ from collections import OrderedDict
 from types import SimpleNamespace
 
 from adaptive_sparse.request_residency import (
+    assess_global_growth_headroom,
     coordinator_broker_snapshot,
+    physical_limited_growth_headroom,
     remember_request_decision,
     resident_admission_fairness,
 )
@@ -104,6 +106,95 @@ class RequestResidencyEvidenceTest(unittest.TestCase):
         )
         self.assertEqual(coordinator_broker_snapshot(coordinator), {"fair_mode": "off"})
         self.assertEqual(calls, [True])
+
+    def test_physical_headroom_caps_the_logical_growth_promise(self):
+        self.assertEqual(
+            physical_limited_growth_headroom(1000, {"available_bytes": 600}),
+            (600, 600),
+        )
+        self.assertEqual(
+            physical_limited_growth_headroom(400, {"available_bytes": 600}),
+            (400, 600),
+        )
+        self.assertEqual(
+            physical_limited_growth_headroom(1000, None), (1000, None)
+        )
+
+    def test_physical_headroom_rejects_malformed_inputs(self):
+        for value in (-1, True, 1.5):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "logical available"):
+                    physical_limited_growth_headroom(
+                        value, {"available_bytes": 10}
+                    )
+        with self.assertRaisesRegex(TypeError, "snapshot"):
+            physical_limited_growth_headroom(10, [])
+        for snapshot in ({}, {"available_bytes": -1}, {"available_bytes": True}):
+            with self.subTest(snapshot=snapshot):
+                with self.assertRaisesRegex(ValueError, "available bytes"):
+                    physical_limited_growth_headroom(10, snapshot)
+
+    def test_global_growth_observe_never_blocks_but_records_pressure(self):
+        stats = {}
+        available, block = assess_global_growth_headroom(
+            1000,
+            800,
+            {"available_bytes": 500},
+            mode="observe",
+            stats=stats,
+        )
+        self.assertEqual(available, 500)
+        self.assertFalse(block)
+        self.assertEqual(stats["resident_broker_global_checks"], 1)
+        self.assertEqual(stats["resident_broker_global_would_deny"], 1)
+        self.assertEqual(stats["resident_broker_global_available_min"], 500)
+
+    def test_global_growth_enforce_blocks_and_tracks_missing_capacity(self):
+        stats = {}
+        available, block = assess_global_growth_headroom(
+            1000,
+            800,
+            {"available_bytes": 500},
+            mode="enforce",
+            stats=stats,
+        )
+        self.assertEqual(available, 500)
+        self.assertTrue(block)
+        self.assertEqual(stats["resident_broker_global_would_deny"], 1)
+
+        missing_stats = {}
+        unchanged, block = assess_global_growth_headroom(
+            1000,
+            1,
+            None,
+            mode="enforce",
+            stats=missing_stats,
+        )
+        self.assertEqual(unchanged, 1000)
+        self.assertTrue(block)
+        self.assertEqual(missing_stats["resident_broker_global_missing"], 1)
+
+    def test_global_growth_exact_fit_and_off_mode_are_compatible(self):
+        stats = {}
+        available, block = assess_global_growth_headroom(
+            1000,
+            800,
+            {"available_bytes": 800},
+            mode="enforce",
+            stats=stats,
+        )
+        self.assertEqual(available, 800)
+        self.assertFalse(block)
+        self.assertNotIn("resident_broker_global_would_deny", stats)
+
+        off_stats = {}
+        self.assertEqual(
+            assess_global_growth_headroom(
+                1000, 2000, None, mode="off", stats=off_stats
+            ),
+            (1000, False),
+        )
+        self.assertEqual(off_stats, {})
 
 
 if __name__ == "__main__":

@@ -116,13 +116,32 @@ def validate_resident_hint_options(parser, *, policy, minimum_tokens, resident_l
         parser.error("adaptive resident hints require future hints and request residency")
 
 
-def validate_resident_broker_options(parser, *, mode, lookahead_tokens, resident_limit):
+def validate_resident_broker_options(
+    parser,
+    *,
+    mode,
+    lookahead_tokens,
+    global_mode,
+    resident_limit,
+    vmm_backing,
+    global_broker_path,
+):
     if mode not in ("off", "dry_run", "enforce"):
         parser.error("resident broker mode must be off, dry_run or enforce")
     if lookahead_tokens < 1:
         parser.error("resident broker lookahead must be positive")
     if mode != "off" and not resident_limit:
         parser.error("resident broker requires enabled request residency")
+    if global_mode not in ("off", "observe", "enforce"):
+        parser.error("resident global broker mode must be off, observe or enforce")
+    if global_mode != "off" and mode == "off":
+        parser.error("resident global broker checks require the resident broker")
+    if global_mode == "enforce" and mode != "enforce":
+        parser.error("resident global broker enforcement requires broker enforce mode")
+    if global_mode != "off" and not vmm_backing:
+        parser.error("resident global broker checks require VMM backing")
+    if global_mode != "off" and not global_broker_path:
+        parser.error("resident global broker checks require a global broker path")
 
 
 def validate_shared_prefix_reuse_options(
@@ -199,19 +218,25 @@ def shared_prefix_manifest(mode):
     return {"shared_prefix_reuse": mode}
 
 
-def resident_broker_environment(mode, lookahead_tokens, resident_limit):
+def resident_broker_environment(
+    mode, lookahead_tokens, resident_limit, global_mode="off"
+):
     if not resident_limit or mode == "off":
         return {}
-    return {
+    result = {
         "EKV_RESIDENT_BROKER": mode,
         "EKV_RESIDENT_BROKER_LOOKAHEAD_TOKENS": str(lookahead_tokens),
     }
+    if global_mode != "off":
+        result["EKV_RESIDENT_BROKER_GLOBAL_MODE"] = global_mode
+    return result
 
 
-def resident_broker_manifest(mode, lookahead_tokens):
+def resident_broker_manifest(mode, lookahead_tokens, global_mode="off"):
     return {
         "resident_broker_mode": mode,
         "resident_broker_lookahead_tokens": lookahead_tokens,
+        "resident_broker_global_mode": global_mode,
     }
 
 
@@ -370,6 +395,11 @@ def main():
     parser.add_argument("--shared-prefix-reuse", choices=("off", "direct"), default="off")
     parser.add_argument("--resident-broker", choices=("off", "dry_run", "enforce"), default="off")
     parser.add_argument("--resident-broker-lookahead-tokens", type=int, default=256)
+    parser.add_argument(
+        "--resident-broker-global-mode",
+        choices=("off", "observe", "enforce"),
+        default="off",
+    )
     parser.add_argument("--adaptive-budget-mib", type=int, default=0)
     parser.add_argument("--adaptive-low-mib", type=int, default=0)
     parser.add_argument("--adaptive-prefill-headroom-mib", type=int, default=0)
@@ -538,7 +568,10 @@ def main():
         parser,
         mode=args.resident_broker,
         lookahead_tokens=args.resident_broker_lookahead_tokens,
+        global_mode=args.resident_broker_global_mode,
         resident_limit=args.resident_limit,
+        vmm_backing=args.vmm_backing,
+        global_broker_path=args.global_broker_path,
     )
     validate_shared_prefix_reuse_options(
         parser,
@@ -691,6 +724,7 @@ def main():
                  "EKV_RESIDENT_HINT_POLICY", "EKV_RESIDENT_MIN_HINT_OUTPUT_TOKENS",
                  "EKV_SHARED_PREFIX_REUSE",
                  "EKV_RESIDENT_BROKER", "EKV_RESIDENT_BROKER_LOOKAHEAD_TOKENS",
+                 "EKV_RESIDENT_BROKER_GLOBAL_MODE",
                  "EKV_GLOBAL_BROKER_PATH", "EKV_GLOBAL_BROKER_MIB",
                  "EKV_GLOBAL_BROKER_STALE_SECONDS", "EKV_GLOBAL_BROKER_FAIR_MODE",
                  "EKV_GLOBAL_BROKER_TENANT", "EKV_GLOBAL_BROKER_TENANT_WEIGHT",
@@ -755,7 +789,7 @@ def main():
         ))
         environment.update(resident_broker_environment(
             args.resident_broker, args.resident_broker_lookahead_tokens,
-            args.resident_limit,
+            args.resident_limit, args.resident_broker_global_mode,
         ))
         environment.update(shared_prefix_environment(
             args.shared_prefix_reuse, args.resident_limit
@@ -850,7 +884,8 @@ def main():
             args.resident_hint_policy, args.resident_min_hint_output_tokens
         ),
         **resident_broker_manifest(
-            args.resident_broker, args.resident_broker_lookahead_tokens
+            args.resident_broker, args.resident_broker_lookahead_tokens,
+            args.resident_broker_global_mode,
         ),
         **shared_prefix_manifest(args.shared_prefix_reuse),
         **global_broker_manifest(
@@ -888,7 +923,8 @@ def main():
                    args.resident_hint_policy, args.resident_min_hint_output_tokens
                ),
                **resident_broker_manifest(
-                   args.resident_broker, args.resident_broker_lookahead_tokens
+                   args.resident_broker, args.resident_broker_lookahead_tokens,
+                   args.resident_broker_global_mode,
                ),
                **shared_prefix_manifest(args.shared_prefix_reuse),
                **global_broker_manifest(

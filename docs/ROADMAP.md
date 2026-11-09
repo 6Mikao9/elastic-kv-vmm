@@ -90,8 +90,13 @@ GPU history. A dry-run mode records the decision without changing placement;
 an enforce mode falls back to native HiSparse. Prediction and consumption follow
 the allocator page geometry, and scheduler demotions/promotions update the same
 ledger. This closes a concrete accounting gap between request-count capacity and
-future physical KV demand. Its transition cost and serving benefit still require
-GPU measurement.
+future physical KV demand. An opt-in global mode can observe or enforce the
+same live residency claim against the physical VMM broker available on every TP
+rank. Observe records would-deny and missing-broker evidence without changing
+admission; enforce requires a common all-rank result and falls back to native
+HiSparse on a physical shortfall. The physical broker remains the sole owner of
+live VMM bytes, so predictive reservations are not subtracted twice. Its
+transition cost and serving benefit still require GPU measurement.
 
 Known-future prefill reservation now aggregates the bounded footprint of
 requests inside a configurable horizon.  Request-level full or hot-set KV and

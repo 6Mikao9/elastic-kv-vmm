@@ -168,6 +168,18 @@ For broker arms additionally inspect `request_residency.resident_broker`,
 confirm that dry-run assessments are present, and verify in enforce mode that
 every broker decline fell back to native HiSparse without changing correctness.
 
+The request-growth ledger is predictive and advisory. On a shared GPU, add
+`--resident-broker-global-mode observe` to compare its logical promises with
+the physical capacity remaining in the existing global VMM broker. This emits
+`resident_broker_global_checks`, `resident_broker_global_would_deny`,
+`resident_broker_global_missing`, `resident_broker_global_declines` and
+`resident_broker_global_available_min` without changing admission. Use
+`--resident-broker enforce --resident-broker-global-mode enforce` only after
+that run shows no missing broker state. Every TP rank then requires enough
+physical VMM headroom before taking the resident path; a local shortfall or
+missing snapshot becomes a common native-HiSparse fallback. Neither mode adds
+the predictive growth reservation to physical usage a second time.
+
 The summarizer requires a completed outer `results.json`, the matching
 `source_manifest.json`, consistent runtime capacity and timing without
 intrusive diagnostics. Plotting also checks common inference arguments,

@@ -152,17 +152,19 @@ class ResidentHintRunnerOptionsTest(unittest.TestCase):
 
     def test_broker_environment_and_manifest_are_explicit(self):
         self.assertEqual(
-            resident_broker_environment("enforce", 256, 2),
+            resident_broker_environment("enforce", 256, 2, "enforce"),
             {
                 "EKV_RESIDENT_BROKER": "enforce",
                 "EKV_RESIDENT_BROKER_LOOKAHEAD_TOKENS": "256",
+                "EKV_RESIDENT_BROKER_GLOBAL_MODE": "enforce",
             },
         )
         self.assertEqual(
-            resident_broker_manifest("dry_run", 256),
+            resident_broker_manifest("dry_run", 256, "observe"),
             {
                 "resident_broker_mode": "dry_run",
                 "resident_broker_lookahead_tokens": 256,
+                "resident_broker_global_mode": "observe",
             },
         )
         self.assertEqual(resident_broker_environment("enforce", 256, 0), {})
@@ -330,18 +332,59 @@ class ResidentHintRunnerOptionsTest(unittest.TestCase):
 
     def test_broker_requires_residency_and_positive_lookahead(self):
         parser = argparse.ArgumentParser()
-        cases = (("enforce", 256, 0), ("dry_run", 0, 2))
-        for mode, lookahead, limit in cases:
-            with self.subTest(mode=mode, lookahead=lookahead, limit=limit):
+        cases = (
+            ("enforce", 256, "off", 0, False, None),
+            ("dry_run", 0, "off", 2, False, None),
+            ("off", 256, "observe", 2, True, "/run/ekv/gpu.sqlite"),
+            ("dry_run", 256, "enforce", 2, True, "/run/ekv/gpu.sqlite"),
+            ("enforce", 256, "observe", 2, False, "/run/ekv/gpu.sqlite"),
+            ("enforce", 256, "observe", 2, True, None),
+        )
+        for mode, lookahead, global_mode, limit, vmm, path in cases:
+            with self.subTest(
+                mode=mode,
+                lookahead=lookahead,
+                global_mode=global_mode,
+                limit=limit,
+                vmm=vmm,
+                path=path,
+            ):
                 with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
                     validate_resident_broker_options(
                         parser,
                         mode=mode,
                         lookahead_tokens=lookahead,
+                        global_mode=global_mode,
                         resident_limit=limit,
+                        vmm_backing=vmm,
+                        global_broker_path=path,
                     )
         validate_resident_broker_options(
-            parser, mode="enforce", lookahead_tokens=256, resident_limit=2
+            parser,
+            mode="dry_run",
+            lookahead_tokens=256,
+            global_mode="observe",
+            resident_limit=2,
+            vmm_backing=True,
+            global_broker_path="/run/ekv/gpu.sqlite",
+        )
+        validate_resident_broker_options(
+            parser,
+            mode="enforce",
+            lookahead_tokens=256,
+            global_mode="off",
+            resident_limit=2,
+            vmm_backing=False,
+            global_broker_path=None,
+        )
+        validate_resident_broker_options(
+            parser,
+            mode="enforce",
+            lookahead_tokens=256,
+            global_mode="enforce",
+            resident_limit=2,
+            vmm_backing=True,
+            global_broker_path="/run/ekv/gpu.sqlite",
         )
 
 
