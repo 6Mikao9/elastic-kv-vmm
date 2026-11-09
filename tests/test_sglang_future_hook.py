@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import unittest
@@ -303,6 +304,23 @@ class SGLangFutureHookTest(unittest.TestCase):
             withhold_incomplete_cohorts(queue, now_s=2.0),
             [],
         )
+        self.assertEqual(snapshot_stats()["cohort_gate_timeouts"] - before, 1)
+
+    def test_zero_cohort_timeout_does_not_hold_a_partial_cohort(self):
+        first = request(
+            "first",
+            10,
+            1.0,
+            {"cohort_id": "batch-0", "cohort_size": 2},
+            version="4",
+        )
+        queue = [first]
+        before = snapshot_stats()["cohort_gate_timeouts"]
+
+        held = withhold_incomplete_cohorts(queue, now_s=1.0, timeout_ms=0)
+
+        self.assertEqual(held, [])
+        self.assertEqual(queue, [first])
         self.assertEqual(snapshot_stats()["cohort_gate_timeouts"] - before, 1)
 
     def test_completed_cohort_is_not_reheld_after_native_partial_admission(self):
@@ -1013,6 +1031,47 @@ class SGLangFutureHookTest(unittest.TestCase):
                 loaded["stats_shards"][0]["stats"]["stats_identity"]["tp_rank"],
                 3,
             )
+
+    def test_load_stats_keeps_rank_documents_and_sums_errors(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory) / "future.json"
+            first = base.with_name("future.rank-a.json")
+            second = base.with_name("future.rank-b.json")
+            first.write_text(
+                json.dumps(
+                    {
+                        "ticks": 8,
+                        "prefill_batches": 2,
+                        "complete_cohort_batches": 1,
+                        "telemetry_errors": 2,
+                        "cohort_gate_errors": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            second.write_text(
+                json.dumps(
+                    {
+                        "ticks": 7,
+                        "prefill_batches": 1,
+                        "complete_cohort_batches": 0,
+                        "telemetry_errors": 3,
+                        "cohort_gate_errors": 2,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            loaded = hook.load_stats(base)
+
+        self.assertEqual(loaded["ticks"], 8)
+        self.assertEqual(loaded["telemetry_errors"], 5)
+        self.assertEqual(loaded["cohort_gate_errors"], 3)
+        self.assertEqual(loaded["shard_count"], 2)
+        self.assertEqual(len(loaded["stats_shards"]), 2)
 
 
 if __name__ == "__main__":

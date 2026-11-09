@@ -637,7 +637,7 @@ def withhold_incomplete_cohorts(
             del _cohort_timed_out[cohort_id]
         first_seen = _cohort_first_seen_s.setdefault(cohort_id, now)
         waited_ms = max(0.0, (now - first_seen) * 1000.0)
-        if waited_ms > timeout_ms:
+        if waited_ms >= timeout_ms:
             _stats["cohort_gate_timeouts"] += 1
             del _cohort_first_seen_s[cohort_id]
             _cohort_timed_out[cohort_id] = signature
