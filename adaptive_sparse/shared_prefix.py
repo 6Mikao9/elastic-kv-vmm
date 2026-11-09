@@ -438,7 +438,8 @@ class SharedPrefixRegistry:
         rows = index.get(key)
         if not rows:
             return None
-        for row in sorted(rows):
+        selected = None
+        for row in rows:
             if row == exclude_row:
                 continue
             source = self._sources.get(row)
@@ -447,8 +448,9 @@ class SharedPrefixRegistry:
             if getattr(source.request, "hisparse_staging", False):
                 self.stats["staging_sources"] += 1
                 continue
-            return source
-        return None
+            if selected is None or row < selected.row:
+                selected = source
+        return selected
 
     def _discard_source_index(self, row: int) -> None:
         key = self._source_keys.pop(row, None)

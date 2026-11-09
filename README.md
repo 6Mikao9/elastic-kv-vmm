@@ -386,9 +386,13 @@ feasible slack. Intervals already backlogged past their planned finish retain a
 predicted service duration from their actual start.
 Shared immutable prefixes are also carried through the validated future hint;
 resident requests in one `prefix_group` are charged one prefix copy in the
-planner and future reservation model. The current runtime does not yet bind
-Top-K reads to another request's resident prefix, so this is not a measured
-serving-memory result.
+planner and future reservation model. Planner credit still requires an explicit
+runtime hit: with
+`--shared-prefix-reuse direct`, complete Top-K blocks may instead read the
+verified resident pages of a live full-residency source. The scheduler indexes
+sources by fingerprint and group geometry, batches all per-layer address
+resolution, and batches native fallback for partial rows. This path remains
+opt-in and its serving-memory and TPOT benefit is not yet measured.
 The 0.5.17 API and request-transport tests pass; a real model server could not
 start on the available 5090 host because PyTorch CUDA initialization failed after
 container `nvidia-smi` succeeded. That blocker is recorded without converting it

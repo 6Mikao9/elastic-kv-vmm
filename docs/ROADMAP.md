@@ -236,18 +236,17 @@ peak from four shared chunks to one while retaining the private arm's
 active-request capacity. A real trace, GPU mapping cost and serving comparison
 remain open.
 
-Separately, explore reuse of identical prefix KV that another request still
-holds on the GPU. A HiSparse Top-K lookup could first resolve a compatible
-shared GPU copy and avoid host-to-device fetch when available. Begin with
-immutable complete prefix blocks and device-to-device fill of the existing
-hot buffer; evaluate direct shared reads only after correctness. Identity
-must include model/weight version, full prefix, position/RoPE, adapter and
-other input-dependent conditions. Protect shared and in-flight references,
-use copy-on-write for mutable tails, and version mappings across eviction
-or migration. Pinned shared chunks can reduce reclamation, so their budget
-cost must be included. Benchmark against equivalent native prefix-cache
-settings; this potential benefit is not automatic from VMM and has not yet
-been measured in the current radix-disabled MiniMax experiments.
+The direct shared-prefix path now resolves complete immutable prefix blocks in
+a live full-resident MiniMax request and fills the HiSparse hot-buffer output
+without host staging for those blocks. Identity includes the full prefix,
+cache salt, adapters, request kind and available multimodal constraints;
+partial or unverifiable blocks remain native. The registry indexes sources by
+fingerprint and group geometry, and each layer batches GPU address resolution
+plus native fallback. Source ownership and VMM leases remain authoritative, so
+consumers fall back if the source is demoted or removed. This is a CPU/API
+implementation with tensor-equivalence coverage; the current radix-disabled
+MiniMax experiments still need paired correctness, host-transfer and TPOT
+measurement. Pinning pages after a source completes remains future work.
 
 ## Deferred research
 
