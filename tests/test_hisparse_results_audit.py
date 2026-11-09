@@ -87,7 +87,7 @@ class HiSparseResultsAuditTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "stored peaks differ for phases"):
             audit(self.arm, 3)
 
-    def test_vmm_requires_all_four_rank_files(self):
+    def setup_vmm(self, *, pending_reclamation=False):
         snapshots = [
             {"tp_rank": rank, "tp_size": 4, "idle": True, "owned_pages": 0,
              "reclaimable_bytes": 0, "backed_bytes": 2, "peak_backed_bytes": 6,
@@ -100,9 +100,30 @@ class HiSparseResultsAuditTest(unittest.TestCase):
         stats = self.arm / "vmm_stats"
         stats.mkdir()
         for rank, snapshot in enumerate(snapshots):
-            (stats / f"tp-{rank}.json").write_text(json.dumps(snapshot), encoding="utf-8")
+            disk = dict(snapshot)
+            if pending_reclamation:
+                pending = 720 << 20
+                disk.update(reclaimable_bytes=pending, backed_bytes=pending + 2,
+                            peak_backed_bytes=pending + 6)
+            (stats / f"tp-{rank}.json").write_text(json.dumps(disk), encoding="utf-8")
+        return stats
+
+    def test_vmm_requires_all_four_rank_files(self):
+        stats = self.setup_vmm()
         _, _, _, report = audit(self.arm, 3)
         self.assertEqual(report["vmm_rank_evidence"], "verified")
         (stats / "tp-3.json").unlink()
         with self.assertRaisesRegex(ValueError, "Incomplete VMM rank evidence"):
+            audit(self.arm, 3)
+
+    def test_vmm_allows_later_pending_reclamation_after_semantic_probes(self):
+        self.setup_vmm(pending_reclamation=True)
+        _, _, _, report = audit(self.arm, 3)
+        self.assertEqual(report["vmm_rank_evidence"], "verified")
+
+    def test_vmm_still_requires_cleanup_at_benchmark_idle_checkpoint(self):
+        self.setup_vmm()
+        self.edit("results.json",
+                  lambda data: data["vmm_idle"][0].update(reclaimable_bytes=1))
+        with self.assertRaisesRegex(ValueError, "Incomplete benchmark idle cleanup"):
             audit(self.arm, 3)

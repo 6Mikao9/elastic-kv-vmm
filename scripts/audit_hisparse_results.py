@@ -73,10 +73,16 @@ def audit_vmm(directory, outer, manifest, ranks):
             "Incomplete VMM rank evidence")
     for rank, snapshot in enumerate(sorted(idle, key=lambda row: row["tp_rank"])):
         disk = read_json(directory / "vmm_stats" / f"tp-{rank}.json")
+        require(snapshot["owned_pages"] == snapshot["reclaimable_bytes"] == 0,
+                f"Incomplete benchmark idle cleanup for VMM rank {rank}")
+        # The on-disk snapshot may have been updated during the later semantic probes.
         for row in (snapshot, disk):
             require(row["tp_rank"] == rank and row["tp_size"] == ranks
-                    and row["idle"] is True and row["owned_pages"] == row["reclaimable_bytes"] == 0
-                    and 0 <= row["backed_bytes"] <= row["peak_backed_bytes"]
+                    and row["idle"] is True
+                    and all(type(row[key]) is int and row[key] >= 0 for key in (
+                        "owned_pages", "reclaimable_bytes", "backed_bytes", "peak_backed_bytes",
+                    ))
+                    and row["reclaimable_bytes"] <= row["backed_bytes"] <= row["peak_backed_bytes"]
                     and (not manifest["resident_limit"]
                          or row["request_residency"]["resident_layer_rows"] > 0),
                     f"Invalid VMM idle or residency evidence for rank {rank}")
@@ -189,7 +195,9 @@ def main(argv=None):
         "scope": (
             "Checks result artifact consistency. Model, image, source provenance and external "
             "GPU runtime/resource evidence are not verified. Token hashes validate recorded "
-            "output IDs only and do not establish KV byte correctness."
+            "output IDs only and do not establish KV byte correctness. VMM cleanup is checked "
+            "at the benchmark idle checkpoint. Later per-rank files can include pending "
+            "reclamation after semantic probes."
         ),
     }, indent=2))
     return 0

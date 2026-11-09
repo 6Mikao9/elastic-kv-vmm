@@ -42,6 +42,11 @@ recomputes both per-rank peaks and the synchronized total peak. VMM-enabled arms
 must provide all four rank files and idle snapshots rather than silently losing
 their backing evidence.
 
+The benchmark idle checkpoint precedes the semantic smoke. Later per-rank files
+can still contain reclaimable chunks from those additional requests during the
+idle grace period. Require completed cleanup in the captured benchmark checkpoint;
+do not impose that earlier boundary on the later disk snapshots.
+
 The historical native artifacts pass this audit. Its report explicitly leaves
 model/image/source provenance and external GPU runtime evidence unverified.
 Review those against the frozen source, container identity, controller and
