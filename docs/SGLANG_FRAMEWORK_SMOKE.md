@@ -97,3 +97,22 @@ runner 现在会落盘逐请求 TTFT、TPOT、总延迟、输出 token/s、整�
 同时修正了 baseline 基准脚本错误地要求读取 VMM 专有
 `adapter_stats.json` 的问题。baseline 现在使用整卡 NVML；V5 使用 NVML 加适配器
 逻辑/物理 backing telemetry。
+
+## 2026-11-09 request-affine VMM 集成复核
+
+在 5090 宿主机新增 clean snapshot
+`/home/liuyuntao/experiments/elastic-kv-vmm-5090-20261108/src-r23-request-affine-final`，
+对应提交 `39ea49fa5850d7ea0f44b22b794d6eb18f2bd677`。使用既有
+`lmsysorg/sglang:latest` 镜像（SGLang 0.5.17），以 `--network none`、不授予 GPU、
+源码只读挂载的隔离容器执行完整测试。快照为 171,167,267 bytes，结果为
+**461 passed, 2 skipped, 146 subtests passed**；两个 skip 都需要真实 CUDA device。
+日志为 `tests-0.5.17-r23-request-affine-final.log`，SHA256
+`cb5bf517f71498ca2a89a91338e68fd024b0ee1ca78ba8fbb383681477d266d3`。
+
+本轮验证了 0.5.17 `alloc_for_extend` / `alloc_for_decode` 请求身份注入、
+request-private chunk 增长与释放、池尾 chunk、`FreeSlots` 守恒、physical chunk
+预检回退，以及 SGLang 实际 import/install 路径。另以 0.5.2 源码形状验证
+`ScheduleBatch.alloc_token_slots` extend/decode 包装。它仍不是 CUDA smoke：
+GPU0/1/3 在容器退出后为 2 MiB / 0%，GPU2 仍为 `Unknown Error`，宿主 CUDA
+runtime 也未恢复。因此本轮不报告 serving 吞吐、TTFT、TPOT、整卡显存或 mapping
+延迟收益。

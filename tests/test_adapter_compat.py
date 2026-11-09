@@ -474,6 +474,18 @@ class AdapterCompatibilityTest(unittest.TestCase):
             self.assertEqual(demand.projected_tokens, 110)
             self.assertIsNone(allocator.demands)
 
+            req.output_ids = [0] * 18
+            batch.seq_lens = [39]
+            batch.forward_mode = SimpleNamespace(is_decode=lambda: True)
+            self.assertEqual(
+                schedule_batch.ScheduleBatch.alloc_token_slots(batch, 1),
+                "tokens-result",
+            )
+            decode_demand = observed[1][0][0]
+            self.assertEqual(decode_demand.slots, 1)
+            self.assertEqual(decode_demand.projected_tokens, 110)
+            self.assertIsNone(allocator.demands)
+
     def test_physical_preflight_counts_private_chunks(self):
         residency = object.__new__(adapter.Residency)
         residency.admission_policy = "physical"
