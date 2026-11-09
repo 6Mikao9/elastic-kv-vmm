@@ -190,6 +190,52 @@ class KindServiceProfile:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class DecodeBatchProfile:
+    """Measured aggregate decode throughput at one co-active batch size.
+
+    The values describe all streams in the batch, not one request. The planner
+    divides by the measured batch size before estimating an individual decode
+    duration. A missing mode inherits the ordinary per-kind rate, so operators
+    can publish only the measurements they actually have.
+    """
+
+    resident_tokens_per_ms: float | None = None
+    sparse_tokens_per_ms: float | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("resident_tokens_per_ms", "sparse_tokens_per_ms"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise ValueError(f"{name} must be a finite positive number or None")
+        if self.resident_tokens_per_ms is None and self.sparse_tokens_per_ms is None:
+            raise ValueError(
+                "decode batch profile requires resident or sparse throughput"
+            )
+
+    def rate(self, mode: ResidencyMode) -> float | None:
+        if mode is ResidencyMode.RESIDENT:
+            return self.resident_tokens_per_ms
+        return self.sparse_tokens_per_ms
+
+    def as_dict(self) -> dict[str, float]:
+        return {
+            key: value
+            for key, value in (
+                ("resident_tokens_per_ms", self.resident_tokens_per_ms),
+                ("sparse_tokens_per_ms", self.sparse_tokens_per_ms),
+            )
+            if value is not None
+        }
+
+
 def normalize_kind_profiles(
     value: object,
 ) -> tuple[tuple[str, KindServiceProfile], ...]:
@@ -221,6 +267,48 @@ def normalize_kind_profiles(
     return tuple(sorted(profiles.items()))
 
 
+def normalize_decode_batch_profiles(
+    value: object,
+) -> tuple[tuple[int, DecodeBatchProfile], ...]:
+    """Validate and canonicalize measured batch-size throughput profiles."""
+
+    raw_profiles: Iterable[tuple[object, object]]
+    if isinstance(value, Mapping):
+        raw_profiles = value.items()
+    elif isinstance(value, (tuple, list)):
+        raw_profiles = value
+    else:
+        raise ValueError(
+            "decode_batch_profiles must be a mapping or pair sequence"
+        )
+    profiles: dict[int, DecodeBatchProfile] = {}
+    for item in raw_profiles:
+        if not isinstance(item, (tuple, list)) or len(item) != 2:
+            raise ValueError(
+                "decode_batch_profiles entries must be batch/profile pairs"
+            )
+        raw_batch_size, raw_profile = item
+        if isinstance(raw_batch_size, str) and raw_batch_size.isdecimal():
+            batch_size = int(raw_batch_size)
+        elif isinstance(raw_batch_size, bool):
+            raise ValueError("decode batch size must be an integer")
+        else:
+            batch_size = raw_batch_size
+        _bounded_int(batch_size, "decode batch size", minimum=1)
+        if batch_size in profiles:
+            raise ValueError(f"duplicate decode batch profile: {batch_size}")
+        if isinstance(raw_profile, DecodeBatchProfile):
+            profile = raw_profile
+        elif isinstance(raw_profile, Mapping):
+            profile = DecodeBatchProfile(**dict(raw_profile))
+        else:
+            raise ValueError(
+                f"decode batch profile for {batch_size} must be an object"
+            )
+        profiles[batch_size] = profile
+    return tuple(sorted(profiles.items()))
+
+
 @dataclass(frozen=True, slots=True)
 class PlannerConfig:
     """Conservative per-instance resource model.
@@ -242,6 +330,10 @@ class PlannerConfig:
     lookahead_ms: int = 0
     auto_resident_output_threshold: int = 1
     active_prefix_prefill_reuse: bool = False
+    decode_batch_profiles: (
+        tuple[tuple[int, DecodeBatchProfile], ...]
+        | Mapping[int | str, DecodeBatchProfile | Mapping[str, object]]
+    ) = ()
     oracle_max_expansions: int = 100_000
     online_max_rollouts: int = 2_000
     kind_profiles: (
@@ -287,6 +379,11 @@ class PlannerConfig:
         object.__setattr__(
             self, "kind_profiles", normalize_kind_profiles(self.kind_profiles)
         )
+        object.__setattr__(
+            self,
+            "decode_batch_profiles",
+            normalize_decode_batch_profiles(self.decode_batch_profiles),
+        )
 
     def profile_for(self, kind: str) -> KindServiceProfile:
         """Return explicit kind overrides, or an all-inherited profile."""
@@ -311,6 +408,36 @@ class PlannerConfig:
     def sparse_hot_tokens_for(self, kind: str) -> int:
         override = self.profile_for(kind).sparse_hot_tokens
         return self.sparse_hot_tokens if override is None else override
+
+    def decode_batch_profile(self, batch_size: int) -> DecodeBatchProfile | None:
+        """Return an exact measured profile, or ``None`` for linear fallback."""
+
+        _bounded_int(batch_size, "batch_size", minimum=1)
+        for candidate, profile in self.decode_batch_profiles:
+            if candidate == batch_size:
+                return profile
+        return None
+
+    def decode_rate_for_batch(
+        self,
+        kind: str,
+        mode: ResidencyMode,
+        batch_size: int,
+    ) -> float:
+        """Return estimated per-stream decode throughput.
+
+        Measured profiles contain aggregate batch throughput. Requests without
+        an exact profile or mode measurement keep the ordinary per-kind rate;
+        the planner never invents interpolation between measurements.
+        """
+
+        profile = self.decode_batch_profile(batch_size)
+        if profile is None:
+            return self.decode_rate(kind, mode)
+        aggregate_rate = profile.rate(mode)
+        if aggregate_rate is None:
+            return self.decode_rate(kind, mode)
+        return aggregate_rate / batch_size
 
     def prefill_workspace_rate(self, kind: str) -> int:
         override = self.profile_for(kind).prefill_workspace_bytes_per_token
@@ -337,6 +464,10 @@ class PlannerConfig:
             "lookahead_ms": self.lookahead_ms,
             "auto_resident_output_threshold": self.auto_resident_output_threshold,
             "active_prefix_prefill_reuse": self.active_prefix_prefill_reuse,
+            "decode_batch_profiles": {
+                str(batch_size): profile.as_dict()
+                for batch_size, profile in self.decode_batch_profiles
+            },
             "oracle_max_expansions": self.oracle_max_expansions,
             "online_max_rollouts": self.online_max_rollouts,
             "kind_profiles": {
@@ -344,6 +475,36 @@ class PlannerConfig:
                 for kind, profile in self.kind_profiles
             },
         }
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeCapabilities:
+    """Capabilities that a rollout executor must verify before execution."""
+
+    radix_cache_enabled: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.radix_cache_enabled, bool):
+            raise ValueError("radix_cache_enabled must be a boolean")
+
+    def as_dict(self) -> dict[str, object]:
+        return {"radix_cache_enabled": self.radix_cache_enabled}
+
+
+def validate_runtime_capabilities(
+    config: PlannerConfig,
+    capabilities: RuntimeCapabilities,
+) -> None:
+    """Reject a plan whose timing claims the live executor cannot provide."""
+
+    if (
+        config.active_prefix_prefill_reuse
+        and not capabilities.radix_cache_enabled
+    ):
+        raise ValueError(
+            "active_prefix_prefill_reuse requires the execution device's "
+            "SGLang radix cache to be enabled"
+        )
 
 
 def _bounded_int(
@@ -376,6 +537,7 @@ class Admission:
     resident_kv_bytes: int
     prefill_workspace_bytes: int
     reason: str
+    decode_batch_size: int = 1
 
     @property
     def startup_delay_ms(self) -> int:
@@ -437,6 +599,7 @@ class PlanResult:
                     "resident_kv_bytes": item.resident_kv_bytes,
                     "prefill_workspace_bytes": item.prefill_workspace_bytes,
                     "reason": item.reason,
+                    "decode_batch_size": item.decode_batch_size,
                 }
                 for item in self.admissions
             ],
@@ -456,6 +619,7 @@ class RolloutSubmission:
     output_tokens: int
     hint: dict[str, object]
     deadline_ms: int | None = None
+    decode_batch_size: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -471,6 +635,7 @@ class RolloutPlan:
     simulation: PlanResult
     submissions: tuple[RolloutSubmission, ...]
     planner_config: PlannerConfig | None = None
+    runtime_capabilities: RuntimeCapabilities | None = None
 
     def as_dict(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -487,12 +652,15 @@ class RolloutPlan:
                     "output_tokens": item.output_tokens,
                     "hint": item.hint,
                     "deadline_ms": item.deadline_ms,
+                    "decode_batch_size": item.decode_batch_size,
                 }
                 for item in self.submissions
             ],
         }
         if self.planner_config is not None:
             payload["planner_config"] = self.planner_config.as_dict()
+        if self.runtime_capabilities is not None:
+            payload["runtime_capabilities"] = self.runtime_capabilities.as_dict()
         return payload
 
 
@@ -504,6 +672,17 @@ class _Active:
 
 def _ceil_duration(tokens: int, rate: float) -> int:
     return max(1, math.ceil(tokens / rate))
+
+
+def _decode_batch_size(
+    active: Sequence[_Active],
+    extra_placements: Sequence[tuple[RequestProfile, ResidencyMode]],
+    config: PlannerConfig,
+) -> int:
+    return min(
+        config.max_active_requests,
+        len(active) + len(extra_placements) + 1,
+    )
 
 
 def _hold_bytes(request: RequestProfile, mode: ResidencyMode, config: PlannerConfig) -> int:
@@ -618,16 +797,27 @@ def _duration_ms(
         config,
         extra_placements=extra_placements,
     )
+    batch_size = _decode_batch_size(active, extra_placements, config)
     decode = _ceil_duration(
-        request.output_tokens, config.decode_rate(request.kind, mode)
+        request.output_tokens,
+        config.decode_rate_for_batch(request.kind, mode, batch_size),
     )
     return prefill + decode
 
 
-def _urgency(request: RequestProfile, now_ms: int, config: PlannerConfig) -> float:
+def _urgency(
+    request: RequestProfile,
+    active: Sequence[_Active],
+    now_ms: int,
+    config: PlannerConfig,
+) -> float:
     if request.deadline_ms is None:
         return 0.0
-    slack = request.deadline_ms - now_ms - _duration_ms(request, ResidencyMode.RESIDENT, config)
+    slack = (
+        request.deadline_ms
+        - now_ms
+        - _duration_ms(request, ResidencyMode.RESIDENT, config, active)
+    )
     horizon = max(1, config.lookahead_ms or 1)
     if slack < 0:
         return 1.0 + min(1.0, -slack / horizon)
@@ -834,7 +1024,7 @@ def _select(
         ranked = sorted(
             pending,
             key=lambda item: (
-                -_urgency(item, now_ms, config),
+                -_urgency(item, active, now_ms, config),
                 -item.priority,
                 _hold_bytes(item, ResidencyMode.RESIDENT, config),
                 item.request_id,
@@ -883,7 +1073,7 @@ def _select(
             displaced = _future_contention(
                 choice, mode, active, pending, future, now_ms, config
             )
-            urgency = _urgency(choice, now_ms, config)
+            urgency = _urgency(choice, active, now_ms, config)
             # Priority and deadlines decide whether work is worth reserving.
             # Sparse placement is cheaper for following requests, while its
             # decode slowdown remains an explicit cost in the simulator.
@@ -916,10 +1106,6 @@ def _select(
         choice, mode, active, future, now_ms, config
     ):
         return None
-    if _prefill_duration(choice, active, config) < _ceil_duration(
-        choice.prompt_tokens, config.prefill_rate(choice.kind)
-    ):
-        reason = f"{reason}+active-prefix-reuse"
     return choice, mode, reason
 
 
@@ -995,6 +1181,7 @@ def _admission_child(
         resident_kv_bytes=hold,
         prefill_workspace_bytes=workspace,
         reason=reason,
+        decode_batch_size=_decode_batch_size(active, (), config),
     )
     return _OracleState(
         now_ms=state.now_ms + prefill,
@@ -1379,6 +1566,7 @@ def _simulate_heuristic_from_state(
                 resident_kv_bytes=hold,
                 prefill_workspace_bytes=workspace,
                 reason=reason,
+                decode_batch_size=_decode_batch_size(active, (), config),
             )
             aggregate, shared_credit = _placement_memory(
                 (
@@ -1575,6 +1763,7 @@ def plan_rollout(
     policy: str = "future",
     *,
     simulation: PlanResult | None = None,
+    runtime_capabilities: RuntimeCapabilities | None = None,
 ) -> RolloutPlan:
     """Convert a simulated policy into delayed submissions and runtime hints.
 
@@ -1594,6 +1783,8 @@ def plan_rollout(
         raise ValueError(
             f"simulation policy {simulation.policy!r} does not match {policy!r}"
         )
+    capabilities = runtime_capabilities or RuntimeCapabilities()
+    validate_runtime_capabilities(config, capabilities)
     workload_ids = {item.request_id for item in workload}
     admission_ids = {item.request_id for item in simulation.admissions}
     if workload_ids != admission_ids or len(workload_ids) != len(simulation.admissions):
@@ -1616,7 +1807,12 @@ def plan_rollout(
                 config.prefill_rate(request.kind) * 1000.0
             ),
             "decode_tokens_per_s": (
-                config.decode_rate(request.kind, admission.mode) * 1000.0
+                config.decode_rate_for_batch(
+                    request.kind,
+                    admission.mode,
+                    admission.decode_batch_size,
+                )
+                * 1000.0
             ),
         }
         if request.deadline_ms is not None:
@@ -1637,9 +1833,10 @@ def plan_rollout(
                 output_tokens=request.output_tokens,
                 hint=hint,
                 deadline_ms=request.deadline_ms,
+                decode_batch_size=admission.decode_batch_size,
             )
         )
-    return RolloutPlan(simulation, tuple(submissions), config)
+    return RolloutPlan(simulation, tuple(submissions), config, capabilities)
 
 
 def _load_workload(
@@ -1716,6 +1913,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--emit-policy", choices=POLICIES)
     parser.add_argument(
+        "--radix-cache-enabled",
+        action="store_true",
+        help=(
+            "declare that the rollout runtime has SGLang radix cache enabled; "
+            "required by active_prefix_prefill_reuse"
+        ),
+    )
+    parser.add_argument(
         "--policies",
         nargs="+",
         choices=POLICIES,
@@ -1735,6 +1940,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             config,
             args.emit_policy,
             simulation=simulations[args.emit_policy],
+            runtime_capabilities=RuntimeCapabilities(
+                radix_cache_enabled=args.radix_cache_enabled
+            ),
         ).as_dict()
     rendered = json.dumps(payload, indent=2, sort_keys=True)
     if args.output is None:

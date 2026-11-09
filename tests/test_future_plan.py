@@ -6,15 +6,18 @@ import unittest
 from dataclasses import replace
 
 from adaptive_sparse.future_plan import (
+    DecodeBatchProfile,
     KindServiceProfile,
     PlanResult,
     PlannerConfig,
     RequestProfile,
     ResidencyMode,
+    RuntimeCapabilities,
     compare,
     main,
     plan_rollout,
     simulate,
+    validate_runtime_capabilities,
 )
 from adaptive_sparse.sglang_future_hook import FutureHint
 
@@ -656,11 +659,75 @@ class FuturePlanTest(unittest.TestCase):
             enabled_by_id["reuse"].finish_ms - disabled_by_id["reuse"].finish_ms,
             -999,
         )
-        self.assertIn("active-prefix-reuse", enabled_by_id["reuse"].reason)
+        self.assertEqual(
+            enabled_by_id["reuse"].reason,
+            "hint-resident+active-prefix-reuse",
+        )
         self.assertEqual(enabled_by_id["anchor"], disabled_by_id["anchor"])
         self.assertEqual(enabled.peak_memory_bytes, disabled.peak_memory_bytes)
         self.assertEqual(enabled.peak_memory_bytes, 11_010)
         self.assertEqual(enabled.peak_shared_prefix_credit_bytes, 1000)
+
+    def test_active_prefix_reuse_updates_deadline_urgency_ranking(self):
+        config = PlannerConfig(
+            memory_budget_bytes=50_000,
+            kv_bytes_per_token=1,
+            prefill_workspace_bytes_per_token=0,
+            sparse_hot_tokens=100,
+            prefill_tokens_per_ms=1,
+            resident_decode_tokens_per_ms=100,
+            sparse_decode_tokens_per_ms=50,
+            max_active_requests=3,
+            active_prefix_prefill_reuse=True,
+        )
+        workload = (
+            RequestProfile(
+                "donor",
+                arrival_ms=0,
+                prompt_tokens=1000,
+                output_tokens=10_000,
+                kind="chat",
+                prefix_group="system-prefix",
+                shared_prefix_tokens=1000,
+                residence_hint="resident",
+            ),
+            RequestProfile(
+                "reuse",
+                arrival_ms=1000,
+                prompt_tokens=1000,
+                output_tokens=1000,
+                kind="chat",
+                deadline_ms=2999,
+                prefix_group="system-prefix",
+                shared_prefix_tokens=1000,
+                residence_hint="resident",
+            ),
+            RequestProfile(
+                "fresh",
+                arrival_ms=1000,
+                prompt_tokens=1000,
+                output_tokens=1000,
+                kind="chat",
+                deadline_ms=3000,
+                residence_hint="resident",
+            ),
+        )
+
+        disabled = simulate(
+            workload,
+            replace(config, active_prefix_prefill_reuse=False),
+            "mode-aware",
+        )
+        result = simulate(workload, config, "mode-aware")
+
+        self.assertEqual(
+            [item.request_id for item in disabled.admissions],
+            ["donor", "reuse", "fresh"],
+        )
+        self.assertEqual(
+            [item.request_id for item in result.admissions],
+            ["donor", "fresh", "reuse"],
+        )
 
     def test_kind_profiles_drive_resources_timing_and_round_trip(self):
         config = replace(
@@ -710,6 +777,143 @@ class FuturePlanTest(unittest.TestCase):
 
         self.assertTrue(restored.active_prefix_prefill_reuse)
         self.assertEqual(restored.as_dict(), config.as_dict())
+
+    def test_measured_batch_profile_changes_coactive_decode_timing(self):
+        config = replace(
+            self.config,
+            memory_budget_bytes=1_000_000,
+            kv_bytes_per_token=1,
+            sparse_hot_tokens=100,
+            max_active_requests=2,
+            decode_batch_profiles={
+                "1": {
+                    "resident_tokens_per_ms": 2,
+                    "sparse_tokens_per_ms": 1.6,
+                },
+                "2": {"resident_tokens_per_ms": 10},
+            },
+        )
+        workload = (
+            RequestProfile(
+                "anchor",
+                arrival_ms=0,
+                prompt_tokens=10,
+                output_tokens=200,
+                residence_hint="resident",
+            ),
+            RequestProfile(
+                "coactive",
+                arrival_ms=1,
+                prompt_tokens=10,
+                output_tokens=200,
+                residence_hint="resident",
+            ),
+        )
+
+        result = simulate(workload, config, "fifo")
+        by_id = {item.request_id: item for item in result.admissions}
+
+        self.assertEqual(by_id["anchor"].finish_ms - by_id["anchor"].start_ms, 101)
+        self.assertEqual(by_id["coactive"].finish_ms - by_id["coactive"].start_ms, 41)
+        self.assertEqual(by_id["anchor"].decode_batch_size, 1)
+        self.assertEqual(by_id["coactive"].decode_batch_size, 2)
+        rollout = plan_rollout(workload, config, "fifo", simulation=result)
+        submission = next(
+            item for item in rollout.submissions if item.request_id == "coactive"
+        )
+        self.assertEqual(submission.decode_batch_size, 2)
+        self.assertEqual(submission.hint["decode_tokens_per_s"], 5000)
+        self.assertEqual(
+            result.as_dict()["admissions"][1]["decode_batch_size"], 2
+        )
+        self.assertEqual(
+            rollout.as_dict()["submissions"][1]["decode_batch_size"], 2
+        )
+        self.assertEqual(
+            config.decode_rate_for_batch(
+                "generic", ResidencyMode.RESIDENT, 2
+            ),
+            5,
+        )
+        self.assertEqual(
+            config.decode_rate_for_batch(
+                "generic", ResidencyMode.RESIDENT, 3
+            ),
+            config.resident_decode_tokens_per_ms,
+        )
+        restored = PlannerConfig(**config.as_dict())
+        self.assertEqual(restored.decode_batch_profiles, config.decode_batch_profiles)
+        self.assertIsInstance(
+            restored.decode_batch_profiles[0][1], DecodeBatchProfile
+        )
+
+    def test_invalid_decode_batch_profiles_are_rejected(self):
+        common = {
+            "memory_budget_bytes": 1,
+            "kv_bytes_per_token": 1,
+            "prefill_workspace_bytes_per_token": 0,
+        }
+        invalid = (
+            (
+                ((0, {"resident_tokens_per_ms": 1}),),
+                "decode batch size",
+            ),
+            (
+                ((True, {"resident_tokens_per_ms": 1}),),
+                "integer",
+            ),
+            (
+                ((1, {}),),
+                "requires resident or sparse",
+            ),
+            (
+                ((1, {"resident_tokens_per_ms": math.inf}),),
+                "finite positive",
+            ),
+            (
+                (("1", {"resident_tokens_per_ms": 1}),
+                 (1, {"resident_tokens_per_ms": 2})),
+                "duplicate decode batch profile",
+            ),
+        )
+        for profiles, message in invalid:
+            with self.subTest(profiles=profiles), self.assertRaisesRegex(
+                ValueError, message
+            ):
+                PlannerConfig(**common, decode_batch_profiles=profiles)
+
+    def test_active_prefix_reuse_requires_explicit_radix_capability(self):
+        config = replace(self.config, active_prefix_prefill_reuse=True)
+        workload = (
+            RequestProfile(
+                "shared",
+                arrival_ms=0,
+                prompt_tokens=100,
+                output_tokens=100,
+                prefix_group="system",
+                shared_prefix_tokens=80,
+            ),
+        )
+        simulation = simulate(workload, config, "fifo")
+
+        with self.assertRaisesRegex(ValueError, "radix cache"):
+            plan_rollout(workload, config, "fifo", simulation=simulation)
+        with self.assertRaisesRegex(ValueError, "radix cache"):
+            validate_runtime_capabilities(
+                config, RuntimeCapabilities(radix_cache_enabled=False)
+            )
+
+        plan = plan_rollout(
+            workload,
+            config,
+            "fifo",
+            simulation=simulation,
+            runtime_capabilities=RuntimeCapabilities(radix_cache_enabled=True),
+        )
+        self.assertEqual(
+            plan.as_dict()["runtime_capabilities"],
+            {"radix_cache_enabled": True},
+        )
 
     def test_rollout_hint_uses_selected_kind_and_residency_rates(self):
         config = replace(

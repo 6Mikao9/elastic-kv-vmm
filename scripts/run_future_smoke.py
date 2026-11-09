@@ -236,7 +236,9 @@ def main(argv: list[str] | None = None) -> int:
         from adaptive_sparse.future_plan import (
             PlannerConfig,
             RequestProfile,
+            RuntimeCapabilities,
             plan_rollout,
+            validate_runtime_capabilities,
         )
         from adaptive_sparse.rollout_executor import load_plan
 
@@ -252,6 +254,9 @@ def main(argv: list[str] | None = None) -> int:
             if raw_config is not None:
                 try:
                     plan_config = PlannerConfig(**raw_config)
+                    validate_runtime_capabilities(
+                        plan_config, RuntimeCapabilities()
+                    )
                 except (TypeError, ValueError) as exc:
                     parser.error(f"invalid planner_config in --plan: {exc}")
         else:
@@ -263,7 +268,12 @@ def main(argv: list[str] | None = None) -> int:
                 requests = [RequestProfile(**item) for item in workload["requests"]]
             except (KeyError, TypeError, ValueError) as exc:
                 parser.error(f"invalid --workload: {exc}")
-            rollout = plan_rollout(requests, config, args.planning_policy)
+            rollout = plan_rollout(
+                requests,
+                config,
+                args.planning_policy,
+                runtime_capabilities=RuntimeCapabilities(),
+            )
             planned_submissions = rollout.submissions
             plan_manifest = rollout.as_dict()
             plan_config = config

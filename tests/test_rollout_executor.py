@@ -20,6 +20,7 @@ from adaptive_sparse.rollout_executor import (
     execute_rollout,
     load_plan,
     make_kv_hints,
+    validate_submissions,
 )
 from adaptive_sparse.service_time import ServiceTimeEstimator
 
@@ -902,6 +903,14 @@ class RolloutExecutorTest(unittest.TestCase):
                 generator=lambda *args: self.fail("request should not be sent"),
             )
 
+    def test_rejects_invalid_decode_batch_size(self):
+        with self.assertRaisesRegex(
+            RolloutExecutionError, "decode batch size must be positive"
+        ):
+            validate_submissions(
+                [replace(submission(), decode_batch_size=0)]
+            )
+
     def test_plan_round_trips_with_execution_inputs(self):
         plan = plan_rollout(
             [
@@ -933,6 +942,7 @@ class RolloutExecutorTest(unittest.TestCase):
         self.assertEqual(loaded[0].hint["expected_output_tokens"], 8)
         self.assertEqual(loaded[0].hint["prefix_group"], "request-prefix")
         self.assertEqual(loaded[0].hint["shared_prefix_tokens"], 16)
+        self.assertEqual(loaded[0].decode_batch_size, 1)
 
     def test_residency_evidence_reconciles_all_tp_ranks(self):
         with tempfile.TemporaryDirectory() as directory:

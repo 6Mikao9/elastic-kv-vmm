@@ -246,6 +246,20 @@ flag additionally shortens the later request's modeled prefill and marks its
 admission reason. It defaults to off because serving measurements require
 SGLang radix caching plus a verified resident-donor lifetime. The 999 ms
 checked-in unit-test difference is policy-model evidence, not measured latency.
+The execution boundary now fails closed when this flag is enabled without an
+explicit radix-cache capability. Local serving scripts declare the capability
+they actually launch and reject a precomputed plan that claims active-prefix
+reuse while radix caching is disabled. The declaration does not add radix-cache
+support to the current VMM adapter.
+Measured peer-batch throughput can be supplied through `decode_batch_profiles`.
+Each entry contains aggregate resident and/or sparse tokens per millisecond at
+one exact batch size; the planner divides that aggregate rate by the batch size
+before estimating a request. Missing sizes and modes retain the ordinary linear
+rate, and the planner does not interpolate between measurements. Every admission
+records the `decode_batch_size` used by its timing model, and the emitted decode
+rate hint uses the same value. Durations fixed at an earlier admission are not
+retroactively rewritten when another request joins the batch, so this remains a
+policy model rather than a full serving simulator.
 `search_exact` distinguishes a completed search from a capped incumbent. Use
 `online` to evaluate each immediate action by completing the deployable
 `future` heuristic from that branch, then commit only the first action. Its

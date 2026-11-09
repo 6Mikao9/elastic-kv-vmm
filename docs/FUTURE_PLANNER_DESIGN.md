@@ -349,6 +349,45 @@ prefilled_tokens = prompt_tokens - shared_prefix_tokens
 必须同时启用并验证 SGLang radix cache、resident donor 生命周期和规划模式一致；
 否则执行器应按原生 prefill 耗时解释，不能引用这 999 ms 的模型差值作为服务收益。
 
+执行边界现在要求显式声明运行时能力。`RuntimeCapabilities(radix_cache_enabled=True)`
+只表示 executor 已确认实际 SGLang 启用了 radix cache；`plan_rollout()` 在配置开启
+active-prefix reuse 而未得到该能力时直接拒绝生成可执行计划。仓库内的 SGLang smoke
+脚本固定声明 radix cache 关闭，并同时校验预先计算的 plan，避免绕过这一保护。
+`elastic-future-plan --radix-cache-enabled` 只用于声明已核验的运行时，不会替当前
+adapter 增加 radix-cache 支持；当前 VMM adapter 仍会拒绝启用 radix cache，直到共享
+backing 的引用、写保护和生命周期实现通过真实测试。
+
+### 4.1.2 已实现：按 batch size 使用实测 decode 吞吐
+
+`decode_batch_profiles` 接受按精确 batch size 记录的 aggregate throughput。例如：
+
+```json
+{
+  "decode_batch_profiles": {
+    "1": {
+      "resident_tokens_per_ms": 20.0,
+      "sparse_tokens_per_ms": 16.0
+    },
+    "4": {
+      "resident_tokens_per_ms": 64.0,
+      "sparse_tokens_per_ms": 48.0
+    }
+  }
+}
+```
+
+规划器把 aggregate rate 除以 batch size，再估计单个请求的 decode duration。只有
+完全匹配的 batch size 和 residency mode 才使用实测值；缺失项回退到原来的每请求
+线性速率，不做插值。admission 和 rollout submission 都记录本次估计采用的
+`decode_batch_size`，rollout hint 的 `decode_tokens_per_s` 也使用同一值，便于检查
+计划和执行之间的单位与假设。
+
+这个模型只影响 admission 时可见的 co-batch 数，以及 deadline urgency 和 future
+contention 的估计。已经开始的请求不会在后续请求加入 batch 时回溯改写 finish time。
+因此它足以让“不同 batch size 会改变计划”进入离线规划，但还不能声称完整复现 SGLang
+动态 batching；后者需要从真实服务器采集 profile，并让 executor 记录实际 co-batch
+大小后做 paired replay。
+
 ### 4.2 受控 rollout 的可执行计划
 
 `plan_rollout()` 把离线策略结果转换成 orchestrator 可执行的动作。每个 action

@@ -93,6 +93,42 @@ class ResidentHintRunnerOptionsTest(unittest.TestCase):
         self.assertEqual(manifest, loaded_manifest)
         self.assertEqual(loaded[0].deadline_ms, 500)
 
+    def test_precomputed_prefix_reuse_plan_requires_live_radix_cache(self):
+        manifest = {
+            "policy": "fifo",
+            "planner_config": {
+                "memory_budget_bytes": 1_000_000,
+                "kv_bytes_per_token": 100,
+                "prefill_workspace_bytes_per_token": 0,
+                "active_prefix_prefill_reuse": True,
+            },
+            "submissions": [
+                {
+                    "request_id": "shared",
+                    "planned_arrival_ms": 0,
+                    "submit_at_ms": 0,
+                    "estimated_finish_ms": 10,
+                    "kind": "generic",
+                    "prompt_tokens": 16,
+                    "output_tokens": 1,
+                    "hint": {
+                        "release_after_ms": 0,
+                        "expected_output_tokens": 1,
+                        "kind": "generic",
+                        "prefix_group": "system",
+                        "shared_prefix_tokens": 8,
+                    },
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            plan_path = Path(directory) / "plan.json"
+            plan_path.write_text(
+                json.dumps({"rollout": manifest}), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "radix cache"):
+                load_future_submissions(plan_path, None, "fifo")
+
     def test_environment_manifest_and_sources_are_consistent(self):
         self.assertEqual(
             resident_hint_environment("adaptive", 128, 2),

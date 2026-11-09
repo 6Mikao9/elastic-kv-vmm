@@ -3,6 +3,7 @@ __pycache__/
 *.so
 *.o
 cache/
+.scratch/
 inspection/
 **/private_trace/
 SGLang052接入简报.md

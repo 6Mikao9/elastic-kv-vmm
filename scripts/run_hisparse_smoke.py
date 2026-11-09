@@ -271,7 +271,9 @@ def load_future_submissions(plan_path, workload_path, policy):
     from adaptive_sparse.future_plan import (
         PlannerConfig,
         RequestProfile,
+        RuntimeCapabilities,
         plan_rollout,
+        validate_runtime_capabilities,
     )
     from adaptive_sparse.rollout_executor import load_plan
 
@@ -279,11 +281,21 @@ def load_future_submissions(plan_path, workload_path, policy):
         submissions = load_plan(plan_path)
         payload = json.loads(Path(plan_path).read_text(encoding="utf-8"))
         manifest = payload.get("rollout", payload)
+        raw_config = manifest.get("planner_config")
+        if raw_config is not None:
+            validate_runtime_capabilities(
+                PlannerConfig(**raw_config), RuntimeCapabilities()
+            )
         return submissions, manifest, manifest.get("policy", "external")
     workload = json.loads(Path(workload_path).read_text(encoding="utf-8"))
     config = PlannerConfig(**workload["config"])
     requests = [RequestProfile(**item) for item in workload["requests"]]
-    rollout = plan_rollout(requests, config, policy)
+    rollout = plan_rollout(
+        requests,
+        config,
+        policy,
+        runtime_capabilities=RuntimeCapabilities(),
+    )
     return rollout.submissions, rollout.as_dict(), policy
 
 
@@ -556,10 +568,17 @@ def main():
         write_json(output / "future_plan.json", future_plan_manifest)
         raw_config = future_plan_manifest.get("planner_config")
         if raw_config is not None:
-            from adaptive_sparse.future_plan import PlannerConfig
+            from adaptive_sparse.future_plan import (
+                PlannerConfig,
+                RuntimeCapabilities,
+                validate_runtime_capabilities,
+            )
 
             try:
                 future_plan_config = PlannerConfig(**raw_config)
+                validate_runtime_capabilities(
+                    future_plan_config, RuntimeCapabilities()
+                )
             except (TypeError, ValueError) as error:
                 parser.error(f"invalid future planner_config: {error}")
         if any(item.prompt_tokens + item.output_tokens > 16384 for item in planned_submissions):

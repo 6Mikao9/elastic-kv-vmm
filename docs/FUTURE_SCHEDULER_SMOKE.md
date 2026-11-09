@@ -90,6 +90,11 @@ hit/miss against the original absolute deadline, and reports throughput over the
 full makespan including deliberate idle as well as over the serving window. The
 executor rejects malformed plans before sending any request and fails loudly on
 late dispatch, incomplete output, or conflicting TP residency telemetry.
+It also rejects a plan that enables `active_prefix_prefill_reuse` unless the
+caller explicitly declares that the launched SGLang instance has radix caching
+enabled. The repository's smoke launchers currently pass
+`--disable-radix-cache`, so they fail closed for such a plan instead of silently
+treating the planner's prefix credit as a measured runtime hit.
 
 For live elasticity, add `--max-inflight N --queue-policy deadline` and
 `--elastic-residency-budget`. The planned timestamps then become earliest

@@ -163,6 +163,13 @@ def validate_submissions(submissions: Iterable[RolloutSubmission]) -> tuple[Roll
             )
         if item.prompt_tokens < 1 or item.output_tokens < 1:
             raise RolloutExecutionError(f"{item.request_id}: token counts must be positive")
+        if (
+            type(item.decode_batch_size) is not int
+            or item.decode_batch_size < 1
+        ):
+            raise RolloutExecutionError(
+                f"{item.request_id}: decode batch size must be positive"
+            )
         hint = FutureHint.from_payload(_future_payload(item.hint))
         if hint.release_after_ms != 0:
             raise RolloutExecutionError(
@@ -245,6 +252,7 @@ def load_plan(path: str | Path) -> tuple[RolloutSubmission, ...]:
                 output_tokens=raw["output_tokens"],
                 hint=dict(hint),
                 deadline_ms=raw.get("deadline_ms"),
+                decode_batch_size=raw.get("decode_batch_size", 1),
             )
         except KeyError as exc:
             raise RolloutExecutionError(
