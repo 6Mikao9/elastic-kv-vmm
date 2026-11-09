@@ -18,7 +18,15 @@ _INVALID = (1 << 64) - 1
 
 @functools.lru_cache(maxsize=None)
 def _load_library(path):
-    lib = ct.CDLL(path)
+    try:
+        lib = ct.CDLL(path)
+    except OSError as exc:
+        source = Path(__file__).resolve().parents[1] / "native" / "elastic_vmm.cpp"
+        raise RuntimeError(
+            "CUDA VMM library could not be loaded. Run "
+            f"`elastic-kv-build-vmm` or set ELASTIC_VMM_LIBRARY. "
+            f"Library={path}; packaged source={source}"
+        ) from exc
     lib.ev_create.argtypes = [ct.c_int, ct.c_uint64, ct.c_uint64]
     lib.ev_create.restype = ct.c_void_p
     for name in ("ev_ensure", "ev_precommit", "ev_drop"):

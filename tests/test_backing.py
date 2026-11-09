@@ -11,6 +11,7 @@ import torch
 from elastic_kv.backing import (
     DEFAULT_CHUNK_BYTES,
     Backing,
+    _load_library,
     _resolve_broker_path,
 )
 from elastic_kv.global_broker import GlobalAdmissionBroker
@@ -77,6 +78,18 @@ class _FakeLibrary:
 
 
 class GlobalBrokerBackingTest(unittest.TestCase):
+    def test_missing_native_library_has_actionable_build_error(self):
+        _load_library.cache_clear()
+        with patch(
+            "elastic_kv.backing.ct.CDLL",
+            side_effect=OSError("missing native library"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "elastic-kv-build-vmm"
+            ):
+                _load_library("missing-libelastic-vmm.so")
+        _load_library.cache_clear()
+
     def test_fair_broker_environment_requires_a_broker_path(self):
         chunk = 1 << 20
         with patch.dict(

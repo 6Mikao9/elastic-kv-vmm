@@ -40,7 +40,8 @@ output token。每轮有独立 warmup；每个模式另跑 12 个固定 greedy �
 - 容器内 60 项 CPU/CUDA 单元测试全部通过；其中 VMM backing 和 Graph 地址复用
   两项随后在空闲 GPU2 上实际运行。
 - 在无网络容器内以 `--no-build-isolation --no-deps` 成功构建并安装 wheel，
-  `elastic_kv` 与 `adaptive_sparse` 都进入安装包。
+  `elastic_kv`、`adaptive_sparse` 和原生 `elastic_vmm.cpp` 都进入安装包；安装后用
+  `elastic-kv-build-vmm` 在本机 CUDA 环境生成 `libelastic_vmm.so`。
 
 机器生成的汇总与逐请求结果见
 [`results/sglang-framework-smoke`](../results/sglang-framework-smoke/)。

@@ -12,10 +12,14 @@ license = "Apache-2.0"
 [project.scripts]
 elastic-sglang = "elastic_kv.launch:main"
 elastic-future-plan = "adaptive_sparse.future_plan:main"
+elastic-kv-build-vmm = "elastic_kv.build_vmm:main"
 
 [tool.setuptools.packages.find]
-include = ["elastic_kv*", "adaptive_sparse*"]
+include = ["elastic_kv*", "adaptive_sparse*", "native*"]
 namespaces = true
+
+[tool.setuptools.package-data]
+native = ["*.cpp"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

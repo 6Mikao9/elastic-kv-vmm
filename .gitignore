@@ -2,6 +2,9 @@ __pycache__/
 *.py[cod]
 *.so
 *.o
+build/
+dist/
+*.egg-info/
 cache/
 .scratch/
 inspection/

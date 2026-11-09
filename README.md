@@ -82,7 +82,18 @@ This differs from CUDA Unified/Managed Memory: there is no CPU page migration or
 
 Use Linux, a CUDA VMM-capable GPU, a compatible NVIDIA driver, CUDA headers and a C++17 compiler. The measured software versions are in [environment.json](environment.json); [requirements.txt](requirements.txt) records the Python stack. The runs used an existing environment with CUDA 12.8 PyTorch. A fresh image rebuild from these requirements has not been validated.
 
-Build the small driver-API library:
+Install the Python package, then build the small driver-API library from the
+C++ source shipped in the wheel:
+
+```bash
+python3 -m pip install .
+elastic-kv-build-vmm
+```
+
+`elastic-kv-build-vmm` writes `libelastic_vmm.so` beside the packaged source.
+Use `--output` to choose another location and set `ELASTIC_VMM_LIBRARY` to that
+file. `CUDA_HOME` selects the CUDA toolkit if it is not at `/usr/local/cuda`.
+The equivalent source-tree build is:
 
 ```bash
 g++ -std=c++17 -O2 -Wall -Wextra -shared -fPIC \
