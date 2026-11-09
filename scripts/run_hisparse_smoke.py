@@ -669,8 +669,12 @@ def main():
         server_args.extend(["--enable-deterministic-inference", "--disable-custom-all-reduce"])
     if args.forced_replay:
         server_args.append("--enable-custom-logit-processor")
-    launch = ([str(ROOT / "adaptive_sparse/launch_minimax_sm80.py")]
-              if args.sm80_bf16_projections else ["-m", "sglang.launch_server"])
+    launch = [
+        "-m",
+        "elastic_kv",
+        "--elastic-runtime-profile",
+        "minimax-hisparse",
+    ]
     environment = os.environ.copy()
     environment["PYTHONPATH"] = os.pathsep.join(filter(None, (str(ROOT), environment.get("PYTHONPATH"))))
     if args.launch_blocking:
@@ -758,11 +762,20 @@ def main():
         ))
     command = [sys.executable, "-u", *launch, "--model-path",
                str(args.model_path.resolve()), *server_args]
-    sources = ("scripts/run_case.py", "benchmarks/client.py", "scripts/run_hisparse_smoke.py",
-               "scripts/container_hisparse_smoke.sh")
+    sources = (
+        "scripts/run_case.py",
+        "benchmarks/client.py",
+        "scripts/run_hisparse_smoke.py",
+        "scripts/container_hisparse_smoke.sh",
+        "elastic_kv/launch.py",
+        "elastic_kv/config.py",
+        "adaptive_sparse/minimax_runtime.py",
+    )
     if args.sm80_bf16_projections:
-        sources += ("adaptive_sparse/minimax_sm80.py", "adaptive_sparse/launch_minimax_sm80.py",
-                    "adaptive_sparse/memory_telemetry.py")
+        sources += (
+            "adaptive_sparse/minimax_sm80.py",
+            "adaptive_sparse/memory_telemetry.py",
+        )
     if args.benchmark_repeats:
         sources += ("benchmarks/hisparse_client.py",)
     if args.forced_replay:

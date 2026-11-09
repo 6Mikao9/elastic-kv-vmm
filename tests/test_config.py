@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from elastic_kv import launch
 from elastic_kv.config import ElasticConfig
-from elastic_kv.launch import main, resolve_config
+from elastic_kv.launch import main, resolve_config, resolve_launch_config
 
 
 class ElasticConfigTest(unittest.TestCase):
@@ -331,13 +331,75 @@ class ElasticConfigTest(unittest.TestCase):
         self.assertEqual(upstream, ["--model-path", "/models/qwen", "--port", "30000"])
         self.assertFalse(dry_run)
 
+    def test_minimax_profile_skips_dense_adapter_and_preserves_sglang_args(self):
+        with patch.dict(os.environ, {"EKV_MODE": "v5"}, clear=True):
+            config, upstream, dry_run, runtime_profile = resolve_launch_config(
+                [
+                    "--elastic-runtime-profile",
+                    "minimax-hisparse",
+                    "--elastic-mode",
+                    "baseline",
+                    "--enable-hisparse",
+                    "--disable-radix-cache",
+                ]
+            )
+
+        self.assertEqual(runtime_profile, "minimax-hisparse")
+        self.assertEqual(config.mode, "baseline")
+        self.assertEqual(upstream, ["--enable-hisparse", "--disable-radix-cache"])
+        self.assertFalse(dry_run)
+
+    def test_minimax_profile_rejects_dense_vmm_mode(self):
+        with (
+            redirect_stdout(io.StringIO()),
+            patch("sys.stderr", io.StringIO()),
+            self.assertRaises(SystemExit),
+        ):
+                resolve_launch_config(
+                [
+                    "--elastic-runtime-profile",
+                    "minimax-hisparse",
+                    "--elastic-mode",
+                    "v5",
+                ]
+            )
+
     def test_dry_run_does_not_import_sglang(self):
         output = io.StringIO()
-        with redirect_stdout(output):
-            status = main(["--elastic-mode", "v5", "--elastic-dry-run"])
+        with patch.dict(os.environ, {}, clear=True), redirect_stdout(output):
+            status = main(
+                [
+                    "--elastic-mode",
+                    "v5",
+                    "--elastic-runtime-profile",
+                    "dense",
+                    "--elastic-dry-run",
+                ]
+            )
         self.assertEqual(status, 0)
         payload = output.getvalue().split(": ", 1)[1]
-        self.assertEqual(json.loads(payload)["mode"], "v5")
+        decoded = json.loads(payload)
+        self.assertEqual(decoded["mode"], "v5")
+        self.assertEqual(decoded["runtime_profile"], "dense")
+
+    def test_minimax_dry_run_selects_sparse_profile_without_sglang(self):
+        output = io.StringIO()
+        with patch.dict(os.environ, {"EKV_MODE": "v5"}, clear=True), redirect_stdout(
+            output
+        ):
+            status = main(
+                [
+                    "--elastic-runtime-profile",
+                    "minimax-hisparse",
+                    "--enable-hisparse",
+                    "--elastic-dry-run",
+                ]
+            )
+
+        self.assertEqual(status, 0)
+        decoded = json.loads(output.getvalue().split(": ", 1)[1])
+        self.assertEqual(decoded["mode"], "baseline")
+        self.assertEqual(decoded["runtime_profile"], "minimax-hisparse")
 
     def test_spawn_worker_installs_only_after_parent_sentinel(self):
         with patch.dict(os.environ, {}, clear=True), patch.object(
@@ -377,6 +439,27 @@ class ElasticConfigTest(unittest.TestCase):
         ):
             launch._install_adapter()
         vmm_install.assert_called_once_with()
+
+    def test_minimax_runtime_profile_skips_dense_adapter(self):
+        dense_install = unittest.mock.Mock()
+        sparse_install = unittest.mock.Mock()
+        modules = {
+            "elastic_kv.adapter": SimpleNamespace(install=dense_install),
+            "adaptive_sparse.minimax_runtime": SimpleNamespace(
+                install_minimax_runtime=sparse_install
+            ),
+        }
+        with patch.dict(
+            os.environ,
+            {
+                "EKV_MODE": "v5",
+                "EKV_RUNTIME_PROFILE": "minimax-hisparse",
+            },
+            clear=True,
+        ), patch.dict(sys.modules, modules):
+            launch._install_adapter()
+        dense_install.assert_not_called()
+        sparse_install.assert_called_once_with()
 
 
 if __name__ == "__main__":

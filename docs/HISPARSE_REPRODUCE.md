@@ -11,6 +11,12 @@ keeps the NVFP4 Marlin experts.
 [Container wrapper](../scripts/container_hisparse_smoke.sh) ·
 [SM80 adapter](../adaptive_sparse/minimax_sm80.py)
 
+The runner starts through the shared `elastic-sglang` entry point with
+`--elastic-runtime-profile minimax-hisparse`. This keeps dense V5 disabled and
+installs only the enabled MiniMax VMM/residency/scheduler hooks, including in
+spawned SGLang workers. The legacy SM80 launcher remains as a compatibility
+wrapper for older manifests.
+
 ```bash
 IMAGE=lmsysorg/sglang:dev-minimax-m31-flash
 # Recorded local image ID used by the wrapper. The registry RepoDigest was not

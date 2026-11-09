@@ -214,6 +214,16 @@ validate OOM behavior.
 
 For an existing isolated environment, the primary entry point is `python3 -m elastic_kv` (or `elastic-sglang` after installing `pyproject.toml`). It validates elastic settings before importing SGLang, installs the adapter, and forwards the remaining arguments to SGLang. The launcher now owns precommit lookahead, future-ordering horizon and both telemetry destinations as well as their `EKV_*` environment equivalents, so spawned SGLang workers receive one validated manifest. `python3 -m elastic_kv.launch` remains compatible with the experiment scripts. The module entry point is required so the adapter is installed in the spawned scheduler process as well as the launcher. See [server usage](docs/SERVER.md); `EKV_STATS_PATH` optionally records residency telemetry.
 
+The same spawn-safe entry point selects the audited MiniMax runtime with
+`--elastic-runtime-profile minimax-hisparse`. This profile keeps dense V5
+disabled and installs the enabled MiniMax compatibility, VMM, future-ordering,
+request-residency, adaptive-budget and telemetry components in their validated
+order. The old `adaptive_sparse/launch_minimax_sm80.py` remains as a
+compatibility wrapper, while the MiniMax smoke runner uses the unified entry
+point so spawned workers reconstruct the same hooks. This consolidates launch
+plumbing only; it does not change the documented TP4/eager scope or turn CPU
+tests into serving evidence.
+
 For the separate future-ordering path, set `EKV_FUTURE_POLICY=deadline` and
 optionally `EKV_FUTURE_STATS_PATH=/path/to/future-stats.json`. On SGLang 0.5.2,
 the launcher installs a small request-transport compatibility layer before the

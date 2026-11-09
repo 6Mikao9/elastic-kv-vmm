@@ -21,9 +21,22 @@ from .config import (
 )
 
 SPAWN_INSTALL_ENV = "_ELASTIC_KV_INSTALL_ON_IMPORT"
+RUNTIME_PROFILE_ENV = "EKV_RUNTIME_PROFILE"
+RUNTIME_PROFILES = ("dense", "minimax-hisparse")
 
 
 def _install_adapter() -> None:
+    runtime_profile = os.environ.get(RUNTIME_PROFILE_ENV, "dense").strip().lower()
+    if runtime_profile not in RUNTIME_PROFILES:
+        raise ValueError(
+            f"{RUNTIME_PROFILE_ENV} must be one of {RUNTIME_PROFILES}"
+        )
+    if runtime_profile == "minimax-hisparse":
+        from adaptive_sparse.minimax_runtime import install_minimax_runtime
+
+        install_minimax_runtime()
+        return
+
     config = ElasticConfig.from_env()
     if config.mode != "baseline":
         from .adapter import install
@@ -58,6 +71,13 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--elastic-mode", choices=MODES)
+    parser.add_argument(
+        "--elastic-runtime-profile",
+        choices=RUNTIME_PROFILES,
+        help=(
+            "install the dense VMM adapter or the audited MiniMax HiSparse runtime"
+        ),
+    )
     parser.add_argument("--elastic-chunk-mib", type=int)
     parser.add_argument("--elastic-retain-chunks", type=int)
     parser.add_argument("--elastic-activation-policy", choices=ACTIVATION_POLICIES)
@@ -118,9 +138,21 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def resolve_config(argv: Sequence[str]) -> tuple[ElasticConfig, list[str], bool]:
-    """Split elastic options from the upstream SGLang argument vector."""
-    args, sglang_argv = _parser().parse_known_args(list(argv))
+def resolve_launch_config(
+    argv: Sequence[str],
+) -> tuple[ElasticConfig, list[str], bool, str]:
+    """Resolve backend settings and the selected runtime-install profile."""
+    parser = _parser()
+    args, sglang_argv = parser.parse_known_args(list(argv))
+    runtime_profile = args.elastic_runtime_profile or "dense"
+    if runtime_profile == "minimax-hisparse" and args.elastic_mode not in (
+        None,
+        "baseline",
+    ):
+        parser.error(
+            "--elastic-mode v0-v5 is incompatible with "
+            "--elastic-runtime-profile minimax-hisparse"
+        )
     config = ElasticConfig.from_env().with_overrides(
         mode=args.elastic_mode,
         chunk_mib=args.elastic_chunk_mib,
@@ -160,13 +192,31 @@ def resolve_config(argv: Sequence[str]) -> tuple[ElasticConfig, list[str], bool]
         global_broker_wait_ms=args.elastic_global_broker_wait_ms,
         global_broker_prefill_mode=args.elastic_global_broker_prefill_mode,
     )
-    return config, sglang_argv, args.elastic_dry_run
+    if runtime_profile == "minimax-hisparse":
+        # A stale dense experiment shell must not activate V5 through EKV_MODE.
+        config = config.with_overrides(mode="baseline")
+    return config, sglang_argv, args.elastic_dry_run, runtime_profile
+
+
+def resolve_config(argv: Sequence[str]) -> tuple[ElasticConfig, list[str], bool]:
+    """Compatibility wrapper for callers interested only in dense settings."""
+
+    config, sglang_argv, dry_run, _ = resolve_launch_config(argv)
+    return config, sglang_argv, dry_run
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    config, sglang_argv, dry_run = resolve_config(sys.argv[1:] if argv is None else argv)
+    config, sglang_argv, dry_run, runtime_profile = resolve_launch_config(
+        sys.argv[1:] if argv is None else argv
+    )
     config.apply()
-    print(f"elastic-sglang configuration: {json.dumps(config.as_dict(), sort_keys=True)}", flush=True)
+    os.environ[RUNTIME_PROFILE_ENV] = runtime_profile
+    launch_config = config.as_dict()
+    launch_config["runtime_profile"] = runtime_profile
+    print(
+        f"elastic-sglang configuration: {json.dumps(launch_config, sort_keys=True)}",
+        flush=True,
+    )
     if dry_run:
         return 0
 

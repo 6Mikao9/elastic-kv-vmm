@@ -5,6 +5,15 @@ experimental memory policy before importing SGLang or touching CUDA, then
 installs the pinned SGLang 0.5.2 adapter and passes all remaining arguments to
 SGLang unchanged.
 
+For the audited MiniMax HiSparse path, pass
+`--elastic-runtime-profile minimax-hisparse`. This selects the sparse runtime,
+keeps the dense VMM adapter disabled even if `EKV_MODE` is stale, and applies the
+enabled MiniMax compatibility, VMM, future-ordering, request-residency,
+adaptive-budget and telemetry hooks in their established order. Non-baseline
+dense `--elastic-mode v0`–`v5` values are rejected for this profile. The old
+`adaptive_sparse/launch_minimax_sm80.py` command remains available as a
+compatibility wrapper and calls the same installer sequence.
+
 `--elastic-mode baseline` deliberately skips the VMM monkeypatch. This keeps a
 native baseline available. The separate future-ordering hook uses native
 `kv_hints` when present and installs the guarded 0.5.2 transport compatibility
@@ -51,6 +60,7 @@ SGLang or touch CUDA.
 
 | Option | Default | Constraint |
 |---|---:|---|
+| `--elastic-runtime-profile` | `dense` | `dense` or `minimax-hisparse`; the latter disables dense V5 |
 | `--elastic-mode` | `baseline` | `baseline`, `v0` through `v5` |
 | `--elastic-chunk-mib` | `2` | positive integer |
 | `--elastic-retain-chunks` | `1` | at least the sink chunk |
