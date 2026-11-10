@@ -49,6 +49,12 @@ def install_minimax_runtime() -> tuple[str, ...]:
         install_minimax_attention_capture(capture_dir)
         installed.append("attention_capture")
 
+    if access_trace_dir := os.environ.get("EKV_HISPARSE_TRACE_DIR"):
+        from adaptive_sparse.hisparse_access_trace import install_hisparse_access_trace
+
+        install_hisparse_access_trace(access_trace_dir)
+        installed.append("hisparse_access_trace")
+
     if vmm_stats_dir := os.environ.get("EKV_VMM_STATS_DIR"):
         from adaptive_sparse.vmm_runtime import install_vmm_runtime
 

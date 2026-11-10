@@ -23,6 +23,8 @@ Successful demotions and promotions now update direction-specific EWMA transfer 
 
 ## Request-level HiSparse
 
+The [real-workload locality pilot](docs/HISPARSE_LOCALITY_RESULTS_20261111.md) captures six WildChat, SWE-agent trajectory and LongBench-v2 requests on TP4 MiniMax with native hot capacities 2048/4096/8192. It reports per-request and temporal residency misses separately from same-trace LRU replay. Gentle simulated shrink can preserve low miss, whereas halving every hot set is costly; an equal-budget hindsight allocation also exposes a trade-off between total misses and request fairness. These are diagnostic locality results, not an online resizing policy or an end-to-end speedup. Raw conversations and token traces remain private.
+
 The MiniMax prototype lets selected long requests keep full GPU history while other requests use the native CPU history and fixed GPU hot buffer. Under a main-KV backing budget, it can demote and promote active requests at safe eager boundaries. The sparse attention selection remains unchanged in both modes. VMM reclaims whole physical chunks after their page references disappear.
 
 A measured shared-chunk layout exposes a limitation of choosing requests by length alone: each of two requests can release 64 software pages without freeing any complete chunk. Joint planning releases 120 chunks, **240 MiB per rank**. An automatic round trip passed full source/destination KV byte checks on all four ranks. This establishes tested data movement and physical reclamation; serving efficiency and whole-device memory are measured separately.

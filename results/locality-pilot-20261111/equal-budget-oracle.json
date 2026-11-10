@@ -1,0 +1,354 @@
+{
+  "method": "hindsight_exact_token_budget_simulation",
+  "interpretation": [
+    "These are simulated batch-token LRU miss counts summed across sampled layers.",
+    "Serial request traces are combined as a hypothetical concurrent allocation.",
+    "This is hindsight allocation, not an online policy or evidence of performance or physical memory reclaim.",
+    "The separate rank oracles may choose different allocations. The joint oracle uses one shared allocation.",
+    "The request-mean objective first pools each request across sampled ranks, then weights requests equally."
+  ],
+  "input_capture_coverage": "complete",
+  "warmup_steps_excluded": 16,
+  "request_aliases": [
+    "R01",
+    "R03",
+    "R04",
+    "R05",
+    "R06"
+  ],
+  "requested_candidates": [
+    2560,
+    3072,
+    3584,
+    4096,
+    6144,
+    8192
+  ],
+  "feasible_candidates": [
+    2560,
+    3072,
+    3584,
+    4096,
+    6144,
+    8192
+  ],
+  "rank_results": [
+    {
+      "rank": 0,
+      "objective": "total_simulated_misses_over_total_selected",
+      "selected_tokens": 8997576,
+      "request_selected_tokens": {
+        "R01": 2135694,
+        "R03": 631137,
+        "R04": 335556,
+        "R05": 2948895,
+        "R06": 2946294
+      },
+      "comparisons": [
+        {
+          "total_token_budget": 20480,
+          "exact_allocations": 341,
+          "uniform": {
+            "allocation": {
+              "R01": 4096,
+              "R03": 4096,
+              "R04": 4096,
+              "R05": 4096,
+              "R06": 4096
+            },
+            "simulated_misses": 360580,
+            "weighted_simulated_miss_rate": 0.04007523804189039,
+            "mean_per_request_simulated_miss_rate": 0.028950075485676997,
+            "per_request_simulated_miss_rate": {
+              "R01": 0.0034761534189823072,
+              "R03": 0.0033780304434694844,
+              "R04": 0.02123341558488002,
+              "R05": 0.06772672475622224,
+              "R06": 0.048936053224830925
+            }
+          },
+          "best": {
+            "allocation": {
+              "R01": 3072,
+              "R03": 2560,
+              "R04": 2560,
+              "R05": 6144,
+              "R06": 6144
+            },
+            "simulated_misses": 251724,
+            "weighted_simulated_miss_rate": 0.02797686843656558,
+            "mean_per_request_simulated_miss_rate": 0.0494000131149705,
+            "per_request_simulated_miss_rate": {
+              "R01": 0.018965731982203443,
+              "R03": 0.06304494903642156,
+              "R04": 0.12055811846606826,
+              "R05": 0.025923608673757457,
+              "R06": 0.018507657416401757
+            }
+          },
+          "worst": {
+            "allocation": {
+              "R01": 3072,
+              "R03": 8192,
+              "R04": 4096,
+              "R05": 2560,
+              "R06": 2560
+            },
+            "simulated_misses": 938116,
+            "weighted_simulated_miss_rate": 0.10426319266433537,
+            "mean_per_request_simulated_miss_rate": 0.06895290969815165,
+            "per_request_simulated_miss_rate": {
+              "R01": 0.018965731982203443,
+              "R03": 0.003140364136471162,
+              "R04": 0.02123341558488002,
+              "R05": 0.16040855981647362,
+              "R06": 0.14101647697073
+            }
+          },
+          "best_improvement_over_uniform_pp": 1.2098369605324812,
+          "best_objective_improvement_over_uniform_pp": 1.2098369605324812
+        }
+      ]
+    },
+    {
+      "rank": 1,
+      "objective": "total_simulated_misses_over_total_selected",
+      "selected_tokens": 8997576,
+      "request_selected_tokens": {
+        "R01": 2135694,
+        "R03": 631137,
+        "R04": 335556,
+        "R05": 2948895,
+        "R06": 2946294
+      },
+      "comparisons": [
+        {
+          "total_token_budget": 20480,
+          "exact_allocations": 341,
+          "uniform": {
+            "allocation": {
+              "R01": 4096,
+              "R03": 4096,
+              "R04": 4096,
+              "R05": 4096,
+              "R06": 4096
+            },
+            "simulated_misses": 269640,
+            "weighted_simulated_miss_rate": 0.029968071400563887,
+            "mean_per_request_simulated_miss_rate": 0.02371557919685153,
+            "per_request_simulated_miss_rate": {
+              "R01": 0.003398426928202261,
+              "R03": 0.003870791919979339,
+              "R04": 0.026099965430509364,
+              "R05": 0.050397521783583345,
+              "R06": 0.03481118992198334
+            }
+          },
+          "best": {
+            "allocation": {
+              "R01": 4096,
+              "R03": 3072,
+              "R04": 3072,
+              "R05": 6144,
+              "R06": 4096
+            },
+            "simulated_misses": 204782,
+            "weighted_simulated_miss_rate": 0.02275968549751622,
+            "mean_per_request_simulated_miss_rate": 0.028861443119875776,
+            "per_request_simulated_miss_rate": {
+              "R01": 0.003398426928202261,
+              "R03": 0.02393458155677769,
+              "R04": 0.062156540190012995,
+              "R05": 0.020006477002402594,
+              "R06": 0.03481118992198334
+            }
+          },
+          "worst": {
+            "allocation": {
+              "R01": 3072,
+              "R03": 8192,
+              "R04": 4096,
+              "R05": 2560,
+              "R06": 2560
+            },
+            "simulated_misses": 756809,
+            "weighted_simulated_miss_rate": 0.08411254320052423,
+            "mean_per_request_simulated_miss_rate": 0.05765737929506076,
+            "per_request_simulated_miss_rate": {
+              "R01": 0.019853499611835777,
+              "R03": 0.003748789882386867,
+              "R04": 0.026099965430509364,
+              "R05": 0.13206540076876253,
+              "R06": 0.10651924078180929
+            }
+          },
+          "best_improvement_over_uniform_pp": 0.7208385903047665,
+          "best_objective_improvement_over_uniform_pp": 0.7208385903047665
+        }
+      ]
+    }
+  ],
+  "sampled_rank_joint_oracle": {
+    "sampled_ranks": [
+      0,
+      1
+    ],
+    "unsampled_tp4_ranks": [
+      2,
+      3
+    ],
+    "scope": "One allocation shared across sampled ranks only. This does not establish a TP4 optimum.",
+    "weighted": {
+      "objective": "total_simulated_misses_over_total_selected",
+      "selected_tokens": 17995152,
+      "request_selected_tokens": {
+        "R01": 4271388,
+        "R03": 1262274,
+        "R04": 671112,
+        "R05": 5897790,
+        "R06": 5892588
+      },
+      "comparisons": [
+        {
+          "total_token_budget": 20480,
+          "exact_allocations": 341,
+          "uniform": {
+            "allocation": {
+              "R01": 4096,
+              "R03": 4096,
+              "R04": 4096,
+              "R05": 4096,
+              "R06": 4096
+            },
+            "simulated_misses": 630220,
+            "weighted_simulated_miss_rate": 0.03502165472122714,
+            "mean_per_request_simulated_miss_rate": 0.026332827341264263,
+            "per_request_simulated_miss_rate": {
+              "R01": 0.003437290173592284,
+              "R03": 0.0036244111817244117,
+              "R04": 0.023666690507694692,
+              "R05": 0.059062123269902796,
+              "R06": 0.041873621573407134
+            }
+          },
+          "best": {
+            "allocation": {
+              "R01": 4096,
+              "R03": 3072,
+              "R04": 3072,
+              "R05": 6144,
+              "R06": 4096
+            },
+            "simulated_misses": 466582,
+            "weighted_simulated_miss_rate": 0.025928205552250963,
+            "mean_per_request_simulated_miss_rate": 0.030481326353691544,
+            "per_request_simulated_miss_rate": {
+              "R01": 0.003437290173592284,
+              "R03": 0.02241668607608174,
+              "R04": 0.06171399110729655,
+              "R05": 0.022965042838080027,
+              "R06": 0.041873621573407134
+            }
+          },
+          "worst": {
+            "allocation": {
+              "R01": 3072,
+              "R03": 8192,
+              "R04": 4096,
+              "R05": 2560,
+              "R06": 2560
+            },
+            "simulated_misses": 1694925,
+            "weighted_simulated_miss_rate": 0.0941878679324298,
+            "mean_per_request_simulated_miss_rate": 0.06330514449660621,
+            "per_request_simulated_miss_rate": {
+              "R01": 0.01940961579701961,
+              "R03": 0.0034445770094290147,
+              "R04": 0.023666690507694692,
+              "R05": 0.14623698029261809,
+              "R06": 0.12376785887626965
+            }
+          },
+          "best_improvement_over_uniform_pp": 0.9093449168976178,
+          "best_objective_improvement_over_uniform_pp": 0.9093449168976178
+        }
+      ]
+    },
+    "mean_per_request": {
+      "objective": "mean_per_request_simulated_miss_rate",
+      "selected_tokens": 17995152,
+      "request_selected_tokens": {
+        "R01": 4271388,
+        "R03": 1262274,
+        "R04": 671112,
+        "R05": 5897790,
+        "R06": 5892588
+      },
+      "comparisons": [
+        {
+          "total_token_budget": 20480,
+          "exact_allocations": 341,
+          "uniform": {
+            "allocation": {
+              "R01": 4096,
+              "R03": 4096,
+              "R04": 4096,
+              "R05": 4096,
+              "R06": 4096
+            },
+            "simulated_misses": 630220,
+            "weighted_simulated_miss_rate": 0.03502165472122714,
+            "mean_per_request_simulated_miss_rate": 0.026332827341264263,
+            "per_request_simulated_miss_rate": {
+              "R01": 0.003437290173592284,
+              "R03": 0.0036244111817244117,
+              "R04": 0.023666690507694692,
+              "R05": 0.059062123269902796,
+              "R06": 0.041873621573407134
+            }
+          },
+          "best": {
+            "allocation": {
+              "R01": 3072,
+              "R03": 3584,
+              "R04": 3584,
+              "R05": 6144,
+              "R06": 4096
+            },
+            "simulated_misses": 501018,
+            "weighted_simulated_miss_rate": 0.027841832066769982,
+            "mean_per_request_simulated_miss_rate": 0.025967057795818066,
+            "per_request_simulated_miss_rate": {
+              "R01": 0.01940961579701961,
+              "R03": 0.009017851908539667,
+              "R04": 0.03656915686204389,
+              "R05": 0.022965042838080027,
+              "R06": 0.041873621573407134
+            }
+          },
+          "worst": {
+            "allocation": {
+              "R01": 4096,
+              "R03": 8192,
+              "R04": 2560,
+              "R05": 3072,
+              "R06": 2560
+            },
+            "simulated_misses": 1439552,
+            "weighted_simulated_miss_rate": 0.07999665687736342,
+            "mean_per_request_simulated_miss_rate": 0.06988874217933712,
+            "per_request_simulated_miss_rate": {
+              "R01": 0.003437290173592284,
+              "R03": 0.0034445770094290147,
+              "R04": 0.1146410733230817,
+              "R05": 0.10415291151431298,
+              "R06": 0.12376785887626965
+            }
+          },
+          "best_improvement_over_uniform_pp": 0.7179822654457156,
+          "best_objective_improvement_over_uniform_pp": 0.036576954544619726
+        }
+      ]
+    }
+  }
+}

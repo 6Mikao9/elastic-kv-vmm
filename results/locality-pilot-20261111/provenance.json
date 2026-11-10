@@ -1,0 +1,161 @@
+{
+  "model": "MiniMax-M3.1-Flash",
+  "image": "lmsysorg/sglang:dev-minimax-m31-flash",
+  "image_id": "sha256:614b1509bcb729c653528d448bff9850f8977fcad9d12ba56bd6dbe3d7985e87",
+  "hardware": "4x A100-SXM4-80GB, NV12, TP4",
+  "gpu_indices": [
+    4,
+    5,
+    6,
+    7
+  ],
+  "diagnostic_only": true,
+  "performance_evidence": false,
+  "capture_ranks": [
+    0,
+    1
+  ],
+  "capture_layers": [
+    5,
+    15,
+    25
+  ],
+  "source_hash_scope": "Files listed in runner source_manifest, not a complete transitive source freeze",
+  "runs": [
+    {
+      "run": "pilot-retry2-20261111/20261110T174134Z-2e5efd4c",
+      "status": "ok",
+      "hot_tokens": 4096,
+      "top_k": 2048,
+      "capacity": {
+        "reported_pool_capacity": 32768,
+        "resolved_max_total_tokens": 32768,
+        "derived_logical_capacity": 65536,
+        "host_to_device_ratio": 2,
+        "derivation": "Audited MiniMax pool and allocator code; logical/index capacity is physical pool size times ratio."
+      },
+      "completed_requests": 6,
+      "access_rows": 9618,
+      "coverage_ok": true,
+      "trace_bytes": 187713475,
+      "source_manifest_sha256": "02c00fa9f0fe5109ee92e26c1aa8e887b37f86c1c396dfd493ebae45477bf970",
+      "runner_source_sha256": {
+        "scripts/run_hisparse_locality.py": "a2b7cd25f168b9f6afab268f043b30ff0901db91c0ed46d5229b8901f21fd0b5",
+        "scripts/container_hisparse_locality.sh": "50d01d7ac72270f8da1b531aa5b2674550b4d3a288c80f9b4b55b029bd1e6a12",
+        "scripts/run_hisparse_smoke.py": "a25122577694773560979b72cee0c303b9650e5a9af756646e9ab15d2edfa4ba",
+        "scripts/run_case.py": "cc3957e8e902f4ab6cd4c3e5be2c6bc4f50dcd301e3a2412d3e8af001c8aec31",
+        "benchmarks/client.py": "d518ab0e33f8c0405ed08f167b814e1ed758798fbb6b97db2c5f29bddfe3b778",
+        "elastic_kv/launch.py": "9ad9c58f51e36d25900b331b97fa064ee4e6f3e2d3a5f919a2b145e9256c9f1b",
+        "elastic_kv/config.py": "4ee494aa81969a47490ab1daa19aa9fab9b26b82c1ae402181b2dc65bb291223",
+        "adaptive_sparse/minimax_runtime.py": "a35752909fb93dbff1e4b173e2a20daafb253e0183ca49b0279b9cbb97c81ff2",
+        "adaptive_sparse/hisparse_access_trace.py": "bddda11b54882e869e8fcfa4f54d76133f420e8d119e2aeaa49385b4e971496f",
+        "adaptive_sparse/minimax_sm80.py": "207df72e8294982f5153a236043871f38a26b37338c543d9c8322fd56d0c2bf0"
+      },
+      "model_metadata_sha256": {
+        "model.safetensors.index.json": "55adcfd75b3433b98a9a045c26386776c179bddeed7eb86c40b73187d218abf1",
+        "tokenizer.json": "bb1f1626cf01448f1e3b6036d0a061ffc66c91d9046aada14ea23a5441b5ad6e",
+        "preprocessor_config.json": "36785da1dc7a00324048bd7c537c24247fca97c626884818257fd0b92287de31",
+        "tokenizer_config.json": "15caca9f74fbce9b86dc014e9324cbefa56703d81ccd6d56020faa1c41d2eae5",
+        "generation_config.json": "272d19efac5060ff8c9f76c7ed67909a5da1be466284ee4f1f1bd2a810c6fad2",
+        "configuration.json": "f888421726665e8a84b738eed42a64875aed79de8be7daade851ac8bf4c0cef9",
+        "config.json": "df6a3668e2de5b8dc0e883e3767495ad17af7e4d69fabe9683088be015fda9ab",
+        "added_tokens.json": "63f277741fb061e615cb604286a845d971178ba4716732a59cf42b3752c0ce4e",
+        "download-complete.json": "e99e5709627ec91cb2f7184db7b96f15b65349aba9162e5c4ce1301cf1b40699",
+        "chat_template.jinja": "961e3f96b2c08d26555efdfeb3b384d5e81181bf0cfc04edbadc31c6e507b431",
+        "special_tokens_map.json": "401b624ec44507183d1dc65c74f7f3387699a77971aa19fa5a0cc57a3989ba97",
+        "vocab.json": "b44c066b5dc34c800c4e3ecbd85f3e95ce3bfdbf8a5fe30223e005175103578a"
+      },
+      "dataset_sha256": "089c29420b1509a8ed222d2c491945feda46b2c48a9597916d756141cf41a6db"
+    },
+    {
+      "run": "native8192-20261111-r1/20261110T181027Z-276dff3d",
+      "status": "ok",
+      "hot_tokens": 8192,
+      "top_k": 2048,
+      "capacity": {
+        "reported_pool_capacity": 32768,
+        "resolved_max_total_tokens": 32768,
+        "derived_logical_capacity": 65536,
+        "host_to_device_ratio": 2,
+        "derivation": "Audited MiniMax pool and allocator code; logical/index capacity is physical pool size times ratio."
+      },
+      "completed_requests": 6,
+      "access_rows": 8256,
+      "coverage_ok": true,
+      "trace_bytes": 164480731,
+      "source_manifest_sha256": "02c00fa9f0fe5109ee92e26c1aa8e887b37f86c1c396dfd493ebae45477bf970",
+      "runner_source_sha256": {
+        "scripts/run_hisparse_locality.py": "a2b7cd25f168b9f6afab268f043b30ff0901db91c0ed46d5229b8901f21fd0b5",
+        "scripts/container_hisparse_locality.sh": "50d01d7ac72270f8da1b531aa5b2674550b4d3a288c80f9b4b55b029bd1e6a12",
+        "scripts/run_hisparse_smoke.py": "a25122577694773560979b72cee0c303b9650e5a9af756646e9ab15d2edfa4ba",
+        "scripts/run_case.py": "cc3957e8e902f4ab6cd4c3e5be2c6bc4f50dcd301e3a2412d3e8af001c8aec31",
+        "benchmarks/client.py": "d518ab0e33f8c0405ed08f167b814e1ed758798fbb6b97db2c5f29bddfe3b778",
+        "elastic_kv/launch.py": "9ad9c58f51e36d25900b331b97fa064ee4e6f3e2d3a5f919a2b145e9256c9f1b",
+        "elastic_kv/config.py": "4ee494aa81969a47490ab1daa19aa9fab9b26b82c1ae402181b2dc65bb291223",
+        "adaptive_sparse/minimax_runtime.py": "a35752909fb93dbff1e4b173e2a20daafb253e0183ca49b0279b9cbb97c81ff2",
+        "adaptive_sparse/hisparse_access_trace.py": "bddda11b54882e869e8fcfa4f54d76133f420e8d119e2aeaa49385b4e971496f",
+        "adaptive_sparse/minimax_sm80.py": "207df72e8294982f5153a236043871f38a26b37338c543d9c8322fd56d0c2bf0"
+      },
+      "model_metadata_sha256": {
+        "model.safetensors.index.json": "55adcfd75b3433b98a9a045c26386776c179bddeed7eb86c40b73187d218abf1",
+        "tokenizer.json": "bb1f1626cf01448f1e3b6036d0a061ffc66c91d9046aada14ea23a5441b5ad6e",
+        "preprocessor_config.json": "36785da1dc7a00324048bd7c537c24247fca97c626884818257fd0b92287de31",
+        "tokenizer_config.json": "15caca9f74fbce9b86dc014e9324cbefa56703d81ccd6d56020faa1c41d2eae5",
+        "generation_config.json": "272d19efac5060ff8c9f76c7ed67909a5da1be466284ee4f1f1bd2a810c6fad2",
+        "configuration.json": "f888421726665e8a84b738eed42a64875aed79de8be7daade851ac8bf4c0cef9",
+        "config.json": "df6a3668e2de5b8dc0e883e3767495ad17af7e4d69fabe9683088be015fda9ab",
+        "added_tokens.json": "63f277741fb061e615cb604286a845d971178ba4716732a59cf42b3752c0ce4e",
+        "download-complete.json": "e99e5709627ec91cb2f7184db7b96f15b65349aba9162e5c4ce1301cf1b40699",
+        "chat_template.jinja": "961e3f96b2c08d26555efdfeb3b384d5e81181bf0cfc04edbadc31c6e507b431",
+        "special_tokens_map.json": "401b624ec44507183d1dc65c74f7f3387699a77971aa19fa5a0cc57a3989ba97",
+        "vocab.json": "b44c066b5dc34c800c4e3ecbd85f3e95ce3bfdbf8a5fe30223e005175103578a"
+      },
+      "dataset_sha256": "089c29420b1509a8ed222d2c491945feda46b2c48a9597916d756141cf41a6db"
+    },
+    {
+      "run": "native2048-20261111-r1/20261110T181916Z-7cfd969c",
+      "status": "ok",
+      "hot_tokens": 2048,
+      "top_k": 2048,
+      "capacity": {
+        "reported_pool_capacity": 32768,
+        "resolved_max_total_tokens": 32768,
+        "derived_logical_capacity": 65536,
+        "host_to_device_ratio": 2,
+        "derivation": "Audited MiniMax pool and allocator code; logical/index capacity is physical pool size times ratio."
+      },
+      "completed_requests": 6,
+      "access_rows": 9792,
+      "coverage_ok": true,
+      "trace_bytes": 177341264,
+      "source_manifest_sha256": "02c00fa9f0fe5109ee92e26c1aa8e887b37f86c1c396dfd493ebae45477bf970",
+      "runner_source_sha256": {
+        "scripts/run_hisparse_locality.py": "a2b7cd25f168b9f6afab268f043b30ff0901db91c0ed46d5229b8901f21fd0b5",
+        "scripts/container_hisparse_locality.sh": "50d01d7ac72270f8da1b531aa5b2674550b4d3a288c80f9b4b55b029bd1e6a12",
+        "scripts/run_hisparse_smoke.py": "a25122577694773560979b72cee0c303b9650e5a9af756646e9ab15d2edfa4ba",
+        "scripts/run_case.py": "cc3957e8e902f4ab6cd4c3e5be2c6bc4f50dcd301e3a2412d3e8af001c8aec31",
+        "benchmarks/client.py": "d518ab0e33f8c0405ed08f167b814e1ed758798fbb6b97db2c5f29bddfe3b778",
+        "elastic_kv/launch.py": "9ad9c58f51e36d25900b331b97fa064ee4e6f3e2d3a5f919a2b145e9256c9f1b",
+        "elastic_kv/config.py": "4ee494aa81969a47490ab1daa19aa9fab9b26b82c1ae402181b2dc65bb291223",
+        "adaptive_sparse/minimax_runtime.py": "a35752909fb93dbff1e4b173e2a20daafb253e0183ca49b0279b9cbb97c81ff2",
+        "adaptive_sparse/hisparse_access_trace.py": "bddda11b54882e869e8fcfa4f54d76133f420e8d119e2aeaa49385b4e971496f",
+        "adaptive_sparse/minimax_sm80.py": "207df72e8294982f5153a236043871f38a26b37338c543d9c8322fd56d0c2bf0"
+      },
+      "model_metadata_sha256": {
+        "model.safetensors.index.json": "55adcfd75b3433b98a9a045c26386776c179bddeed7eb86c40b73187d218abf1",
+        "tokenizer.json": "bb1f1626cf01448f1e3b6036d0a061ffc66c91d9046aada14ea23a5441b5ad6e",
+        "preprocessor_config.json": "36785da1dc7a00324048bd7c537c24247fca97c626884818257fd0b92287de31",
+        "tokenizer_config.json": "15caca9f74fbce9b86dc014e9324cbefa56703d81ccd6d56020faa1c41d2eae5",
+        "generation_config.json": "272d19efac5060ff8c9f76c7ed67909a5da1be466284ee4f1f1bd2a810c6fad2",
+        "configuration.json": "f888421726665e8a84b738eed42a64875aed79de8be7daade851ac8bf4c0cef9",
+        "config.json": "df6a3668e2de5b8dc0e883e3767495ad17af7e4d69fabe9683088be015fda9ab",
+        "added_tokens.json": "63f277741fb061e615cb604286a845d971178ba4716732a59cf42b3752c0ce4e",
+        "download-complete.json": "e99e5709627ec91cb2f7184db7b96f15b65349aba9162e5c4ce1301cf1b40699",
+        "chat_template.jinja": "961e3f96b2c08d26555efdfeb3b384d5e81181bf0cfc04edbadc31c6e507b431",
+        "special_tokens_map.json": "401b624ec44507183d1dc65c74f7f3387699a77971aa19fa5a0cc57a3989ba97",
+        "vocab.json": "b44c066b5dc34c800c4e3ecbd85f3e95ce3bfdbf8a5fe30223e005175103578a"
+      },
+      "dataset_sha256": "089c29420b1509a8ed222d2c491945feda46b2c48a9597916d756141cf41a6db"
+    }
+  ]
+}
